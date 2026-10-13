@@ -78,6 +78,8 @@ test('startup registration and initial snapshot do not require a message round t
     assert.deepEqual(JSON.parse(serialized), snapshot);
     assert.ok(html.includes('if (initialState) render(initialState)'));
     assert.ok(html.includes('data-command="diagnose"'));
+    assert.ok(html.includes(`<span class="version-tag" title="GENAI Login v${manifest.version}">v${manifest.version}</span>`));
+    assert.ok(html.indexOf('data-command="clear"') < html.indexOf('data-command="diagnose"'));
 });
 
 test('port action validates, cancels, resets and saves only user settings', async () => {

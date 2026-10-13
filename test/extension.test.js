@@ -9,7 +9,7 @@ suite('Extension Test Suite', () => {
 		let listens = 0;
 		http.Server.prototype.listen = function (...args) { listens++; return original.apply(this, args); };
 		try {
-			const extension = vscode.extensions.getExtension('local-genai.genai-login');
+			const extension = vscode.extensions.getExtension('Petalzu.genai-login');
 			assert.ok(extension);
 			await extension.activate();
 			const commands = await vscode.commands.getCommands(true);
@@ -18,7 +18,7 @@ suite('Extension Test Suite', () => {
 		} finally { http.Server.prototype.listen = original; }
 	});
 	test('Dashboard view is contributed as a Webview', async () => {
-		const extension = vscode.extensions.getExtension('local-genai.genai-login');
+		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
 		await extension.activate();
 		const view = extension.packageJSON.contributes.views['genai-login'].find(item => item.id === 'genai-login.session');
 		assert.equal(view.type, 'webview');

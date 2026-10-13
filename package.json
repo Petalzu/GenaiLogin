@@ -3,8 +3,9 @@
   "displayName": "GENAI Login",
   "description": "Manual GENAI login and local bridge",
   "readme": "GENAI-README.md",
-  "version": "0.0.13",
-  "publisher": "local-genai",
+  "version": "0.0.14",
+  "publisher": "Petalzu",
+  "author": "Petalzu",
   "license": "MIT",
   "repository": {
     "type": "git",

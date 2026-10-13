@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { version } = require('./package.json');
 
 function dashboardHtml(initialState = null) {
     const nonce = crypto.randomBytes(16).toString('base64');
@@ -49,6 +50,7 @@ function dashboardHtml(initialState = null) {
         }
         .eyebrow { color: var(--green); font-size: 9px; font-weight: 800; letter-spacing: 1.1px; }
         h1 { margin: 2px 0 0; font-size: 17px; letter-spacing: 0; }
+        .version-tag { margin-left: 7px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: rgba(255, 255, 255, 0.05); font-size: 10px; font-weight: 650; vertical-align: 2px; }
         .icon-button {
             width: 29px;
             height: 29px;
@@ -198,7 +200,7 @@ function dashboardHtml(initialState = null) {
             <div class="brand-mark">G</div>
             <div>
                 <div class="eyebrow">GENAI BRIDGE</div>
-                <h1>连接控制台</h1>
+                <h1>连接控制台<span class="version-tag" title="GENAI Login v${version}">v${version}</span></h1>
             </div>
             <button class="icon-button" data-command="refresh" title="刷新状态" aria-label="刷新状态">↻</button>
         </header>
@@ -251,9 +253,6 @@ function dashboardHtml(initialState = null) {
             <button class="action-tile primary" data-command="connect">
                 <span class="action-icon">+</span><span class="action-copy"><strong>连接 GENAI</strong><small>登录并启动桥接</small></span>
             </button>
-            <button class="action-tile" data-command="diagnose" title="在可见 Edge 窗口中诊断登录">
-                <span class="action-icon" aria-hidden="true">E</span><span class="action-copy"><strong>可见诊断</strong><small>Edge</small></span>
-            </button>
             <button class="action-tile" data-command="credentials">
                 <span class="action-icon">K</span><span class="action-copy"><strong>账号设置</strong><small>更新安全凭据</small></span>
             </button>
@@ -262,6 +261,9 @@ function dashboardHtml(initialState = null) {
             </button>
             <button class="action-tile danger" data-command="clear">
                 <span class="action-icon">×</span><span class="action-copy"><strong>清除数据</strong><small>删除账号与 Cookie</small></span>
+            </button>
+            <button class="action-tile" data-command="diagnose" title="在可见 Edge 窗口中诊断登录">
+                <span class="action-icon" aria-hidden="true">E</span><span class="action-copy"><strong>可见诊断</strong><small>Edge</small></span>
             </button>
         </section>
         <div class="history-bar usage-hover" tabindex="0">

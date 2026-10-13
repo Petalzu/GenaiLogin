@@ -1,5 +1,11 @@
 # Change Log
 
+## [0.0.14]
+
+- Changed the publisher and author to Petalzu; the extension ID is now `Petalzu.genai-login` and does not replace an installed `local-genai.genai-login` in place.
+- Added the extension version to the dashboard header.
+- Moved the visible diagnostic login action to the end of the action grid.
+
 ## [0.0.13]
 
 - Added optional Duo device confirmation handling: after phone approval, the extension selects "Yes, this is my device" once on the official Duo API host when both exact English or Simplified Chinese choices are visible.
