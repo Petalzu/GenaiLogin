@@ -4,7 +4,7 @@
 
 ## Install
 
-Download the `.vsix` asset from [GitHub Releases](https://github.com/Petalzu/GenaiHelper/releases/latest), then use VS Code **Extensions > ... > Install from VSIX...**. Alternatively run `code --install-extension genai-login-0.0.13.vsix --force`. Reload the window after active conversations finish. No Node.js or npm installation is needed for the packaged extension.
+Download the `.vsix` asset from [GitHub Releases](https://github.com/Petalzu/GenaiLogin/releases/latest), then use VS Code **Extensions > ... > Install from VSIX...**. Alternatively run `code --install-extension genai-login-0.0.14.vsix --force`. Reload the window after active conversations finish. No Node.js or npm installation is needed for the packaged extension.
 
 GENAI Login is a local VS Code extension for UMPASS authentication and an OpenAI-compatible bridge.
 

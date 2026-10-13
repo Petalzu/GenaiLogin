@@ -5,6 +5,7 @@
 - Changed the publisher and author to Petalzu; the extension ID is now `Petalzu.genai-login` and does not replace an installed `local-genai.genai-login` in place.
 - Added the extension version to the dashboard header.
 - Moved the visible diagnostic login action to the end of the action grid.
+- Updated repository and documentation links after the GitHub repository rename to Petalzu/GenaiLogin.
 
 ## [0.0.13]
 

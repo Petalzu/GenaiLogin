@@ -20,15 +20,15 @@ The endpoint remains http://127.0.0.1:58379/v1/chat/completions with compatibili
 
 ## Install from GitHub Releases
 
-1. Open [the latest release](https://github.com/Petalzu/GenaiHelper/releases/latest).
+1. Open [the latest release](https://github.com/Petalzu/GenaiLogin/releases/latest).
 2. Download the `.vsix` file under **Assets**, not the source ZIP or TAR archive.
 3. In VS Code, open **Extensions**, select the **...** menu, then **Install from VSIX...** and choose the downloaded file.
 4. Run **Developer: Reload Window**, then open **GENAI** in the activity bar.
 
-Alternatively, install the v0.0.12 package from a terminal:
+Alternatively, install the v0.0.14 package from a terminal:
 
 ```bash
-code --install-extension genai-login-0.0.12.vsix --force
+code --install-extension genai-login-0.0.14.vsix --force
 ```
 
 Node.js and npm are not required for a Release installation. Microsoft Edge and a valid GENAI account are still required. When upgrading, finish active conversations before reloading: reloading the owner window stops its bridge. Existing saved credentials and settings are retained.
@@ -36,8 +36,8 @@ Node.js and npm are not required for a Release installation. Microsoft Edge and 
 ## Installing from source
 
 ```bash
-git clone https://github.com/Petalzu/GenaiHelper.git
-cd GenaiHelper
+git clone https://github.com/Petalzu/GenaiLogin.git
+cd GenaiLogin
 npm install
 npm test
 ```
