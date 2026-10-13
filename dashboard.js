@@ -251,6 +251,9 @@ function dashboardHtml(initialState = null) {
             <button class="action-tile primary" data-command="connect">
                 <span class="action-icon">+</span><span class="action-copy"><strong>连接 GENAI</strong><small>登录并启动桥接</small></span>
             </button>
+            <button class="action-tile" data-command="diagnose" title="在可见 Edge 窗口中诊断登录">
+                <span class="action-icon" aria-hidden="true">E</span><span class="action-copy"><strong>可见诊断</strong><small>Edge</small></span>
+            </button>
             <button class="action-tile" data-command="credentials">
                 <span class="action-icon">K</span><span class="action-copy"><strong>账号设置</strong><small>更新安全凭据</small></span>
             </button>

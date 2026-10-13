@@ -1,10 +1,10 @@
 # GENAI Login
 
-## Version 0.0.10
+## Version 0.0.13
 
 ## Install
 
-Download the `.vsix` asset from [GitHub Releases](https://github.com/Petalzu/GenaiHelper/releases/latest), then use VS Code **Extensions > ... > Install from VSIX...**. Alternatively run `code --install-extension genai-login-0.0.10.vsix --force`. Reload the window after active conversations finish. No Node.js or npm installation is needed for the packaged extension.
+Download the `.vsix` asset from [GitHub Releases](https://github.com/Petalzu/GenaiHelper/releases/latest), then use VS Code **Extensions > ... > Install from VSIX...**. Alternatively run `code --install-extension genai-login-0.0.13.vsix --force`. Reload the window after active conversations finish. No Node.js or npm installation is needed for the packaged extension.
 
 GENAI Login is a local VS Code extension for UMPASS authentication and an OpenAI-compatible bridge.
 
@@ -13,6 +13,10 @@ GENAI Login is a local VS Code extension for UMPASS authentication and an OpenAI
 Open GENAI in the activity bar. The connection dashboard provides square action tiles for account setup, connection, disconnect, and clearing saved data. It also shows the local port, connection uptime, bridge request count, model usage, keepalive state, and token usage reported by GENAI.
 
 Edge must be installed. A saved valid cookie jar skips the browser login. Otherwise the extension starts temporary headless Microsoft Edge, fills the saved UMPASS credentials once, and waits for the normal MFA and redirect flow. After API verification, the Edge session remains available until Disconnect so the session can be kept alive. Disconnect, timeout, cancellation, authentication failure, window reload, and VS Code exit close it.
+
+If phone approval succeeds but the connection stalls, disconnect first and use the dashboard's **可见诊断** action or run **GENAI: Diagnose login in visible Edge** from the Command Palette. This uses the same login flow in a visible temporary Edge window so additional verification, consent or error pages can be inspected. Login retains its 180-second deadline. Authentication diagnostics record hostnames, fixed route categories, navigation status/error codes and page structure flags, not URL parameters, form values, page text or cookies. Do not share callback URLs, authentication codes or cookies when reporting a failure.
+
+Duo may ask whether to remember the device after phone approval. On the official Duo API host, when both exact device-confirmation choices are visible, the extension selects **Yes, this is my device** once, as the default for this personal device. The English choices and the verified Simplified Chinese equivalents are supported, including a link-style negative choice. It does not approve MFA or click other verification or consent controls. Other prompts require the visible diagnostic login. Edge still uses a temporary browser context, so choosing to remember the device does not guarantee that a new browser context after Disconnect or reload will skip MFA.
 
 Credentials and cookies are stored in VS Code SecretStorage. Clear removes both stored values; it does not revoke the server-side session.
 

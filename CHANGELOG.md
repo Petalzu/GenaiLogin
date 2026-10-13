@@ -1,5 +1,13 @@
 # Change Log
 
+## [0.0.13]
+
+- Added optional Duo device confirmation handling: after phone approval, the extension selects "Yes, this is my device" once on the official Duo API host when both exact English or Simplified Chinese choices are visible.
+- Added "GENAI: Diagnose login in visible Edge" command and a dashboard action for stalled logins.
+- Added sanitized authentication diagnostics: hostname, fixed route category, navigation status/error codes and page structure flags without URL parameters, form values or page text.
+- Changed credential submission to not await navigation so the login loop controls the MFA and redirect flow.
+- Added regression coverage for Duo device confirmation, diagnostic login mode, and authentication location reporting.
+
 ## [0.0.12]
 
 - Added per-model token, cache and reference cost details to the dashboard.

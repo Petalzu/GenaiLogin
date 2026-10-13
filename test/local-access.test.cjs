@@ -29,8 +29,9 @@ test('credentials are not written when ownership changes during input', async ()
 
 test('connection initialization failure clears active state and permits retry', async () => {
     const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
-    const start = source.indexOf('const connect = async () =>');
+    const start = source.indexOf('const connect = async (');
     const end = source.indexOf('let configuringModels', start);
+    assert.ok(start >= 0 && end > start);
     let loads = 0;
     const sandbox = {
         AbortController,
@@ -47,6 +48,26 @@ test('connection initialization failure clears active state and permits retry', 
     assert.equal(loads, 2);
 });
 
+test('visible diagnostic login requires ownership and an idle connection', async () => {
+    const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
+    const start = source.indexOf('const diagnose = async () =>');
+    const end = source.indexOf('const actions =', start);
+    assert.ok(start >= 0 && end > start);
+    for (const state of ['observer', 'active', 'idle']) {
+        const calls = [];
+        const notices = [];
+        const sandbox = {
+            requireOwner: async () => state !== 'observer',
+            active: state === 'active' ? {} : undefined,
+            connect: async diagnostic => calls.push(diagnostic),
+            vscode: { window: { showInformationMessage: async message => notices.push(message) } }
+        };
+        await vm.runInNewContext(source.slice(start, end) + 'diagnose()', sandbox);
+        assert.deepEqual(calls, state === 'idle' ? [true] : []);
+        assert.equal(notices.length, state === 'active' ? 1 : 0);
+    }
+});
+
 test('startup registration and initial snapshot do not require a message round trip', () => {
     const manifest = require('../package.json');
     assert.ok(manifest.activationEvents.includes('onStartupFinished'));
@@ -56,6 +77,7 @@ test('startup registration and initial snapshot do not require a message round t
     const serialized = html.match(/const initialState = (.*);/)[1];
     assert.deepEqual(JSON.parse(serialized), snapshot);
     assert.ok(html.includes('if (initialState) render(initialState)'));
+    assert.ok(html.includes('data-command="diagnose"'));
 });
 
 test('port action validates, cancels, resets and saves only user settings', async () => {
@@ -148,6 +170,8 @@ test('observer synchronizes owner state without opening a server or changing cre
         await nextTurn();
         assert.equal(fetches, 0);
         assert.equal(poll, undefined);
+        assert.ok(commands.has('genai-login.diagnose'));
+        assert.ok(require('../package.json').contributes.commands.some(command => command.command === 'genai-login.diagnose'));
         const view = { visible: false, webview: { postMessage: message => messages.push(message.data),
             onDidReceiveMessage: () => disposable },
             onDidChangeVisibility: callback => { visibilityChanged = callback; return disposable; },
@@ -159,8 +183,8 @@ test('observer synchronizes owner state without opening a server or changing cre
         assert.match(messages.at(-1).status, /shared window/);
         assert.equal(messages.at(-1).tokensOut, 56);
         assert.equal(messages.at(-1).models[0].name, 'test-model');
-        for (const action of ['connect', 'disconnect', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
-        assert.equal(notices, 3);
+        for (const action of ['connect', 'diagnose', 'disconnect', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
+        assert.equal(notices, 4);
         snapshot.requests = 23;
         poll(); await nextTurn();
         assert.equal(messages.at(-1).requests, 23);

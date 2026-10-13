@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "Manual GENAI login and local bridge",
   "readme": "GENAI-README.md",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "publisher": "local-genai",
   "license": "MIT",
   "repository": {
@@ -73,6 +73,10 @@
       {
         "command": "genai-login.connect",
         "title": "GENAI: Login and connect"
+      },
+      {
+        "command": "genai-login.diagnose",
+        "title": "GENAI: Diagnose login in visible Edge"
       },
       {
         "command": "genai-login.credentials",

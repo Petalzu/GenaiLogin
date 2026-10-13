@@ -167,12 +167,12 @@ function activate(context) {
 		await context.secrets.delete('session');
 		return true;
 	};
-	const connect = async () => {
+	const connect = async (diagnostic = false) => {
 		if (active) return;
 		await syncSharedState();
 		if (active || sharedState) return;
 		output.show(true);
-		trace('Manual connection requested');
+		trace(diagnostic ? 'Visible diagnostic connection requested' : 'Manual connection requested');
 		let stored = await context.secrets.get('credentials');
 		if (!stored) { if (!await credentials()) return; stored = await context.secrets.get('credentials'); }
 		if (active) return;
@@ -192,7 +192,7 @@ function activate(context) {
 		const authenticate = () => {
 			if (!authentication) {
 				status('Authenticating');
-				authentication = login(session, account, controller.signal, trace, undefined, true).then(async () => { await persist(); stats.connectedAt ??= Date.now(); trace('Authenticated; session saved'); status(`Connected :${stats.port}`); }).finally(() => { if (active === controller) authentication = undefined; });
+				authentication = login(session, account, controller.signal, trace, undefined, true, !diagnostic).then(async () => { await persist(); stats.connectedAt ??= Date.now(); trace('Authenticated; session saved'); status(`Connected :${stats.port}`); }).finally(() => { if (active === controller) authentication = undefined; });
 			}
 			return authentication;
 		};
@@ -335,7 +335,12 @@ function activate(context) {
 			await vscode.window.showInformationMessage(`端口已设为 ${next}。当前连接不变；请在任务结束后重载相关窗口，并将 Copilot 模型 URL 更新为 http://127.0.0.1:${next}/v1/chat/completions。`);
 		} catch (error) { await vscode.window.showErrorMessage(`端口设置失败：${error.message}`); }
 	};
-	const actions = { connect, credentials, models, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => { if (!await requireOwner()) return; stop(); await context.secrets.delete('credentials'); await context.secrets.delete('session'); } };
+	const diagnose = async () => {
+		if (!await requireOwner()) return;
+		if (active) { await vscode.window.showInformationMessage('Disconnect GENAI before starting a visible diagnostic login.'); return; }
+		await connect(true);
+	};
+	const actions = { connect, diagnose, credentials, models, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => { if (!await requireOwner()) return; stop(); await context.secrets.delete('credentials'); await context.secrets.delete('session'); } };
 	const reportError = error => vscode.window.showErrorMessage(error?.code === 'EADDRINUSE' ? `Port ${stats.port} is occupied. Stop the old bridge or configure another port and reload.` : 'GENAI login failed or timed out. Check GENAI Login output, installed Edge, credentials and MFA.');
 	for (const [name, action] of Object.entries(actions)) context.subscriptions.push(vscode.commands.registerCommand(`genai-login.${name}`, async () => {
 		try { await action(); } catch (error) { reportError(error); }
