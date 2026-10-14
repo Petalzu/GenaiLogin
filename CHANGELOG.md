@@ -1,5 +1,26 @@
 # Change Log
 
+## [0.0.16]
+
+- Publish the first VS Code Marketplace version while preserving the `Petalzu.genai-login` extension ID.
+- Clarify the project description, support links, account requirements and independent community status.
+- Streamline project and user documentation with Marketplace-only installation and automatic-update guidance.
+- Mark 0.0.16 as the final GitHub Release; future extension versions will be distributed through the Marketplace, with source code and issue tracking remaining on GitHub.
+
+## [0.0.15]
+
+- Fixed HTTP 503 and other temporary health failures being treated as session expiry; health checks now target the authentication endpoint, not the model service.
+- Added activity-aware health scheduling with two-minute idle checks, a five-minute maximum healthy gap, token-expiry hints, bounded backoff and Retry-After handling.
+- Reject stale failed checks after newer authenticated requests without treating existing stream bytes as new authentication; stop repeating MFA after a failed automatic login and preserve active streams.
+- Unified the activity bar, view, page heading and command prefix as GENAI Login while preserving extension and storage IDs.
+- Reuse verified saved sessions without loading Playwright; close normal login browsers after verification and replace retained diagnostic browsers before reauthentication.
+- Distinguish expired sessions from temporary upstream failures and rate limits, with bounded health checks and keepalive backoff.
+- Save changed cookies asynchronously with serialized, coalesced writes; storage failures no longer block successful responses.
+- Register request cancellation before authentication/body reading and guard old asynchronous callbacks against replacement connections.
+- Preserve legacy history and persist new per-window usage deltas in independent atomic files instead of shared whole-object Memento writes.
+- Show explicit dashboard states, login stages and health/storage warnings; disable incompatible actions, confirm credential clearing and release hidden Webviews.
+- Add connection, persistence, cross-window history, real Edge dashboard and authentication regression tests.
+
 ## [0.0.14]
 
 - Changed the publisher and author to Petalzu; the extension ID is now `Petalzu.genai-login` and does not replace an installed `local-genai.genai-login` in place.
@@ -41,10 +62,6 @@
 - Published a ready-to-install VSIX through GitHub Releases.
 
 All notable changes to the "genai-login" extension will be documented in this file.
-
-## [Unreleased]
-
-- Initial release
 
 ## [0.0.8]
 

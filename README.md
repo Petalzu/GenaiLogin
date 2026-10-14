@@ -1,137 +1,116 @@
 # GENAI Login
 
-Manual UMPASS login and local API bridge for desktop VS Code. Open GENAI in the activity bar to use the connection dashboard, save credentials, and connect. The extension uses a temporary headless Microsoft Edge session for the normal MFA flow, keeps that browser session alive until Disconnect, and stores credentials and cookies in VS Code SecretStorage.
+GENAI Login is a desktop VS Code extension that connects OpenAI-compatible clients to the University of Macau's [GENAI service](https://chat.genai.um.edu.mo) through a local API bridge. Authentication uses the standard UMPASS sign-in and MFA flow.
 
-The endpoint remains http://127.0.0.1:58379/v1/chat/completions with compatibility API key local-browser-session. Stop the old bridge first. MFA is not bypassed. The dashboard shows port, uptime, bridge requests, models, and upstream-reported token usage. Network failures require retrying the request; authentication expiry triggers one login attempt. Reloading the window stops the bridge, but saved credentials persist. See GENAI-README.md for details.
+This is an independent community project, not an official University of Macau extension. Access requires an authorized university account and remains subject to the service's usage policies.
+
+[User Guide](GENAI-README.md) | [Pricing Reference](PRICING.md) | [Changelog](CHANGELOG.md)
 
 ## Features
 
-- **Manual login flow** — you enter UMPASS credentials, the extension drives the normal OIDC → password → MFA flow; nothing is bypassed or harvested.
-- **Local OpenAI-compatible bridge** on `127.0.0.1:58379` with `/v1/models` and `/v1/chat/completions`, including SSE streaming passthrough.
-- **Connection dashboard** (webview) showing status, port, uptime, request count, per-model usage, keepalive state, and upstream-reported token usage.
-- **SecretStorage only** — credentials and cookie jars never touch plain configuration files or the filesystem.
-- **Keepalive** — a serialized 60-second session check persists refreshed cookies and reauthenticates once when the session expires.
+- **Local API bridge** with model listing, chat completions, streaming responses, and request cancellation.
+- **Session management** with saved-session reuse, activity-aware health checks, and automatic authentication recovery.
+- **Copilot model configuration** with reviewed presets, explicit confirmation, and configuration backups.
+- **Connection dashboard** with login progress, session health, model usage, and persistent token statistics.
+- **Credential storage** through VS Code SecretStorage rather than plain-text settings.
 
 ## Requirements
 
-- Desktop VS Code (extension kind `ui`; it does not run in Remote/SSH windows).
-- Microsoft Edge installed on the machine running VS Code.
-- A valid UMPASS account with access to GENAI.
+- Desktop VS Code 1.110 or later.
+- Microsoft Edge installed on the VS Code client machine.
+- A UMPASS account authorized to access GENAI.
 
-## Install from GitHub Releases
+The extension runs in the local UI extension host, including when the workspace is connected through Remote-SSH. Its bridge listens on the client machine, not the remote host.
 
-1. Open [the latest release](https://github.com/Petalzu/GenaiLogin/releases/latest).
-2. Download the `.vsix` file under **Assets**, not the source ZIP or TAR archive.
-3. In VS Code, open **Extensions**, select the **...** menu, then **Install from VSIX...** and choose the downloaded file.
-4. Run **Developer: Reload Window**, then open **GENAI** in the activity bar.
+## Installation
 
-Alternatively, install the v0.0.14 package from a terminal:
+GENAI Login is available on the official [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Petalzu.genai-login).
 
-```bash
-code --install-extension genai-login-0.0.14.vsix --force
+1. Open **Extensions** in VS Code.
+2. Search for `@id:Petalzu.genai-login` and select **GENAI Login** by **Petalzu**.
+3. Select **Install**.
+
+Alternatively, install directly from the Marketplace using the command line:
+
+```sh
+code --install-extension Petalzu.genai-login
 ```
 
-Node.js and npm are not required for a Release installation. Microsoft Edge and a valid GENAI account are still required. When upgrading, finish active conversations before reloading: reloading the owner window stops its bridge. Existing saved credentials and settings are retained.
+Enable **Auto Update** in the extension's management menu to receive future versions directly in VS Code. Existing users should verify this option is enabled. Automatic updates follow VS Code's update settings.
 
-## Installing from source
+**Version 0.0.16 is the final GitHub Release.** Future extension versions will be distributed through the Marketplace. This repository remains the home for source code, changelogs, and issue tracking.
 
-```bash
+Node.js and npm are not required to install or use the extension. Finish active requests before restarting extensions or reloading participating windows. Saved credentials, settings, and usage history are retained.
+
+## Quick Start
+
+1. Open **GENAI Login** in the activity bar.
+2. Run **GENAI Login: Save account and password** to store your UMPASS credentials.
+3. Run **GENAI Login: Login and connect** and complete any required MFA. A valid saved session skips browser login.
+4. Configure your client using the connection details below.
+
+### Client Connection
+
+- **Base URL:** `http://127.0.0.1:58379/v1`
+- **API key:** `local-browser-session`
+- **Supported endpoints:** `GET /v1/models` and `POST /v1/chat/completions`
+
+The bridge supports streaming chat responses. It is not a complete implementation of the OpenAI API, and browser-origin requests are rejected.
+
+### GitHub Copilot
+
+Run **GENAI Login: Manage Copilot models** to add or remove models in the current VS Code Profile. Presets are defined in [genai-models.json](genai-models.json).
+
+Changes require confirmation and create a backup before saving. Unrelated providers and model settings are preserved; unsaved or concurrently modified configuration files must be resolved before proceeding.
+
+## Configuration
+
+Open VS Code Settings and search for **GENAI Login**.
+
+- **`genai-login.port`**: local bridge port. Default: `58379`; range: `1024-65535`. Changing it requires reloading participating windows and updating client URLs.
+- **`genai-login.idleTimeoutSeconds`**: maximum time without upstream response data. Default: `0` (disabled); range: `0-86400`. Applies to new requests and pauses during authentication. This is not a total generation deadline.
+
+### Session Health
+
+Health checks adapt to request activity: normally after two idle minutes, with a five-minute maximum interval during healthy operation. Known token expiry advances the next check. Temporary outages and rate limits use backoff rather than triggering a new login.
+
+Health checks do not extend a fixed server-side token lifetime. Genuine expiry or revocation may require authentication and MFA again. See the [User Guide](GENAI-README.md) for recovery steps.
+
+### Multiple Windows
+
+One VS Code window owns each bridge port. Other windows using the same port display shared status; connection and credential operations must be performed in the owner window. Closing or reloading that window stops the bridge. Ownership is not transferred automatically.
+
+## Usage Statistics
+
+The dashboard records request attempts and token usage reported by GENAI. Missing token usage is not estimated. History is local to the extension storage and survives disconnects and credential clearing; unfinished responses or pending writes may be lost if VS Code exits unexpectedly.
+
+Cost estimates use reference model rates and documented assumptions. They are not GENAI billing records. See [PRICING.md](PRICING.md) for rates and estimation details.
+
+## Security and Limitations
+
+- Credentials and cookies are managed through VS Code SecretStorage, not plain-text configuration. Clearing them does not revoke the server-side session.
+- The bridge listens only on `127.0.0.1`. Its compatibility API key is not a security boundary against other local programs; do not expose or forward the port to untrusted networks.
+- Authentication follows the university's sign-in process and does not bypass MFA. Temporary browser sessions do not guarantee remembered-device behavior across reconnects.
+- Failed or partially delivered generations are not automatically replayed. Review any partial output before retrying a request.
+- Requests remain subject to upstream availability, client timeouts, and account permissions.
+
+## Development
+
+Use Node.js 24 and npm. Microsoft Edge is required for browser regression tests.
+
+```sh
 git clone https://github.com/Petalzu/GenaiLogin.git
 cd GenaiLogin
-npm install
+npm ci
 npm test
 ```
 
-Open the folder in VS Code and press **F5** to run the extension in a development window, or package a VSIX locally:
+`npm test` runs lint checks, Node.js regression tests, and VS Code extension-host tests. Browser authentication tests use intercepted responses; successful university login must be verified separately with an authorized account.
 
-```bash
-npx @vscode/vsce package -o genai-login.vsix
-```
+## Contributing
 
-Install the generated VSIX from the command line:
-
-```bash
-code --install-extension genai-login.vsix --force
-```
-
-Or via the VS Code UI: *Extensions* panel → `…` menu → *Install from VSIX…*.
-
-**Upgrading an installed version:** `--force` replaces the extension in place even when the version number is unchanged. Reload the VS Code window afterwards so the new code takes effect.
-
-**Packaging notes:**
-
-- Run `npm install` first; `vsce` bundles runtime dependencies into the VSIX (approximately 6 MB compressed for v0.0.10). `devDependencies` are excluded automatically.
-- Do **not** pass `--no-dependencies`: it skips dependency resolution and produces a VSIX without `node_modules`, which fails at runtime with missing-module errors.
-- `vsce` renames `README.md` → `readme.md`, `LICENSE` → `LICENSE.txt`, and `CHANGELOG.md` → `changelog.md` inside the VSIX; the content is unchanged. `test/` and local-only files are excluded via `.vscodeignore`.
-
-## Usage
-
-1. Open the **GENAI** view in the activity bar.
-2. Save your UMPASS account and password (stored in SecretStorage).
-3. Press **Connect**. A temporary headless Edge completes the login/MFA flow and remains available until Disconnect.
-4. Point OpenAI-compatible clients at `http://127.0.0.1:58379/v1` with the API key `local-browser-session`.
-
-If a saved cookie jar is still valid, login is skipped entirely.
-
-## Extension Settings
-
-### Copilot Model Management
-
-Use the **Copilot 模型** dashboard tile or **GENAI: Manage Copilot models** command to add or delete multiple models. The fixed presets are in [genai-models.json](genai-models.json); no upstream connection is required. Choose Add or Delete; the extension invokes VS Code's built-in command to open the current Profile's model configuration. Manual file selection is offered only if automatic resolution fails.
-
-Adding skips models already configured at the current loopback endpoint by ID or model name. Unchecking an existing model does not delete it. Deleting is a separate multi-select operation restricted to catalog models at that endpoint; other ports and services are preserved. Associated per-model settings are removed only when no remaining model in that provider uses the ID. Empty provider entries are retained.
-
-Both operations require confirmation and create a timestamped sibling `.bak` file before saving. Unsaved or concurrently changed files are rejected. Deletion removes only selected model text and unused model settings, preserving unselected model text and parameters; a semantic check rejects unrelated parameter changes. If Copilot does not refresh automatically, reload the window after active requests finish.
-
-Open VS Code Settings and search for `GENAI Login`:
-
-- `genai-login.port`: default `58379`, valid range `1024` through `65535`. After changing it, reload participating windows and update the client's base URL to `http://127.0.0.1:<port>/v1`. Reloading the owner interrupts active requests; wait for them to finish first.
-- `genai-login.idleTimeoutSeconds`: default `0` (disabled), range `0` through `86400`. Applies to new requests. A positive value limits time without upstream data and resets as data arrives. There is no total generation deadline.
-
-Model requests use a separate HTTP pool without implicit response-header/body timeouts. Cancellation still releases upstream resources. Network failure, upstream termination, client timeouts and closing the owner window can still interrupt a response; this is not a guarantee of indefinite connectivity. Partial generations are never automatically replayed.
-
-Other windows synchronize shared statistics only while the GENAI view is visible, immediately on opening and then every two seconds. Hiding it stops polling. Use the same configured port across windows.
-
-Dashboard metric details float downwards with an opaque background without resizing or moving the cards. The dashboard retains its Webview when hidden; lightweight startup registration and inline initial state reduce first-open work without starting a connection. Streamed content is forwarded byte-for-byte, including intentional newlines and code blocks. SSE frame separators are not answer text. Unexpected displayed line breaks require comparing an affected response with the client's rendering; the bridge does not strip model formatting.
-
-## Known Issues
-
-### Historical Usage
-
-The history card persists total chat request attempts and reported input/output tokens in VS Code extension global storage. Counts begin when this feature is installed; previous usage cannot be reconstructed. Requests count once before forwarding, including failed attempts; authentication retries do not count twice. Token totals update when responses settle, and missing usage is not estimated. Disconnecting or clearing account credentials does not erase history. Windows write independent records to avoid overwriting each other's totals; visible observers receive the owner's history snapshot. Storage sharing follows VS Code's profile/global-storage behavior and is not a cross-device account total. Abrupt termination can lose pending writes or unfinished response usage.
-
-- Only one VS Code window can own port 58379; stop the other bridge first.
-- Network failures are not retried automatically — resend the request.
-- Streamed conversations are not replayed after an automatic relogin.
-- The compatibility key `local-browser-session` is not a strong boundary against other local programs; never expose the port beyond loopback.
-
-## How it works
-
-```
-Chat client ──> 127.0.0.1:58379 (Host/Bearer/Fetch-Metadata checks)
-                    │
-                    ▼
-        auth.js / browser-auth.js
-        (cookie jar + headless Edge login)
-                    │
-                    ▼
-        https://chat.genai.um.edu.mo/api/v1
-```
-
-`auth.js` performs form-based OIDC/SAML login with fetch and a `tough-cookie` jar. `browser-auth.js` falls back to a temporary headless Edge session via `playwright-core` when the form flow hits interactive steps (e.g. MFA). Upstream hosts are pinned to `chat.genai.um.edu.mo`, `login.um.edu.mo`, and `websso.um.edu.mo`; redirects to any other host are refused.
-
-The local bridge enforces:
-
-- Host header must be exactly `127.0.0.1:<configured port>` (default `58379`)
-- `Origin` header must be absent (blocks browser-based callers)
-- `Sec-Fetch-Site` must be `none` or absent
-- `Authorization: Bearer local-browser-session`
-
-## Security notes
-
-- Credentials and cookie jars are stored in VS Code SecretStorage; **Clear** removes both stored values but does not revoke the server-side session.
-- No telemetry, no analytics, no data leaves the machine except requests destined for the pinned GENAI hosts.
+Bug reports and focused pull requests are welcome. Use [GitHub Issues](https://github.com/Petalzu/GenaiLogin/issues) to describe the expected behavior, reproduction steps, extension version, and VS Code version. Include only sanitized diagnostics; never attach passwords, cookies, tokens, or authentication callback URLs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Licensed under the [MIT License](LICENSE).

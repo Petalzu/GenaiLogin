@@ -4,6 +4,7 @@ const { chromium } = require('playwright-core');
 const { CookieJar } = require('tough-cookie');
 const { browserLogin } = require('../browser-auth');
 const { ORIGIN } = require('../auth');
+const { dashboardHtml } = require('../dashboard');
 test('ADFS duplicate username fields only fill visible password form', async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
@@ -82,4 +83,94 @@ for (const mode of ['button', 'Enter', 'Duo device confirmation', 'Duo Chinese d
         assert.equal(traces.includes('Duo device confirmation detected; remembering this device'), duo && !blocked);
         assert.equal(traces.includes('Browser session verified'), !blocked);
     } finally { approve(); await browser.close(); }
+});
+
+test('Dashboard states and controls remain usable on narrow and wide views', { timeout: 20000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    try {
+        const context = await browser.newContext();
+        await context.addInitScript(() => {
+            globalThis.dashboardCommands = [];
+            globalThis.acquireVsCodeApi = () => ({ postMessage: message => globalThis.dashboardCommands.push(message.command) });
+        });
+        await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: dashboardHtml({
+            status: 'Disconnected', connection: 'disconnected', active: false, listening: false,
+            port: 58379, models: [], keepalive: { state: 'idle' }
+        }) }));
+        const page = await context.newPage();
+        const errors = [];
+        page.on('pageerror', error => errors.push(error.message));
+        await page.goto('http://genai-dashboard.test/');
+        await page.waitForFunction(() => globalThis.dashboardCommands.includes('ready'));
+        assert.equal(await page.title(), 'GENAI Login');
+        assert.match(await page.locator('h1').textContent(), /^GENAI Login/);
+        const render = state => page.evaluate(data => globalThis.dispatchEvent(new MessageEvent('message', { data: { type: 'state', data } })), state);
+        const base = { port: 58379, models: [], keepalive: { state: 'idle' } };
+        assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot ');
+        assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+        assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), false);
+        for (const width of [240, 360, 1200]) {
+            await page.setViewportSize({ width, height: 900 });
+            await render({ ...base, connection: 'authenticating', status: 'Authenticating', active: true,
+                listening: true, loginPhase: 'mfa', pendingActions: ['connect'] });
+            assert.equal(await page.locator('#status-text').textContent(), '正在登录');
+            assert.equal(await page.locator('#keepalive-text').textContent(), '等待手机 MFA 确认');
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), false);
+            assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
+            assert.equal(await page.locator('#port-badge').textContent(), ':58379');
+            await render({ ...base, connection: 'connected', status: 'Connected :58379', active: true,
+                connectedAt: Date.now(), listening: true, sessionPersistence: 'error',
+                keepalive: { state: 'error', lastCheckAt: Date.now(), nextCheckAt: Date.now() + 120000 } });
+            assert.match(await page.locator('#keepalive-text').textContent(), /保活暂时失败.*重试/);
+            assert.equal(await page.locator('#session-warning').isVisible(), true);
+            assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot warning');
+            assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
+            await render({ ...base, connection: 'connected', status: 'Connected :58379', active: true, listening: true,
+                connectedAt: Date.now(), keepalive: { state: 'healthy', expiresAt: Date.now() + 45000, nextCheckAt: Date.now() + 10000 } });
+            assert.match(await page.locator('#keepalive-text').textContent(), /会话即将或已经到期/);
+            assert.match(await page.locator('#last-check').textContent(), /下次检查/);
+            assert.match(await page.locator('#last-check').getAttribute('title'), /会话到期/);
+            assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
+            await render({ ...base, connection: 'connected', status: 'Connected :58379 (shared window)', shared: true,
+                active: true, listening: true, connectedAt: Date.now() });
+            assert.equal(await page.locator('#status-text').textContent(), '已连接 · 其他窗口');
+            assert.match(await page.locator('#keepalive-text').textContent(), /^只读/);
+            for (const command of ['connect', 'diagnose', 'credentials', 'clear', 'disconnect']) assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), false);
+            assert.equal(await page.locator('[data-command="models"]').isEnabled(), true);
+            if (process.env.GENAI_DASHBOARD_SCREENSHOTS) {
+                const { join } = require('node:path');
+                const { tmpdir } = require('node:os');
+                await page.screenshot({ path: join(tmpdir(), `genai-dashboard-${width}.png`), fullPage: true });
+            }
+        }
+        await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false });
+        await page.locator('[data-command="connect"]').click();
+        assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'connect');
+        assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+});
+
+test('verified UMPASS rejection is reported without resubmitting credentials', { timeout: 15000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    const traces = [];
+    let submissions = 0;
+    try {
+        const context = await browser.newContext();
+        await context.route('**/*', route => {
+            const url = new URL(route.request().url());
+            if (url.origin === ORIGIN) return route.fulfill({ contentType: 'text/html', body: '<script>location.href="https://websso.um.edu.mo/adfs/ls/"</script>' });
+            if (url.origin === 'https://websso.um.edu.mo') {
+                const rejected = route.request().method() === 'POST';
+                if (rejected) submissions++;
+                return route.fulfill({ contentType: 'text/html', body: `<form method="post"><input name="UserName"><input name="Password" type="password"><button id="submitButton" type="submit">Sign in</button></form>${rejected ? '<p id="errorText">Private account error</p>' : ''}` });
+            }
+            return route.fulfill({ status: 404 });
+        });
+        const page = await context.newPage();
+        await assert.rejects(browserLogin({ valid: async () => false }, { username: 'test', password: 'dummy' }, AbortSignal.timeout(10000), message => traces.push(message),
+            { launch: async () => ({ newContext: async () => context, close: () => browser.close() }) }), { code: 'CREDENTIALS_REJECTED' });
+        assert.equal(submissions, 1);
+        assert.ok(!traces.some(message => message.includes('Private account error') || message.includes('dummy')));
+        assert.equal(page.isClosed(), true);
+    } finally { await browser.close(); }
 });

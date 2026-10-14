@@ -1,4 +1,3 @@
-const { chromium } = require('playwright-core');
 const { Cookie } = require('tough-cookie');
 const { setTimeout: delay } = require('node:timers/promises');
 const { ORIGIN } = require('./auth');
@@ -11,16 +10,22 @@ function authenticationLocation(url) {
     return `host=${location.hostname || 'none'} route=${route}`;
 }
 
-async function browserLogin(session, credentials, signal, trace = () => {}, launcher = chromium, keepOpen = false, headless = true) {
+async function browserLogin(session, credentials, signal, trace = () => {}, launcher, keepOpen = false, headless = true, { force = false } = {}) {
     if (keepOpen && !signal) throw new Error('Diagnostic browser requires disconnect signal');
-    trace('Checking saved session');
-    if (!keepOpen && await session.valid(signal)) return;
     const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(180000)]);
     bounded.throwIfAborted();
+    trace('Checking saved session');
+    if (!keepOpen && !force && await session.valid(AbortSignal.any([bounded, AbortSignal.timeout(30000)]))) {
+        bounded.throwIfAborted(); return;
+    }
+    bounded.throwIfAborted();
+    launcher ??= require('playwright-core').chromium;
     let browser;
     let retained = false;
+    let closing;
     let phase = 'launch';
-    const close = () => { browser?.close().catch(() => {}); };
+    const release = () => signal?.removeEventListener('abort', close);
+    const close = () => { release(); return closing ??= browser?.close().catch(() => {}); };
     bounded.addEventListener('abort', close, { once: true });
     try {
         trace(headless ? 'Starting temporary headless Edge' : 'Starting temporary visible Edge (diagnostic)');
@@ -58,6 +63,10 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
                 phase = duo ? 'duo-mfa' : origin === ORIGIN ? 'genai-callback' : origin === 'https://websso.um.edu.mo' ? (submitted ? 'mfa' : 'umpass') : 'identity-callback';
             }
             const password = page.locator('input[name="Password"][type="password"]');
+            if (submitted && origin === 'https://websso.um.edu.mo' && await password.isVisible() &&
+                await page.locator('#errorText, #error, .alert-error, .alert-danger').filter({ visible: true }).count()) {
+                throw Object.assign(new Error('UMPASS rejected credentials'), { code: 'CREDENTIALS_REJECTED' });
+            }
             if (!submitted && origin === 'https://websso.um.edu.mo' && await password.isVisible()) {
                 phase = 'verify-form';
                 const safe = await password.evaluate(input => {
@@ -105,8 +114,9 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
                     if (keepOpen) {
                         retained = true;
                         signal.addEventListener('abort', close, { once: true });
-                        browser.once?.('disconnected', () => signal.removeEventListener('abort', close));
+                        browser.once?.('disconnected', release);
                         trace('Diagnostic mode: Edge retained until Disconnect');
+                        return close;
                     }
                     return;
                 }
@@ -131,12 +141,14 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
             await delay(1000, undefined, { signal: bounded });
         }
     } catch (error) {
+        const navigationCode = /\b(ERR_[A-Z0-9_]+)\b/.exec(error?.message || '')?.[1];
+        if (navigationCode) error.code = navigationCode;
         const code = bounded.aborted ? bounded.reason?.name : error?.name;
         trace(`Browser login failed: phase=${phase} code=${typeof code === 'string' && /^[A-Za-z0-9_]+$/.test(code) ? code : 'UNKNOWN'}`);
         throw error;
     } finally {
         bounded.removeEventListener('abort', close);
-        if (browser && !retained) { await browser.close(); trace('Temporary Edge closed'); }
+        if (browser && !retained) { await close(); trace('Temporary Edge closed'); }
     }
 }
 module.exports = { browserLogin };

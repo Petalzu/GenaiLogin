@@ -1,49 +1,66 @@
 # GENAI Login
 
-## Version 0.0.14
+User guide for the GENAI Login connection dashboard. For installation, client configuration, development, and licensing, see the [project README](README.md).
 
-## Install
+GENAI Login is an independent community extension, not an official University of Macau product. An authorized UMPASS account is required.
 
-Download the `.vsix` asset from [GitHub Releases](https://github.com/Petalzu/GenaiLogin/releases/latest), then use VS Code **Extensions > ... > Install from VSIX...**. Alternatively run `code --install-extension genai-login-0.0.14.vsix --force`. Reload the window after active conversations finish. No Node.js or npm installation is needed for the packaged extension.
+## Install and Update
 
-GENAI Login is a local VS Code extension for UMPASS authentication and an OpenAI-compatible bridge.
+Install [GENAI Login](https://marketplace.visualstudio.com/items?itemName=Petalzu.genai-login) from the official Visual Studio Marketplace. In VS Code's **Extensions** view, search for `@id:Petalzu.genai-login` and select **Install**. Enable **Auto Update** in the extension's management menu to receive subsequent versions in VS Code.
 
-## Usage
+Version 0.0.16 is the final GitHub Release. Future extension updates will be distributed through the Marketplace; source code and issue tracking remain on GitHub.
 
-Open GENAI in the activity bar. The connection dashboard provides square action tiles for account setup, connection, disconnect, and clearing saved data. It also shows the local port, connection uptime, bridge request count, model usage, keepalive state, and token usage reported by GENAI.
+## Connect
 
-Edge must be installed. A saved valid cookie jar skips the browser login. Otherwise the extension starts temporary headless Microsoft Edge, fills the saved UMPASS credentials once, and waits for the normal MFA and redirect flow. After API verification, the Edge session remains available until Disconnect so the session can be kept alive. Disconnect, timeout, cancellation, authentication failure, window reload, and VS Code exit close it.
+1. Open **GENAI Login** in the activity bar.
+2. Select **账号设置**, or run **GENAI Login: Save account and password**, and enter your UMPASS credentials.
+3. Select **连接 GENAI**, or run **GENAI Login: Login and connect**.
+4. Complete the required MFA and wait for the dashboard to show a connected session.
 
-If phone approval succeeds but the connection stalls, disconnect first and use the dashboard's **可见诊断** action or run **GENAI: Diagnose login in visible Edge** from the Command Palette. This uses the same login flow in a visible temporary Edge window so additional verification, consent or error pages can be inspected. Login retains its 180-second deadline. Authentication diagnostics record hostnames, fixed route categories, navigation status/error codes and page structure flags, not URL parameters, form values, page text or cookies. Do not share callback URLs, authentication codes or cookies when reporting a failure.
+A valid saved session is reused. Otherwise, the extension opens a temporary headless Edge instance and closes it after verification. MFA approval remains your responsibility.
 
-Duo may ask whether to remember the device after phone approval. On the official Duo API host, when both exact device-confirmation choices are visible, the extension selects **Yes, this is my device** once, as the default for this personal device. The English choices and the verified Simplified Chinese equivalents are supported, including a link-style negative choice. It does not approve MFA or click other verification or consent controls. Other prompts require the visible diagnostic login. Edge still uses a temporary browser context, so choosing to remember the device does not guarantee that a new browser context after Disconnect or reload will skip MFA.
+When Duo displays a recognized device-confirmation prompt, the extension selects **Yes, this is my device**. This does not approve MFA or guarantee that future temporary browser sessions will be remembered. Use the extension only on a trusted personal device.
 
-Credentials and cookies are stored in VS Code SecretStorage. Clear removes both stored values; it does not revoke the server-side session.
+## Manage the Connection
 
-Endpoint: `http://127.0.0.1:58379/v1/chat/completions`. Compatibility key: `local-browser-session`. The bridge requires the fixed local Host, Bearer, and Fetch Metadata checks and refuses requests with an Origin header. The compatibility key is not a strong security boundary against other local programs, so do not expose the port beyond loopback.
+- **Disconnect** stops the bridge and session checks without deleting saved credentials or history.
+- **Clear saved credentials and session** requires confirmation, disconnects the bridge, and removes saved credentials and cookies. Usage history remains; the server-side session is not revoked.
+- **Manage Copilot models** adds or removes presets in the current Profile. Addition and deletion are separate operations; unchecking a model during addition does not delete it. Configuration changes require confirmation and create a backup.
 
-Only one VS Code window owns port 58379. Other activated extension windows on the same machine synchronize the owner's connection status, uptime, request/token totals, model usage and keepalive state every two seconds through an authenticated local status endpoint. Status reads do not count as model requests and do not return cookies or credentials. Connecting in an observer window reuses the existing owner. Disconnect, account changes and clearing data must be performed in the owner window. Closing an observer does not stop the bridge; closing or reloading the owner does, and observers clear their shared state when the endpoint becomes unavailable. No automatic ownership transfer is performed. All participating windows must use this updated extension; older bridges without the status endpoint cannot be synchronized.
+Only the window that owns the bridge can disconnect it or change credentials. Other windows display read-only connection status. Use the same port across participating windows.
 
-Observer polling runs only while the GENAI dashboard is visible. Opening or revealing it fetches fresh state immediately and then every two seconds; hiding or disposing it stops polling and cancels the pending status request. Activating the extension alone does not fetch shared state. Explicit connection/account commands still perform a one-off ownership check even when the dashboard is hidden. The owner's bridge and session keepalive continue independently of dashboard visibility.
+## Session Health
 
-The bridge retries one request after authentication expiry; streamed conversations are not automatically replayed. The 60-second keepalive is serialized so checks cannot overlap, and refreshed cookies are persisted.
+The dashboard displays session health, the next scheduled check, and known expiry information. Successful request activity reduces redundant checks. During healthy operation, checks run after two idle minutes or at least once every five minutes. Temporary failures use backoff and respect server rate limits.
 
-Upstream idle timeout defaults to 0 (disabled), with no total generation deadline. Set `genai-login.idleTimeoutSeconds` in VS Code Settings to a positive number (up to 86400) to enable an idle timeout for new requests, reset by response headers and forwarded chunks. Model requests use a separate HTTP pool with header/body timeouts disabled. Client disconnection cancels the upstream request, and streaming respects client backpressure. Session health checks retain a separate 30-second timeout.
+Health checks cannot extend a fixed token lifetime. If authentication expires, one automatic login attempt may require MFA. When verification fails, disconnect and reconnect; the extension does not repeatedly initiate MFA. Already-started streams are not automatically replayed.
 
-Use the port tile or `genai-login.port` in VS Code Settings to customize the loopback port (1024-65535, default 58379). Reload participating windows after current requests finish, and update client URLs to the new port. Listening, Host checks, dashboard details and visible-window synchronization use the configured port. Credentials remain in SecretStorage, not settings. Dashboard details float downwards with an opaque background without changing card dimensions.
+Hiding the dashboard does not stop the bridge or session checks. Closing or reloading the owner window does. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version.
 
-The GENAI Login output records proxy duration, received byte count and sanitized transport error codes without logging prompts, replies or credentials. An upstream disconnect after partial output remains a failure: the bridge does not invent a successful completion or replay a possibly accepted generation request. Upstream outages, client timeouts and an explicitly configured idle timeout can still interrupt responses. These safeguards apply to the VS Code extension bridge, not the separate experimental standalone script. Stream bytes and intentional newlines are preserved; no automatic newline removal is performed.
+## Troubleshooting
 
-Token totals use `prompt_tokens` and `completion_tokens` from upstream JSON or SSE usage data. Requests without usage data are counted but do not receive an invented token estimate. Model tracking is bounded to keep malformed or unusual model names from growing memory without limit.
+### Login Stalls
 
-Expand the token total or historical total to see each model's input, output and total tokens, cache hit rate, and estimated cost. New per-model history survives reloads; older aggregate history remains visible as unattributed usage and cannot be retroactively priced. Cache hit rate is cached input tokens divided by input tokens for requests that report valid cache usage (`prompt_tokens_details.cached_tokens` or `prompt_cache_hit_tokens`). Missing cache reports are unknown, not zero; report coverage is displayed. Streaming cumulative usage is settled once per request.
+Disconnect, then run **GENAI Login: Diagnose login in visible Edge** or select **可见诊断**. Inspect the visible browser for verification, consent, or error pages. Diagnostic Edge remains open until disconnect; the login deadline is three minutes.
 
-DeepSeek-V4.1-Flash estimates use the [official DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing), checked on 2026-10-08: USD per million tokens, off-peak input $0.15, cached input $0.003, output $0.60; peak rates are twice these values. Each request uses its start time: Monday-Friday 01:00-04:00 and 06:00-10:00 UTC are peak (start inclusive, end exclusive); all other times are off-peak. Chinese public holiday exceptions are intentionally NOT applied, so estimates can differ from official billing on holidays. Requests crossing a boundary retain their starting rate. Expanded model details separate peak and off-peak costs. Previously saved estimates without request times remain explicitly labeled ranges and are not retroactively repriced. Only requests with input, output and valid cached-input counts are priced. Reasoning tokens already included in output are not charged twice. These are official-rate equivalent estimates, not GENAI charges. Other models remain unpriced. Historical estimates retain the prices applied when recorded; future price changes require updating the pricing constants.
+Open **View > Output** and select **GENAI Login** for sanitized authentication stages and transport error codes. Do not share authentication callback URLs, passwords, cookies, or tokens.
 
-## Copilot Models
+### Port Is Occupied
 
-The **Copilot 模型** tile provides multi-select addition and deletion using the seven presets in `genai-models.json`. It opens the current Profile's configuration through VS Code's built-in command, with manual selection only as a fallback. Addition skips matching local endpoint/model identities; deletion is limited to catalog models on the current port. Confirm the selected names before saving; a timestamped sibling backup is created. Dirty or changed files require retrying. Precise deletion preserves unselected model text and parameters and retains empty provider entries. These operations do not require an active GENAI connection.
+Check whether another VS Code window already owns the connection. Manage it there, or change **genai-login.port**, reload participating windows, and update client URLs. Only one bridge can listen on a given port.
 
-## Tests
+### Upstream or Session Errors
 
-Run `npm test` for lint, statistics regression tests, and VS Code integration tests. Successful account login and any account-specific MFA must be verified by the user through the extension's password input.
+Temporary service errors do not necessarily indicate expired credentials. Allow the scheduled health retry, or retry the client request after service recovers. If a response was partially delivered, review its content before retrying.
+
+A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed verification requires an explicit disconnect and reconnect.
+
+### Remote Clients Cannot Connect
+
+The bridge listens on the VS Code client machine. A process running on a Remote-SSH host cannot reach it through that host's `127.0.0.1`. Use a client on the local machine; do not expose the bridge to untrusted networks.
+
+## Usage and Cost Estimates
+
+Token statistics use usage data reported by GENAI. Requests without usage are counted without an invented token estimate. Disconnecting or clearing credentials does not reset history.
+
+Cost estimates are reference values, not GENAI charges. Model rates and cache assumptions are documented in [PRICING.md](PRICING.md).

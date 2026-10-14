@@ -8,6 +8,7 @@ function dashboardHtml(initialState = null) {
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
+    <title>GENAI Login</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
     <style>
@@ -36,6 +37,7 @@ function dashboardHtml(initialState = null) {
         button { font: inherit; color: inherit; }
         .shell { padding: 14px 12px 16px; }
         .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+        .brand-copy { min-width: 0; flex: 1; }
         .brand-mark {
             display: grid;
             width: 32px;
@@ -49,7 +51,7 @@ function dashboardHtml(initialState = null) {
             font-weight: 800;
         }
         .eyebrow { color: var(--green); font-size: 9px; font-weight: 800; letter-spacing: 1.1px; }
-        h1 { margin: 2px 0 0; font-size: 17px; letter-spacing: 0; }
+        h1 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 2px 0 0; font-size: 17px; letter-spacing: 0; }
         .version-tag { margin-left: 7px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: rgba(255, 255, 255, 0.05); font-size: 10px; font-weight: 650; vertical-align: 2px; }
         .icon-button {
             width: 29px;
@@ -77,9 +79,11 @@ function dashboardHtml(initialState = null) {
         .status-dot.connected { background: var(--green); box-shadow: 0 0 0 4px rgba(67, 211, 146, 0.14); }
         .status-dot.busy { background: var(--amber); box-shadow: 0 0 0 4px rgba(243, 189, 105, 0.14); }
         .status-dot.error { background: var(--red); box-shadow: 0 0 0 4px rgba(242, 122, 122, 0.14); }
+        .status-dot.warning { background: var(--amber); box-shadow: 0 0 0 4px rgba(243, 189, 105, 0.14); }
         .status-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-        .status-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-        .status-copy small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status-copy strong { overflow-wrap: anywhere; font-size: 13px; }
+        .status-copy small { color: var(--muted); overflow-wrap: anywhere; line-height: 1.4; }
+        .session-warning { color: var(--amber); line-height: 1.5; margin: 8px 2px 0; }
         .port-badge { margin-left: auto; padding: 4px 7px; border: 1px solid rgba(107, 169, 255, 0.35); border-radius: 6px; color: var(--blue); background: rgba(107, 169, 255, 0.1); font-size: 10px; white-space: nowrap; }
         .section-label { display: flex; align-items: center; justify-content: space-between; margin: 16px 2px 7px; color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: 1px; }
         .metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -176,6 +180,7 @@ function dashboardHtml(initialState = null) {
             transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
         }
         .action-tile:hover, .action-tile:focus-visible { border-color: var(--blue); background: rgba(107, 169, 255, 0.1); outline: none; transform: translateY(-1px); }
+        .action-tile:disabled { opacity: 0.5; cursor: default; transform: none; background: rgba(255, 255, 255, 0.04); border-color: var(--border); }
         .action-tile.primary { border-color: rgba(67, 211, 146, 0.45); }
         .action-tile.primary:hover, .action-tile.primary:focus-visible { border-color: var(--green); background: rgba(67, 211, 146, 0.1); }
         .action-tile.danger:hover, .action-tile.danger:focus-visible { border-color: var(--red); background: rgba(242, 122, 122, 0.1); }
@@ -198,9 +203,8 @@ function dashboardHtml(initialState = null) {
     <main class="shell">
         <header class="brand">
             <div class="brand-mark">G</div>
-            <div>
-                <div class="eyebrow">GENAI BRIDGE</div>
-                <h1>连接控制台<span class="version-tag" title="GENAI Login v${version}">v${version}</span></h1>
+            <div class="brand-copy">
+                <h1>GENAI Login<span class="version-tag" title="GENAI Login v${version}">v${version}</span></h1>
             </div>
             <button class="icon-button" data-command="refresh" title="刷新状态" aria-label="刷新状态">↻</button>
         </header>
@@ -212,6 +216,7 @@ function dashboardHtml(initialState = null) {
             </div>
             <span id="port-badge" class="port-badge">:58379</span>
         </section>
+        <p id="session-warning" class="session-warning" role="status" hidden></p>
         <div class="section-label"><span>实时概览</span><span id="sync-text">尚未同步</span></div>
         <section class="metric-grid">
             <div class="metric" tabindex="0">
@@ -298,7 +303,10 @@ function dashboardHtml(initialState = null) {
             if (tokens >= 1e4) return (tokens / 1e4).toFixed(1) + ' 万';
             return formatNumber(tokens);
         };
-        const connected = data => Boolean(data.connectedAt && String(data.status).startsWith('Connected'));
+        const connectionState = data => data.connection || (String(data.status).startsWith('Connected') ? 'connected' :
+            String(data.status).startsWith('Authenticating') ? 'authenticating' : String(data.status).startsWith('Connecting') ? 'connecting' :
+            String(data.status).startsWith('Disconnected') ? 'disconnected' : 'error');
+        const connected = data => Boolean(data.connectedAt && connectionState(data) === 'connected');
         const money = value => Number(value).toFixed(6);
         const costText = usage => number(usage.timedReports) === number(usage.pricedReports)
             ? money(usage.costMin) : money(usage.costMin) + ' ~ ' + money(usage.costMax);
@@ -354,11 +362,28 @@ function dashboardHtml(initialState = null) {
         function render(data) {
             snapshot = data;
             const isConnected = connected(data);
-            const statusText = String(data.status || 'Disconnected');
+            const mode = connectionState(data);
+            const shared = Boolean(data.shared || String(data.status).includes('(shared window)'));
+            const busy = mode === 'authenticating' || mode === 'connecting';
+            const active = data.active ?? (isConnected || busy || Boolean(data.connectedAt));
+            const pending = Array.isArray(data.pendingActions) ? data.pendingActions : [];
+            const exclusivePending = pending.some(command => ['connect', 'diagnose', 'credentials', 'clear'].includes(command));
+            for (const button of document.querySelectorAll('[data-command]')) {
+                const command = button.dataset.command;
+                button.disabled = pending.includes(command) ||
+                    (['connect', 'diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
+                    (command === 'clear' && (shared || exclusivePending)) ||
+                    (command === 'disconnect' && (!active || shared));
+            }
+            const warning = data.sessionPersistence === 'error' || ['error', 'needs-login'].includes(data.keepalive?.state) ||
+                (data.keepalive?.expiresAt && data.keepalive.expiresAt - Date.now() <= 60000);
             const dot = byId('status-dot');
-            dot.className = 'status-dot ' + (isConnected ? 'connected' : /auth|connect/i.test(statusText) ? 'busy' : /error|failed|retry/i.test(statusText) ? 'error' : '');
-            byId('status-text').textContent = isConnected ? '已连接' : statusText === 'Disconnected' ? '未连接' : statusText;
-            byId('port-badge').textContent = isConnected ? ':' + data.port : '未监听';
+            dot.className = 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : '');
+            const label = { connected: '已连接', disconnected: '未连接', connecting: '正在连接', authenticating: '正在登录', error: '请求暂时失败' }[mode] || '未连接';
+            byId('status-text').textContent = label + (shared ? ' · 其他窗口' : '');
+            byId('port-badge').textContent = (data.listening ?? isConnected) ? ':' + data.port : '未监听';
+            byId('session-warning').hidden = data.sessionPersistence !== 'error';
+            byId('session-warning').textContent = data.sessionPersistence === 'error' ? 'Cookie 保存失败，当前连接可继续；重载后可能需要重新登录。' : '';
             const hasUsage = number(data.usageReports) > 0;
             byId('token-value').textContent = hasUsage ? formatTokens(number(data.tokensIn) + number(data.tokensOut)) : '--';
             const inputKnown = number(data.inputUsageReports ?? data.usageReports) > 0;
@@ -386,8 +411,19 @@ function dashboardHtml(initialState = null) {
             }
             if (!usageRows.length) costList.textContent = '暂无用量';
             const keepalive = data.keepalive || {};
-            byId('keepalive-text').textContent = keepalive.state === 'healthy' ? '每 60s 检查 Cookie' : keepalive.state === 'checking' ? '正在检查 Cookie' : keepalive.state === 'reauthenticating' ? 'Cookie 过期，正在重认证' : isConnected ? '等待首次保活检查' : '等待连接';
-            byId('last-check').textContent = keepalive.lastCheckAt ? '上次保活 ' + formatClock(keepalive.lastCheckAt) : '保活：尚未检查';
+            const expiring = keepalive.expiresAt && keepalive.expiresAt - Date.now() <= 60000;
+            const phases = { 'checking-session': '正在验证保存的会话', 'opening-browser': '正在启动 Edge', credentials: '正在提交 UMPASS 登录',
+                mfa: '等待手机 MFA 确认', umpass: '等待 UMPASS 验证', redirect: '等待身份认证跳转', callback: '正在验证 GENAI 会话' };
+            const health = mode === 'authenticating' ? phases[data.loginPhase] || '正在验证登录' :
+                keepalive.state === 'needs-login' ? '验证未完成，请断开后重新连接' :
+                keepalive.state === 'error' ? '保活暂时失败' + (keepalive.nextCheckAt ? '，' + formatClock(keepalive.nextCheckAt) + ' 重试' : '，等待重试') :
+                keepalive.state === 'checking' ? '正在检查会话' : keepalive.state === 'reauthenticating' ? '认证已失效，正在重认证' :
+                expiring ? '会话即将或已经到期，服务端可能要求重新登录' :
+                keepalive.state === 'healthy' ? '会话有效' : isConnected ? '等待首次检查' : '等待连接';
+            byId('keepalive-text').textContent = (shared ? '只读 · ' : '') + health;
+            byId('last-check').textContent = keepalive.nextCheckAt ? '下次检查 ' + formatClock(keepalive.nextCheckAt) : '保活：尚未安排';
+            byId('last-check').title = '上次检查 ' + formatClock(keepalive.lastCheckAt) +
+                (keepalive.expiresAt ? ' · 会话到期 ' + formatClock(keepalive.expiresAt) : ' · 会话到期时间未知');
             byId('sync-text').textContent = '同步 ' + formatClock(Date.now());
             byId('uptime-value').textContent = isConnected ? formatDuration(Date.now() - data.connectedAt) : '--';
             renderModels(Array.isArray(data.models) ? data.models : []);
@@ -398,7 +434,9 @@ function dashboardHtml(initialState = null) {
                 ? '调用 ' + formatNumber(history.requests) + ' 次 · IN ' + (formatShort(history.tokensIn) ?? '--') + ' · OUT ' + (formatShort(history.tokensOut) ?? '--')
                 : '调用 ' + formatNumber(history.requests) + ' 次 · 等待 usage' : '未连接，无历史统计';
         }
-        document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => vscode.postMessage({ command: button.dataset.command })));
+        document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => {
+            if (!button.disabled) vscode.postMessage({ command: button.dataset.command });
+        }));
         window.addEventListener('message', event => { if (event.data && event.data.type === 'state') render(event.data.data); });
         const initialState = ${initialJson};
         if (initialState) render(initialState);

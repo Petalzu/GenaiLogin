@@ -28,6 +28,34 @@ test('visible diagnostic login retains Edge until disconnect', async () => {
 test('saved session does not launch Edge', async () => {
     await browserLogin({ valid: async () => true }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') });
 });
+test('valid saved session does not even load Playwright', () => {
+    const { spawnSync } = require('node:child_process');
+    const result = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(require.resolve('../browser-auth'))}).browserLogin({valid: async () => true}, {}).then(() => { if (Object.keys(require.cache).some(file => file.includes('playwright-core'))) process.exitCode = 1; });`]);
+    assert.equal(result.status, 0, result.stderr?.toString());
+});
+test('transient session check failure does not start a new login', async () => {
+    await assert.rejects(browserLogin({ valid: async () => { throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE' }); } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }), { code: 'SESSION_UNAVAILABLE' });
+});
+test('forced ordinary login closes Edge after verification', async () => {
+    let closed = 0;
+    let checks = 0;
+    const page = { on() {}, goto: async () => {}, url: () => 'https://chat.genai.um.edu.mo/', locator: () => ({}) };
+    const browser = { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+        cookies: async () => [{ name: 'token', value: 'dummy', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    await browserLogin({ valid: async () => { checks++; return true; }, jar: { setCookie: async () => {} } }, {}, undefined, () => {}, { launch: async () => browser }, false, true, { force: true });
+    assert.equal(checks, 1);
+    assert.equal(closed, 1);
+});
+test('retained diagnostic browser has an idempotent explicit cleanup', async () => {
+    let closed = 0;
+    const controller = new AbortController();
+    const page = { on() {}, goto: async () => {}, url: () => 'https://chat.genai.um.edu.mo/', locator: () => ({}) };
+    const browser = { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+        cookies: async () => [{ name: 'token', value: 'dummy', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    const close = await browserLogin({ valid: async () => true, jar: { setCookie: async () => {} } }, {}, controller.signal, () => {}, { launch: async () => browser }, true, false);
+    await close(); await close(); controller.abort();
+    assert.equal(closed, 1);
+});
 test('browser closes on navigation failure', async () => {
     let closed = false;
     const traces = [];

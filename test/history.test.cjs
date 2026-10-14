@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createHistory } = require('../stats');
+const { createHistory, createHistoryFiles } = require('../stats');
 const { createStats, recordRequest, applyUsage, commitRequest, createUsageParser } = require('../stats');
 
 test('final stream cache usage settles once and persists model costs', async () => {
@@ -101,7 +101,7 @@ test('history shares one in-process accumulator and settles once', async () => {
 test('failed persistence is reported and does not poison later updates', async () => {
 	let updates = 0, errors = 0;
 	const history = createHistory({ keys: () => [], get() {}, update: async () => { if (++updates === 1) throw Error('disk'); } }, () => { errors++; });
-	history.start(); history.start(); await history.flush();
+	history.start(); await history.flush(); history.start(); await history.flush();
 	assert.equal(errors, 1);
 	assert.equal(updates, 2);
 	assert.equal(history.snapshot().requests, 2);
@@ -141,4 +141,122 @@ test('summary survives fresh storage reload without rewriting', async () => {
 	assert.equal(saved.tokensIn + saved.tokensOut, 385513887);
 	assert.deepEqual(saved, legacy);
 	assert.deepEqual(createHistory(storage()).snapshot(), saved);
+});
+
+test('independent windows cannot overwrite history with their stale snapshots', async () => {
+	const legacy = { requests: 10, tokensIn: 100, tokensOut: 200, inputUsageReports: 1, outputUsageReports: 1 };
+	const disk = new Map([['usageHistory.summary.v2', legacy]]);
+	const storage = () => {
+		const cache = new Map(disk);
+		return { keys: () => [...cache.keys()], get: key => cache.get(key), update: async (key, value) => {
+			cache.set(key, value); disk.set(key, value);
+		} };
+	};
+	const firstWindow = createHistory(storage());
+	const secondWindow = createHistory(storage());
+	firstWindow.start(); firstWindow.finish({ model: 'sample', hasInput: true, tokensIn: 7 });
+	await firstWindow.flush();
+	secondWindow.start(); secondWindow.finish({ model: 'sample', hasOutput: true, tokensOut: 9 });
+	await secondWindow.flush();
+	const reloaded = createHistory(storage()).snapshot();
+	assert.equal(reloaded.requests, 12);
+	assert.equal(reloaded.tokensIn, 107);
+	assert.equal(reloaded.tokensOut, 209);
+	assert.equal(reloaded.modelUsage[0].requests, 2);
+	assert.equal(reloaded.modelUsage[0].tokensIn, 7);
+	assert.equal(reloaded.modelUsage[0].tokensOut, 9);
+	assert.deepEqual(disk.get('usageHistory.summary.v2'), legacy);
+	assert.equal([...disk.keys()].filter(key => key.startsWith('usageHistory.window.v3.')).length, 2);
+});
+
+test('history observes peer records and coalesces queued writes without double counting', async () => {
+	const records = new Map();
+	const releases = [];
+	let writes = 0;
+	const storage = { keys: () => [...records.keys()], get: key => records.get(key), update: async (key, value) => {
+		writes++;
+		await new Promise(resolve => releases.push(resolve));
+		records.set(key, value);
+	} };
+	const history = createHistory(storage);
+	history.start(); history.start();
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(writes, 1);
+	history.start(); history.start(); history.start();
+	releases.shift()();
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(writes, 2);
+	releases.shift()(); await history.flush();
+	records.set('usageHistory.window.v3.peer', { requests: 3, tokensIn: 12 });
+	assert.equal(history.snapshot().requests, 8);
+	assert.equal(history.snapshot().tokensIn, 12);
+	assert.equal(createHistory({ ...storage }).snapshot().requests, 8);
+});
+
+test('independent history files survive whole-object Memento overwrites', async () => {
+	const files = new Map();
+	const joins = (directory, name) => directory + '/' + name;
+	const fileSystem = {
+		createDirectory: async () => {},
+		readDirectory: async directory => [...files.keys()].filter(path => path.startsWith(directory + '/')).map(path => [path.slice(directory.length + 1), 1]),
+		readFile: async path => files.get(path),
+		writeFile: async (path, bytes) => { files.set(path, bytes); },
+		rename: async (source, target) => { files.set(target, files.get(source)); files.delete(source); }
+	};
+	const legacy = { requests: 10, tokensIn: 100 };
+	const storage = () => ({ get: key => key === 'usageHistory.summary.v2' ? legacy : undefined, keys: () => ['usageHistory.summary.v2'],
+		update: () => assert.fail('new usage must not overwrite the shared Memento') });
+	const first = createHistory(storage(), () => assert.fail('unexpected storage error'), createHistoryFiles(fileSystem, '/history', joins));
+	const second = createHistory(storage(), () => assert.fail('unexpected storage error'), createHistoryFiles(fileSystem, '/history', joins));
+	await Promise.all([first.reload(), second.reload()]);
+	first.start(); second.start();
+	await Promise.all([first.flush(), second.flush()]);
+	assert.equal(files.size, 2);
+	assert.ok([...files.keys()].every(path => path.endsWith('.json')));
+	await first.reload(); await second.reload();
+	assert.equal(first.snapshot().requests, 12);
+	assert.equal(second.snapshot().requests, 12);
+	const reloaded = createHistory(storage(), () => assert.fail('unexpected reload error'), createHistoryFiles(fileSystem, '/history', joins));
+	await reloaded.reload();
+	assert.equal(reloaded.snapshot().requests, 12);
+	assert.equal(reloaded.snapshot().tokensIn, 100);
+});
+
+test('history files persist atomically across fresh stores on disk', async () => {
+	const fileSystem = require('node:fs/promises');
+	const { join } = require('node:path');
+	const { tmpdir } = require('node:os');
+	const directory = await fileSystem.mkdtemp(join(tmpdir(), 'genai-history-'));
+	const adapter = { createDirectory: path => fileSystem.mkdir(path, { recursive: true }),
+		readDirectory: async path => (await fileSystem.readdir(path)).map(name => [name, 1]),
+		readFile: path => fileSystem.readFile(path), writeFile: (path, bytes) => fileSystem.writeFile(path, bytes),
+		rename: (source, target) => fileSystem.rename(source, target) };
+	const storage = () => ({ get() {}, keys: () => [], update: () => assert.fail('Memento must remain unchanged') });
+	try {
+		const first = createHistory(storage(), () => assert.fail('write failed'), createHistoryFiles(adapter, directory, join));
+		const second = createHistory(storage(), () => assert.fail('write failed'), createHistoryFiles(adapter, directory, join));
+		first.start(); second.start();
+		await Promise.all([first.flush(), second.flush()]);
+		first.start(); await first.flush();
+		const restored = createHistory(storage(), () => assert.fail('read failed'), createHistoryFiles(adapter, directory, join));
+		await restored.reload();
+		assert.equal(restored.snapshot().requests, 3);
+		assert.equal((await fileSystem.readdir(directory)).filter(name => name.endsWith('.tmp')).length, 0);
+	} finally { await fileSystem.rm(directory, { recursive: true, force: true }); }
+});
+
+test('one corrupt history file does not hide healthy records or delete original data', async () => {
+	const data = new Map([
+		['usageHistory.window.v3.1111.json', Buffer.from('{"requests":3}')],
+		['usageHistory.window.v3.2222.json', Buffer.from('damaged')],
+		['usageHistory.window.v3.3333.json', Buffer.from('{"modelUsage":{}}')]
+	]);
+	let errors = 0;
+	const store = createHistoryFiles({ createDirectory: async () => {}, readDirectory: async () => [...data.keys()].map(name => [name, 1]),
+		readFile: async name => data.get(name) }, '', (directory, name) => name, () => { errors++; });
+	const history = createHistory({ get() {}, keys: () => [] }, () => assert.fail('whole reload must not fail'), store);
+	await history.reload();
+	assert.equal(history.snapshot().requests, 3);
+	assert.equal(errors, 2);
+	assert.equal(data.size, 3);
 });

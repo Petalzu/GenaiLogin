@@ -4,7 +4,7 @@ const { readConfig, isConfigured, preset, appendModels, removableModels, removeM
 
 async function configureModels(port) {
 	try {
-		const operation = await vscode.window.showQuickPick(['添加模型', '删除模型'], { title: 'GENAI · Copilot 模型管理' });
+		const operation = await vscode.window.showQuickPick(['添加模型', '删除模型'], { title: 'GENAI Login · Copilot 模型管理' });
 		if (!operation) return;
 		try { await vscode.commands.executeCommand('workbench.action.openLanguageModelsJson'); } catch {}
 		const active = vscode.window.activeTextEditor?.document;

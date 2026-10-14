@@ -1,9 +1,9 @@
 {
   "name": "genai-login",
   "displayName": "GENAI Login",
-  "description": "Manual GENAI login and local bridge",
+  "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.14",
+  "version": "0.0.16",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",
@@ -11,6 +11,12 @@
     "type": "git",
     "url": "https://github.com/Petalzu/GenaiLogin.git"
   },
+  "homepage": "https://github.com/Petalzu/GenaiLogin#readme",
+  "bugs": {
+    "url": "https://github.com/Petalzu/GenaiLogin/issues"
+  },
+  "icon": "media/genai-icon.png",
+  "keywords": ["genai", "umpass", "openai", "copilot", "authentication", "local-bridge"],
   "extensionKind": [
     "ui"
   ],
@@ -48,7 +54,7 @@
       "activitybar": [
         {
           "id": "genai-login",
-          "title": "GENAI",
+          "title": "GENAI Login",
           "icon": "media/genai-activity.svg"
         }
       ]
@@ -57,7 +63,7 @@
       "genai-login": [
         {
           "id": "genai-login.session",
-          "name": "GENAI Connection",
+          "name": "GENAI Login",
           "type": "webview"
         }
       ]
@@ -65,31 +71,31 @@
     "commands": [
       {
         "command": "genai-login.port",
-        "title": "GENAI: Set bridge port"
+        "title": "GENAI Login: Set bridge port"
       },
       {
         "command": "genai-login.models",
-        "title": "GENAI: Manage Copilot models"
+        "title": "GENAI Login: Manage Copilot models"
       },
       {
         "command": "genai-login.connect",
-        "title": "GENAI: Login and connect"
+        "title": "GENAI Login: Login and connect"
       },
       {
         "command": "genai-login.diagnose",
-        "title": "GENAI: Diagnose login in visible Edge"
+        "title": "GENAI Login: Diagnose login in visible Edge"
       },
       {
         "command": "genai-login.credentials",
-        "title": "GENAI: Save account and password"
+        "title": "GENAI Login: Save account and password"
       },
       {
         "command": "genai-login.disconnect",
-        "title": "GENAI: Disconnect"
+        "title": "GENAI Login: Disconnect"
       },
       {
         "command": "genai-login.clear",
-        "title": "GENAI: Clear saved credentials and session"
+        "title": "GENAI Login: Clear saved credentials and session"
       }
     ]
   },

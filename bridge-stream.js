@@ -26,7 +26,21 @@ function createRequestLifetime(response, parentSignal, idleMs = 0) {
 	if (response.destroyed) cancel();
 	if (signal.aborted) dispose();
 	touch();
-	return { signal, touch, dispose };
+	return { signal, touch, dispose, setIdleTimeout: milliseconds => { idleMs = milliseconds; touch(); } };
+}
+
+function waitForSignal(promise, signal) {
+	signal.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const aborted = () => { signal.removeEventListener('abort', aborted); reject(signal.reason); };
+		signal.addEventListener('abort', aborted, { once: true });
+		Promise.resolve(promise).then(value => {
+			signal.removeEventListener('abort', aborted); resolve(value);
+		}, error => {
+			signal.removeEventListener('abort', aborted); reject(error);
+		});
+		if (signal.aborted) aborted();
+	});
 }
 
 const reasoningFields = ['cot_summary', 'reasoning_text', 'reasoning_content', 'reasoning', 'thinking'];
@@ -132,4 +146,4 @@ function transportCode(error) {
 	return typeof code === 'string' && /^[A-Za-z0-9_]+$/.test(code) ? code : 'UNKNOWN';
 }
 
-module.exports = { createRequestLifetime, forwardBody, transportCode };
+module.exports = { createRequestLifetime, waitForSignal, forwardBody, transportCode };

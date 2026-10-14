@@ -1,8 +1,8 @@
 const vscode = require('vscode');
 const http = require('node:http');
-const { createRequestLifetime, forwardBody, transportCode } = require('./bridge-stream');
+const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('./bridge-stream');
 const { dashboardHtml } = require('./dashboard');
-const { createStats, createHistory, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
+const { createStats, createHistory, createHistoryFiles, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
 
 let stopActive;
 
@@ -51,7 +51,7 @@ class DashboardProvider {
 	}
 
 	refresh() {
-		this.view?.webview.postMessage({ type: 'state', data: this.getState() });
+		if (this.view?.visible) this.view.webview.postMessage({ type: 'state', data: this.getState() });
 	}
 
 	dispose() {
@@ -67,21 +67,34 @@ function activate(context) {
 	const output = vscode.window.createOutputChannel('GENAI Login');
 	context.subscriptions.push(output);
 	const trace = message => output.appendLine(`${new Date().toISOString()} ${message}`);
-	const history = createHistory(context.globalState, () => trace('History persistence failed; totals may not survive reload.'));
+	const historyFiles = context.globalStorageUri ? createHistoryFiles(vscode.workspace.fs,
+		vscode.Uri.joinPath(context.globalStorageUri, 'usage-history'), vscode.Uri.joinPath,
+		() => trace('An unreadable history record was preserved and skipped; other totals remain available.')) : undefined;
+	const history = createHistory(context.globalState, () => trace('History storage unavailable; totals may be incomplete or fail to survive reload.'), historyFiles);
 	let server, active, authentication, keepaliveTimer, keepaliveOwner;
 	let state = 'Disconnected';
+	let connection = 'disconnected', loginPhase;
+	const pendingActions = new Map();
 	let dashboard;
 	let sharedState, syncInFlight, syncDisposed = false;
 	let syncController = new AbortController();
 	let syncTimer;
 	let keepaliveInfo = { state: 'idle', lastCheckAt: null };
+	let sessionPersistence, sessionPersistenceInfo = 'idle';
 	const configuredPort = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
 	const stats = createStats(Number.isInteger(configuredPort) && configuredPort >= 1024 && configuredPort <= 65535 ? configuredPort : 58379);
 	let dispatcher;
 	context.subscriptions.push({ dispose: () => { void dispatcher?.destroy().catch(() => {}); } });
-	const status = value => { state = value; dashboard?.refresh(); };
+	const status = value => {
+		state = value;
+		connection = value.startsWith('Connected') ? 'connected' : value === 'Authenticating' ? 'authenticating' : value === 'Connecting' ? 'connecting' : value === 'Disconnected' ? 'disconnected' : 'error';
+		if (connection !== 'authenticating') loginPhase = undefined;
+		dashboard?.refresh();
+	};
 	const localSnapshot = () => ({
 		status: state,
+		connection, loginPhase, active: Boolean(active), listening: Boolean(server?.listening), shared: false,
+		pendingActions: [...pendingActions.keys()],
 		history: history.snapshot(),
 		port: stats.port,
 		connectedAt: stats.connectedAt,
@@ -95,9 +108,10 @@ function activate(context) {
 		modelUsage: modelUsageRows(stats.modelUsage),
 		pricing: DEEPSEEK_PRICING,
 		models: [...stats.models].map(([name, requests]) => ({ name, requests })).concat(stats.otherModels ? [{ name: '其他模型', requests: stats.otherModels }] : []),
-		keepalive: { ...keepaliveInfo }
+		keepalive: { ...keepaliveInfo },
+		sessionPersistence: sessionPersistenceInfo
 	});
-	const stateSnapshot = () => !active && sharedState ? { ...sharedState, status: `${sharedState.status} (shared window)` } : localSnapshot();
+	const stateSnapshot = () => !active && sharedState ? { ...sharedState, shared: true, pendingActions: [...pendingActions.keys()], status: `${sharedState.status} (shared window)` } : localSnapshot();
 	const syncSharedState = () => {
 		if (syncDisposed || active) return Promise.resolve();
 		if (syncInFlight) return syncInFlight;
@@ -131,6 +145,7 @@ function activate(context) {
 			syncInFlight = undefined;
 			return;
 		}
+		void history.reload().then(() => { if (!syncDisposed) dashboard?.refresh(); });
 		void syncSharedState();
 		syncTimer = setInterval(() => { void syncSharedState(); }, 2000);
 		syncTimer.unref?.();
@@ -145,8 +160,10 @@ function activate(context) {
 	};
 	const stop = () => {
 		active?.abort(); active = undefined; authentication = undefined;
+		pendingActions.delete('connect'); pendingActions.delete('diagnose');
 		clearTimeout(keepaliveTimer); keepaliveTimer = undefined; keepaliveOwner = undefined;
 		keepaliveInfo = { state: 'idle', lastCheckAt: null };
+		sessionPersistenceInfo = 'idle';
 		server?.closeAllConnections(); server?.close(); server = undefined;
 		stats.connectedAt = null; stats.requests = 0; stats.tokensIn = 0; stats.tokensOut = 0; stats.usageReports = 0; stats.usageMissing = 0; stats.models.clear(); stats.otherModels = 0;
 		stats.inputUsageReports = 0; stats.outputUsageReports = 0;
@@ -164,6 +181,7 @@ function activate(context) {
 		if (!await requireOwner()) return false;
 		if (active) throw new Error('Disconnect before changing credentials.');
 		await context.secrets.store('credentials', JSON.stringify({ username, password }));
+		await sessionPersistence?.flush();
 		await context.secrets.delete('session');
 		return true;
 	};
@@ -171,68 +189,137 @@ function activate(context) {
 		if (active) return;
 		await syncSharedState();
 		if (active || sharedState) return;
-		output.show(true);
+		await history.reload();
+		if (active || sharedState) return;
+		if (diagnostic) output.show(true);
 		trace(diagnostic ? 'Visible diagnostic connection requested' : 'Manual connection requested');
 		let stored = await context.secrets.get('credentials');
 		if (!stored) { if (!await credentials()) return; stored = await context.secrets.get('credentials'); }
 		if (active) return;
 		const controller = new AbortController(); active = controller;
 		try {
+		status('Connecting');
 		const { Agent, fetch: upstreamFetch } = require('undici');
-		const { Session, ORIGIN } = require('./auth');
+		const { Session, createKeepaliveSchedule, createSessionPersistence, ORIGIN } = require('./auth');
 		const { browserLogin: login } = require('./browser-auth');
 		dispatcher ??= new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 		keepaliveOwner = controller;
 		let keepaliveInFlight = false;
 		const account = JSON.parse(stored);
-		let session;
-		try { session = new Session(await context.secrets.get('session'), trace); } catch { trace('Saved cookie jar unavailable; starting fresh'); session = new Session(undefined, trace); }
+		let session, savedSession;
+		try { savedSession = await context.secrets.get('session'); session = new Session(savedSession, trace); } catch { savedSession = undefined; trace('Saved cookie jar unavailable; starting fresh'); session = new Session(undefined, trace); }
 		if (controller.signal.aborted) return;
-		const persist = async () => { controller.signal.throwIfAborted(); await context.secrets.store('session', JSON.stringify(session.jar.toJSON())); };
-		const authenticate = () => {
+		const isCurrentConnection = () => keepaliveOwner === controller && active === controller && !controller.signal.aborted;
+		const keepaliveSchedule = createKeepaliveSchedule(session);
+		sessionPersistenceInfo = 'idle';
+		const persistence = createSessionPersistence(session, context.secrets, isCurrentConnection, value => {
+			if (value === 'error' && sessionPersistenceInfo !== 'error') trace('Session persistence failed; live requests continue, but reload may require login.');
+			sessionPersistenceInfo = value; dashboard?.refresh();
+		}, Boolean(savedSession));
+		sessionPersistence = persistence;
+		const persist = () => persistence.save();
+		let retainedBrowser, reauthenticationBlocked = false;
+		const loginTrace = message => {
+			trace(message);
+			if (!isCurrentConnection()) return;
+			const phase = message === 'Checking saved session' ? 'checking-session' : message.startsWith('Starting temporary') ? 'opening-browser' :
+				message === 'Filling verified UMPASS login form' ? 'credentials' : message.startsWith('Waiting for Duo') || message.startsWith('Credentials submitted') ? 'mfa' :
+				message.startsWith('Waiting for UMPASS') ? 'umpass' : message === 'Checking GENAI callback' ? 'callback' : message === 'Waiting for identity redirect' ? 'redirect' : undefined;
+			if (phase && loginPhase !== phase) { loginPhase = phase; dashboard?.refresh(); }
+		};
+		const authenticate = (force = false) => {
 			if (!authentication) {
+				loginPhase = 'checking-session';
 				status('Authenticating');
-				authentication = login(session, account, controller.signal, trace, undefined, true, !diagnostic).then(async () => { await persist(); stats.connectedAt ??= Date.now(); trace('Authenticated; session saved'); status(`Connected :${stats.port}`); }).finally(() => { if (active === controller) authentication = undefined; });
+				authentication = (async () => {
+					await retainedBrowser?.(); retainedBrowser = undefined;
+					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic, { force });
+					controller.signal.throwIfAborted();
+					if (active !== controller) return;
+					void persist();
+					if (!isCurrentConnection()) return;
+					keepaliveSchedule.checked();
+					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
+					stats.connectedAt ??= Date.now(); trace('Authenticated; session persistence scheduled'); status(`Connected :${stats.port}`);
+				})().catch(error => {
+					if (force && isCurrentConnection()) {
+						reauthenticationBlocked = true;
+						keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
+						status('Authentication required; reconnect');
+					}
+					throw error;
+				}).finally(() => { if (active === controller) { authentication = undefined; if (!keepaliveInFlight) scheduleKeepalive(); } });
 			}
 			return authentication;
 		};
 		const scheduleKeepalive = () => {
-			if (keepaliveOwner !== controller || active !== controller || controller.signal.aborted) return;
+			if (!isCurrentConnection()) return;
 			clearTimeout(keepaliveTimer);
-			keepaliveTimer = setTimeout(runKeepalive, 60000);
+			keepaliveTimer = undefined;
+			if (authentication || reauthenticationBlocked) return;
+			const plan = keepaliveSchedule.snapshot();
+			const milliseconds = Math.max(0, plan.nextCheckAt - Date.now());
+			keepaliveInfo = { ...keepaliveInfo, nextCheckAt: plan.nextCheckAt, expiresAt: plan.expiresAt, expiring: plan.expiring };
+			keepaliveTimer = setTimeout(runKeepalive, milliseconds);
+			keepaliveTimer.unref?.();
 		};
-		const isCurrentConnection = () => keepaliveOwner === controller && active === controller && !controller.signal.aborted;
 		const runKeepalive = async () => {
 			if (!isCurrentConnection() || keepaliveInFlight) return;
+			if (authentication || reauthenticationBlocked) return;
+			const activityVersion = keepaliveSchedule.snapshot().activityVersion;
 			keepaliveInFlight = true;
 			keepaliveInfo = { state: 'checking', lastCheckAt: Date.now() };
 			dashboard?.refresh();
 			try {
 				const valid = await session.valid(AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]));
 				if (!isCurrentConnection()) return;
+				if (activityVersion !== keepaliveSchedule.snapshot().activityVersion) {
+					keepaliveSchedule.checked();
+					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
+					trace('Keepalive: stale check ignored after successful upstream activity');
+					return;
+				}
 				if (valid) {
-					await persist();
-					if (!isCurrentConnection()) return;
+					void persist();
+					keepaliveSchedule.checked();
 					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
 					trace('Keepalive: session valid');
 				} else {
 					keepaliveInfo = { state: 'reauthenticating', lastCheckAt: Date.now() };
 					dashboard?.refresh();
-					trace('Keepalive: session expired; reauthenticating');
-					await authenticate();
+					trace('Keepalive: authentication endpoint rejected the session; reauthenticating');
+					await authenticate(true);
 					if (!isCurrentConnection()) return;
-					await persist();
-					if (!isCurrentConnection()) return;
+					void persist();
+					keepaliveSchedule.checked();
 					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
 					trace('Keepalive: reauthenticated');
 				}
-			} catch { if (isCurrentConnection()) { keepaliveInfo = { state: 'error', lastCheckAt: Date.now() }; trace('Keepalive: check failed; will retry'); } }
+			} catch (error) {
+				if (isCurrentConnection()) {
+					if (reauthenticationBlocked) {
+						trace(`Keepalive: reauthentication failed code=${transportCode(error)}; manual reconnect required, active streams preserved`);
+						void reportError(error);
+						return;
+					}
+					const recentSuccess = activityVersion !== keepaliveSchedule.snapshot().activityVersion;
+					if (recentSuccess && !error.retryAfterMs) keepaliveSchedule.checked(); else keepaliveSchedule.failed(error.retryAfterMs);
+					keepaliveInfo = { state: recentSuccess ? 'healthy' : 'error', lastCheckAt: Date.now() };
+					trace(`Keepalive: temporary failure code=${transportCode(error)} status=${Number.isInteger(error.status) ? error.status : 'unknown'} recentSuccess=${recentSuccess}; no reauthentication`);
+				}
+			}
 			finally {
 				keepaliveInFlight = false;
 				if (isCurrentConnection()) { scheduleKeepalive(); dashboard?.refresh(); }
 			}
 		};
 		const startKeepalive = () => { clearTimeout(keepaliveTimer); scheduleKeepalive(); };
+		const noteActivity = (authenticated = true) => {
+			if (!isCurrentConnection()) return;
+			keepaliveSchedule.activity(authenticated);
+			if (!keepaliveInFlight && !reauthenticationBlocked) keepaliveInfo = { state: 'healthy', lastCheckAt: keepaliveInfo.lastCheckAt };
+			scheduleKeepalive();
+		};
 		const sendError = (response, code, message) => { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message } })); };
 		const settleRequest = requestStats => {
 			history.finish(requestStats);
@@ -249,16 +336,22 @@ function activate(context) {
 			}
 			const route = request.method === 'POST' && request.url === '/v1/chat/completions' ? '/api/v1/chat/completions' : request.method === 'GET' && request.url === '/v1/models' ? '/api/v1/models' : null;
 			if (!route) return sendError(response, 404, 'Not found');
-			if (authentication) await authentication;
-			const chunks = []; let size = 0;
-			for await (const chunk of request) { size += chunk.length; if (size > 20 * 1024 * 1024) return sendError(response, 413, 'Request too large'); chunks.push(chunk); }
-			if (response.destroyed) return;
-			const idleSeconds = vscode.workspace.getConfiguration('genai-login').get('idleTimeoutSeconds', 0);
-			const lifetime = createRequestLifetime(response, controller.signal, Number.isInteger(idleSeconds) && idleSeconds >= 0 && idleSeconds <= 86400 ? idleSeconds * 1000 : 0);
+			const lifetime = createRequestLifetime(response, controller.signal);
+			const cancelRequest = () => request.destroy();
+			lifetime.signal.addEventListener('abort', cancelRequest, { once: true });
 			const startedAt = Date.now();
 			let bytes = 0;
 			let requestStats, usageParser;
 			try {
+			if (reauthenticationBlocked) return sendError(response, 401, 'Session authentication failed. Disconnect and reconnect after completing verification.');
+			if (authentication) await waitForSignal(authentication, lifetime.signal);
+			lifetime.signal.throwIfAborted();
+			const chunks = []; let size = 0;
+			for await (const chunk of request) { lifetime.signal.throwIfAborted(); size += chunk.length; if (size > 20 * 1024 * 1024) return sendError(response, 413, 'Request too large'); chunks.push(chunk); }
+			lifetime.signal.throwIfAborted();
+			const idleSeconds = vscode.workspace.getConfiguration('genai-login').get('idleTimeoutSeconds', 0);
+			const idleMs = Number.isInteger(idleSeconds) && idleSeconds >= 0 && idleSeconds <= 86400 ? idleSeconds * 1000 : 0;
+			lifetime.setIdleTimeout(idleMs);
 			const options = { method: request.method, body: request.method === 'POST' ? Buffer.concat(chunks) : undefined, headers: { 'content-type': 'application/json', Accept: 'application/json' }, signal: lifetime.signal, fetch: upstreamFetch, dispatcher };
 			if (request.method === 'POST') {
 				requestStats = recordRequest(stats, options.body);
@@ -268,27 +361,38 @@ function activate(context) {
 			let result = await session.request(ORIGIN + route, options);
 			if (result.status === 401) {
 				await result.body?.cancel();
-				try { await authenticate(); } catch { sendError(response, 401, 'Automatic login failed; reconnect after checking credentials or verification.'); if (active === controller) stop(); return; }
+				trace('Proxy: authentication rejected with HTTP 401; attempting one login before forwarding');
+				lifetime.setIdleTimeout(0);
+				try { await waitForSignal(authenticate(true), lifetime.signal); } catch (error) {
+					if (lifetime.signal.aborted) throw error;
+					sendError(response, 401, 'Automatic login failed; disconnect and reconnect after checking credentials or verification.'); return;
+				}
 				lifetime.signal.throwIfAborted();
-				lifetime.touch();
+				lifetime.setIdleTimeout(idleMs);
 				result = await session.request(ORIGIN + route, options);
 			}
 			lifetime.touch();
-			await persist(); status(`Connected :${stats.port}`);
+			void persist();
 			const contentType = result.headers.get('content-type') || 'application/json';
+			const sessionAccepted = result.ok && /application\/json|text\/event-stream/i.test(contentType);
+			if (sessionAccepted) noteActivity();
+			if (isCurrentConnection() && !authentication && !reauthenticationBlocked) status(`Connected :${stats.port}`);
 			response.writeHead(result.status, { 'content-type': contentType });
 			if (!result.body) { settleRequest(requestStats); return response.end(); }
 			usageParser = createUsageParser(contentType, requestStats);
 			await forwardBody(result.body, response, lifetime, chunk => {
 				bytes += chunk.length;
 				usageParser.consume(chunk);
+				if (sessionAccepted && Date.now() - keepaliveSchedule.snapshot().lastActivityAt >= 15000) noteActivity(false);
 			}, result.status === 200 && contentType.toLowerCase().includes('text/event-stream'));
+			if (sessionAccepted) noteActivity(false);
 			trace(`Proxy completed: status=${result.status} elapsedMs=${Date.now() - startedAt} bytes=${bytes}`);
 			} catch (error) {
 				const reason = lifetime.signal.reason?.name === 'TimeoutError' ? lifetime.signal.reason : error;
 				trace(`Proxy failed: code=${transportCode(reason)} elapsedMs=${Date.now() - startedAt} bytes=${bytes} cancelled=${lifetime.signal.aborted}`);
 				throw error;
 			} finally {
+				lifetime.signal.removeEventListener('abort', cancelRequest);
 				lifetime.dispose();
 				usageParser?.finish();
 				if (usageParser) trace(`Proxy formatting: ${JSON.stringify(usageParser.formatting)}`);
@@ -297,7 +401,7 @@ function activate(context) {
 		};
 		server = http.createServer((request, response) => { handle(request, response).catch(() => {
 			if (response.destroyed) return;
-			if (!controller.signal.aborted) status('Network error; retry request');
+			if (active === controller && !controller.signal.aborted) status('Network error; retry request');
 			if (!response.headersSent) sendError(response, 502, 'Upstream request failed. Retry when network is available.'); else response.destroy();
 		}); });
 			status('Connecting');
@@ -305,6 +409,7 @@ function activate(context) {
 			await authenticate();
 			startKeepalive();
 		} catch (error) {
+			if (controller.signal.aborted) return;
 			trace('Connection failed; inspect preceding stage (no credentials logged)'); output.show(true);
 			if (active === controller) stop();
 			if (error.code === 'EADDRINUSE') { await syncSharedState(); if (sharedState) return; }
@@ -322,7 +427,7 @@ function activate(context) {
 		try {
 			const configuration = vscode.workspace.getConfiguration('genai-login');
 			const value = await vscode.window.showInputBox({
-				title: '设置 GENAI 端口',
+				title: '设置 GENAI Login 端口',
 				value: String(configuration.get('port', 58379)),
 				prompt: `当前窗口使用 ${stats.port}；输入 1024–65535，留空恢复默认 58379。重载后生效。`,
 				ignoreFocusOut: true,
@@ -340,14 +445,41 @@ function activate(context) {
 		if (active) { await vscode.window.showInformationMessage('Disconnect GENAI before starting a visible diagnostic login.'); return; }
 		await connect(true);
 	};
-	const actions = { connect, diagnose, credentials, models, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => { if (!await requireOwner()) return; stop(); await context.secrets.delete('credentials'); await context.secrets.delete('session'); } };
-	const reportError = error => vscode.window.showErrorMessage(error?.code === 'EADDRINUSE' ? `Port ${stats.port} is occupied. Stop the old bridge or configure another port and reload.` : 'GENAI login failed or timed out. Check GENAI Login output, installed Edge, credentials and MFA.');
-	for (const [name, action] of Object.entries(actions)) context.subscriptions.push(vscode.commands.registerCommand(`genai-login.${name}`, async () => {
-		try { await action(); } catch (error) { reportError(error); }
-	}));
+	const actions = { connect, diagnose, credentials, models, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => {
+		if (!await requireOwner()) return;
+		const owner = active;
+		const answer = await vscode.window.showWarningMessage('清除保存的账号和 Cookie？', { modal: true, detail: '当前连接将断开，账号和 Cookie 将删除。历史用量保留；此操作不会撤销服务器端会话。' }, '清除凭据');
+		if (answer !== '清除凭据' || !await requireOwner() || active !== owner) return;
+		stop(); await sessionPersistence?.flush(); await context.secrets.delete('credentials'); await context.secrets.delete('session');
+	} };
+	const reportError = async error => {
+		if (error?.name === 'AbortError') return;
+		const message = error?.code === 'EADDRINUSE' ? `端口 ${stats.port} 已占用。请关闭其他桥接，或设置另一个端口后重载。` :
+			error?.code === 'SESSION_UNAVAILABLE' ? 'GENAI 暂时不可用或请求受限。现有凭据未清除，请稍后重试。' :
+			/msedge|executable.*exist|browser.*not found/i.test(error?.message || '') ? '无法启动 Microsoft Edge。请确认 Edge 已安装，再重试连接。' :
+			error?.code === 'CREDENTIALS_REJECTED' ? 'UMPASS 未接受登录。请检查账号和密码，再重试。' :
+			error?.name === 'TimeoutError' ? '登录等待超时。请确认手机上的 MFA 已完成，或使用可见诊断查看阻塞页面。' :
+			/ERR_|UND_ERR|ECONN|ENOTFOUND/.test(transportCode(error)) ? '登录网络连接失败。请检查网络后重试，保存的凭据未清除。' :
+			'GENAI 登录未完成。请查看日志中的失败阶段，或使用可见诊断。';
+		const choice = await vscode.window.showErrorMessage(message, '查看日志', '可见诊断');
+		if (choice === '查看日志') output.show(true);
+		if (choice === '可见诊断') { try { await actions.diagnose(); } catch { output.show(true); } }
+	};
+	for (const [name, action] of Object.entries(actions)) {
+		actions[name] = async () => {
+			const exclusive = ['connect', 'diagnose', 'credentials', 'clear'];
+			if (pendingActions.has(name) || (exclusive.includes(name) && exclusive.some(value => pendingActions.has(value)))) return;
+			const operation = {};
+			pendingActions.set(name, operation); dashboard?.refresh();
+			try { return await action(); } finally { if (pendingActions.get(name) === operation) pendingActions.delete(name); dashboard?.refresh(); }
+		};
+		context.subscriptions.push(vscode.commands.registerCommand(`genai-login.${name}`, async () => {
+			try { await actions[name](); } catch (error) { await reportError(error); }
+		}));
+	}
 	dashboard = new DashboardProvider(stateSnapshot, actions, reportError, setSyncVisible, trace);
 	context.subscriptions.push({ dispose: () => { syncDisposed = true; clearInterval(syncTimer); syncController.abort(); } });
-	context.subscriptions.push(vscode.window.registerWebviewViewProvider('genai-login.session', dashboard, { webviewOptions: { retainContextWhenHidden: true } }), { dispose: () => dashboard.dispose() }, { dispose: stop });
+	context.subscriptions.push(vscode.window.registerWebviewViewProvider('genai-login.session', dashboard, { webviewOptions: { retainContextWhenHidden: false } }), { dispose: () => dashboard.dispose() }, { dispose: stop });
 }
 function deactivate() { stopActive?.(); }
 module.exports = { activate, deactivate };

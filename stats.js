@@ -1,4 +1,5 @@
 const { StringDecoder } = require('node:string_decoder');
+const { randomUUID } = require('node:crypto');
 const modelPricing = require('./model-pricing.json');
 
 const DEEPSEEK_PRICING = Object.freeze({
@@ -61,30 +62,68 @@ function recordModelUsage(models, request) {
 
 const historyStores = new WeakMap();
 
-function createHistory(storage, onError = () => {}) {
-	const key = 'usageHistory.summary.v2';
+function createHistoryFiles(fileSystem, directory, joinPath, onError = () => {}) {
+	let ready;
+	const ensureDirectory = () => ready ??= fileSystem.createDirectory(directory).catch(error => { ready = undefined; throw error; });
+	return {
+		async read() {
+			await ensureDirectory();
+			const entries = await fileSystem.readDirectory(directory);
+			const records = await Promise.all(entries.filter(([name]) => /^usageHistory\.window\.v3\.[0-9a-f-]+\.json$/.test(name)).map(async ([name]) => {
+				try {
+					const record = JSON.parse(Buffer.from(await fileSystem.readFile(joinPath(directory, name))).toString('utf8'));
+					if (!record || typeof record !== 'object' || (record.modelUsage !== undefined && !Array.isArray(record.modelUsage))) throw new Error('Invalid usage record');
+					return [name.slice(0, -5), record];
+				} catch { onError(); return undefined; }
+			}));
+			return records.filter(Boolean);
+		},
+		async update(key, value) {
+			await ensureDirectory();
+			const temporary = joinPath(directory, key + '.tmp');
+			const destination = joinPath(directory, key + '.json');
+			await fileSystem.writeFile(temporary, Buffer.from(JSON.stringify(value)));
+			await fileSystem.rename(temporary, destination, { overwrite: true });
+		}
+	};
+}
+
+function createHistory(storage, onError = () => {}, recordStore) {
+	const legacyKey = 'usageHistory.summary.v2';
+	const prefix = 'usageHistory.window.v3.';
 	let shared = historyStores.get(storage);
 	if (!shared) {
 		const total = { requests: 0, tokensIn: 0, tokensOut: 0, inputUsageReports: 0, outputUsageReports: 0 };
 		const models = new Map();
-		const saved = storage.get(key);
-		const records = saved ? [saved] : [];
-		for (const record of records) {
-			for (const field of Object.keys(total)) {
-				if (Number.isSafeInteger(record?.[field]) && record[field] >= 0) total[field] += record[field];
-			}
-			mergeModelUsage(models, record?.modelUsage);
-		}
-		shared = { total, models, pending: Promise.resolve() };
+		shared = { total, models, key: prefix + randomUUID(), pending: Promise.resolve(), saving: false, records: new Map(), recordStore };
 		historyStores.set(storage, shared);
 	}
 	const { total, models } = shared;
-	const snapshot = () => ({ ...total, ...(models.size ? { modelUsage: modelUsageRows(models) } : {}) });
+	const deltaSnapshot = () => ({ ...total, ...(models.size ? { modelUsage: modelUsageRows(models) } : {}) });
+	const snapshot = () => {
+		const result = { ...total };
+		const combined = new Map();
+		mergeModelUsage(combined, modelUsageRows(models));
+		const records = [storage.get(legacyKey), ...[...shared.records].filter(([key]) => key !== shared.key).map(([, value]) => value),
+			...(storage.keys?.() || []).filter(key => key.startsWith(prefix) && key !== shared.key).map(key => storage.get(key))];
+		for (const record of records) {
+			for (const field of Object.keys(total)) {
+				if (Number.isSafeInteger(record?.[field]) && record[field] >= 0) result[field] += record[field];
+			}
+			mergeModelUsage(combined, record?.modelUsage);
+		}
+		return { ...result, ...(combined.size ? { modelUsage: modelUsageRows(combined) } : {}) };
+	};
 	const save = () => {
-		const value = snapshot();
+		shared.requested = deltaSnapshot();
+		if (shared.saving) return;
+		shared.saving = true;
 		shared.pending = shared.pending.then(async () => {
-			await storage.update(key, value);
-		}).catch(onError);
+			while (shared.requested) {
+				const value = shared.requested; shared.requested = undefined;
+				try { await (shared.recordStore || storage).update(shared.key, value); } catch { onError(); }
+			}
+		}).finally(() => { shared.saving = false; });
 	};
 	return {
 		start() { total.requests++; save(); },
@@ -97,6 +136,13 @@ function createHistory(storage, onError = () => {}) {
 			save();
 		},
 		snapshot,
+		reload() {
+			if (!shared.recordStore) return Promise.resolve();
+			if (!shared.loading) shared.loading = shared.recordStore.read().then(records => {
+				shared.records = new Map(records);
+			}).catch(onError).finally(() => { shared.loading = undefined; });
+			return shared.loading;
+		},
 		flush: () => shared.pending
 	};
 }
@@ -273,6 +319,7 @@ module.exports = {
 	DEEPSEEK_PRICING,
 	modelUsageRows,
 	createHistory,
+	createHistoryFiles,
 	MAX_TRACKED_MODELS,
 	MAX_SSE_LINE_LENGTH,
 	MAX_JSON_STATS_BODY,

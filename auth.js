@@ -1,10 +1,92 @@
 const { CookieJar } = require('tough-cookie');
-const { load } = require('cheerio');
 const ORIGIN = 'https://chat.genai.um.edu.mo';
 const HOSTS = new Set(['chat.genai.um.edu.mo', 'login.um.edu.mo', 'websso.um.edu.mo']);
+const sessionWrites = new WeakMap();
+
+function createKeepaliveSchedule(session, now = Date.now) {
+    let lastActivityAt = now(), lastCheckAt = now(), failures = 0, retryAt, cooldownAt = 0, activityVersion = 0;
+    const snapshot = () => {
+        const current = now();
+        const expiresAt = session.expiresAt?.() ?? null;
+        let nextCheckAt = retryAt ?? Math.min(lastActivityAt + 120000, lastCheckAt + 300000);
+        if (expiresAt !== null && retryAt === undefined) {
+            const deadline = expiresAt - 60000 > lastCheckAt ? expiresAt - 60000 : expiresAt;
+            nextCheckAt = Math.min(nextCheckAt, Math.max(lastCheckAt + 30000, deadline));
+        }
+        return { nextCheckAt: Math.max(current, nextCheckAt, cooldownAt), expiresAt, lastActivityAt, activityVersion,
+            expiring: expiresAt !== null && expiresAt - current <= 60000 };
+    };
+    return {
+        activity(authenticated = true) {
+            lastActivityAt = now();
+            if (authenticated) { activityVersion++; failures = 0; retryAt = undefined; }
+        },
+        checked() { lastCheckAt = now(); lastActivityAt = now(); failures = 0; retryAt = undefined; cooldownAt = 0; },
+        failed(retryAfterMs = 0) {
+            failures++;
+            lastCheckAt = now();
+            const delay = Math.min(30000 * 2 ** Math.min(failures - 1, 4), 300000);
+            cooldownAt = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? now() + retryAfterMs : 0;
+            retryAt = now() + Math.max(delay, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+        },
+        snapshot
+    };
+}
+
+function createSessionPersistence(session, secrets, isCurrent, onState = () => {}, initiallySaved = false) {
+    const fingerprint = snapshot => JSON.stringify({ ...snapshot, cookies: snapshot.cookies?.map(cookie => {
+        const value = { ...cookie }; delete value.lastAccessed; return value;
+    }) });
+    let saved = initiallySaved ? fingerprint(session.jar.toJSON()) : undefined;
+    let requested, pending;
+    const save = () => {
+        if (!isCurrent()) return Promise.resolve(false);
+        const snapshot = session.jar.toJSON();
+        const next = { fingerprint: fingerprint(snapshot), value: JSON.stringify(snapshot) };
+        if (next.fingerprint === saved && !pending) return Promise.resolve(true);
+        requested = next;
+        if (pending) return pending;
+        const previous = sessionWrites.get(secrets) || Promise.resolve();
+        pending = previous.catch(() => {}).then(async () => {
+            while (requested && isCurrent()) {
+                const value = requested; requested = undefined;
+                if (value.fingerprint === saved) continue;
+                try {
+                    await secrets.store('session', value.value);
+                    if (!isCurrent()) return false;
+                    saved = value.fingerprint;
+                    onState('saved');
+                } catch {
+                    requested = undefined;
+                    if (isCurrent()) onState('error');
+                    return false;
+                }
+            }
+            return isCurrent();
+        }).finally(() => { pending = undefined; });
+        sessionWrites.set(secrets, pending);
+        return pending;
+    };
+    return { save, flush: () => pending || Promise.resolve() };
+}
 
 class Session {
     constructor(saved, trace = () => {}) { this.jar = saved ? CookieJar.fromJSON(saved) : new CookieJar(); this.trace = trace; }
+    expiresAt() {
+        const token = this.jar.getCookiesSync(ORIGIN, { expire: false }).find(cookie => cookie.key === 'token');
+        if (!token) return null;
+        const deadlines = [];
+        const cookieExpiry = token.expiryTime();
+        if (Number.isFinite(cookieExpiry)) deadlines.push(cookieExpiry);
+        if (token.value.length <= 16384) {
+            try {
+                const parts = token.value.split('.');
+                const claims = parts.length === 3 ? JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) : null;
+                if (Number.isSafeInteger(claims?.exp) && claims.exp > 0 && claims.exp <= 8640000000000) deadlines.push(claims.exp * 1000);
+            } catch {}
+        }
+        return deadlines.length ? Math.min(...deadlines) : null;
+    }
     async request(url, options = {}) {
         let current = new URL(url);
         let method = options.method || 'GET';
@@ -25,23 +107,43 @@ class Session {
             for (const cookie of response.headers.getSetCookie()) await this.jar.setCookie(cookie, current.href);
             const location = response.headers.get('location');
             if (![301, 302, 303, 307, 308].includes(response.status) || !location) return response;
+            const next = new URL(location, current);
+            if (options.checkSession && next.protocol === 'https:' && HOSTS.has(next.hostname) &&
+                (next.origin !== ORIGIN || next.pathname === '/oauth/oidc/login')) return response;
             await response.body?.cancel();
             if (response.status === 303 || ([301, 302].includes(response.status) && method === 'POST')) { method = 'GET'; body = undefined; }
-            const next = new URL(location, current);
             if (body && next.origin !== current.origin) throw new Error('Cross-origin POST redirect refused');
             current = next;
         }
         throw new Error('Too many authentication redirects');
     }
     async valid(signal) {
-        const response = await this.request(`${ORIGIN}/api/v1/models`, { signal });
-        const valid = response.ok && (response.headers.get('content-type') || '').includes('application/json');
+        const response = await this.request(`${ORIGIN}/api/v1/auths/`, { signal, checkSession: true });
+        const contentType = (response.headers.get('content-type') || '').toLowerCase();
         await response.body?.cancel();
-        return valid;
+        if (response.ok && contentType.includes('application/json')) return true;
+        if (response.status === 401) return false;
+        if ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
+            const next = new URL(response.headers.get('location'), response.url || ORIGIN);
+            if (next.protocol === 'https:' && HOSTS.has(next.hostname) &&
+                (next.origin !== ORIGIN || next.pathname === '/oauth/oidc/login')) return false;
+        }
+        if (response.ok && contentType.includes('text/html') && response.url &&
+            ['login.um.edu.mo', 'websso.um.edu.mo'].includes(new URL(response.url).hostname)) return false;
+        throw Object.assign(new Error('Session check temporarily unavailable'), {
+            code: 'SESSION_UNAVAILABLE', status: response.status,
+            retryAfterMs: (() => {
+                const value = response.headers.get('retry-after');
+                if (!value) return 0;
+                const milliseconds = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+                return Number.isFinite(milliseconds) ? Math.min(Math.max(0, milliseconds), 86400000) : 0;
+            })()
+        });
     }
 }
 
 function forms(html, url) {
+    const { load } = require('cheerio');
     const document = load(html);
     return document('form').toArray().map(element => {
         const form = document(element);
@@ -90,4 +192,4 @@ async function login(session, credentials, signal, trace = () => {}) {
     }
     throw new Error('Authentication step limit exceeded');
 }
-module.exports = { Session, forms, ORIGIN, login };
+module.exports = { Session, createKeepaliveSchedule, createSessionPersistence, forms, ORIGIN, login };
