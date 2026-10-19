@@ -1,6 +1,56 @@
-const { Cookie } = require('tough-cookie');
 const { setTimeout: delay } = require('node:timers/promises');
-const { ORIGIN } = require('./auth');
+const { fork } = require('node:child_process');
+const { Cookie, Session, ORIGIN } = require('./auth');
+
+function isolatedBrowserLogin(session, credentials, bounded, signal, trace, keepOpen, headless) {
+    return new Promise((resolve, reject) => {
+        const child = fork(__filename, [], { execArgv: [], windowsHide: true,
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+        let verified = false, returned = false, failure, closing = false;
+        let importing = Promise.resolve(), resolveExit;
+        const exited = new Promise(resolve => { resolveExit = resolve; });
+        const close = () => {
+            if (!closing && child.connected) { closing = true; child.send({ type: 'abort' }, () => {}); }
+            return exited;
+        };
+        const release = () => { bounded.removeEventListener('abort', close); signal?.removeEventListener('abort', close); };
+        bounded.addEventListener('abort', close, { once: true });
+        child.on('message', message => {
+            if (message.type === 'trace') trace(message.value);
+            if (message.type === 'error') failure = Object.assign(new Error(message.message), { name: message.name, code: message.code });
+            if (message.type === 'verified') {
+                importing = (async () => {
+                    bounded.throwIfAborted();
+                    for (const cookie of message.cookies) await session.jar.setCookie(Cookie.fromJSON(cookie), ORIGIN);
+                    bounded.throwIfAborted();
+                    verified = true;
+                    if (keepOpen) {
+                        bounded.removeEventListener('abort', close);
+                        signal.addEventListener('abort', close, { once: true });
+                        if (signal.aborted) { await close(); signal.throwIfAborted(); }
+                        returned = true;
+                        resolve(close);
+                    }
+                })().catch(error => { failure = error; void close(); });
+            }
+        });
+        child.on('error', error => { failure = error; });
+        child.once('close', async code => {
+            release();
+            resolveExit();
+            await importing;
+            if (returned) return;
+            if (bounded.aborted) reject(bounded.reason);
+            else if (failure) reject(failure);
+            else if (verified && code === 0) resolve();
+            else reject(new Error('Browser authentication process exited before verification'));
+        });
+        child.send({ kind: 'genai-browser-login', saved: JSON.stringify(session.jar.toJSON()), credentials, keepOpen, headless }, error => {
+            if (error) { failure = error; child.kill(); }
+        });
+        if (bounded.aborted) void close();
+    });
+}
 
 function authenticationLocation(url) {
     const location = new URL(url);
@@ -19,6 +69,7 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
         bounded.throwIfAborted(); return;
     }
     bounded.throwIfAborted();
+    if (!launcher) return isolatedBrowserLogin(session, credentials, bounded, signal, trace, keepOpen, headless);
     launcher ??= require('playwright-core').chromium;
     let browser;
     let retained = false;
@@ -114,7 +165,10 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
                     if (keepOpen) {
                         retained = true;
                         signal.addEventListener('abort', close, { once: true });
-                        browser.once?.('disconnected', release);
+                        browser.once?.('disconnected', () => {
+                            release();
+                            if (require.main === module && process.connected) process.disconnect();
+                        });
                         trace('Diagnostic mode: Edge retained until Disconnect');
                         return close;
                     }
@@ -151,4 +205,40 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
         if (browser && !retained) { await close(); trace('Temporary Edge closed'); }
     }
 }
+
+if (require.main === module && typeof process.send === 'function') process.once('message', options => {
+    if (options?.kind !== 'genai-browser-login') return;
+    const controller = new AbortController();
+    let retained;
+    const finish = () => { if (process.connected) process.disconnect(); };
+    const send = message => { if (process.connected) process.send(message, () => {}); };
+    const abort = () => {
+        controller.abort();
+        if (retained) void retained().finally(finish);
+    };
+    process.on('disconnect', abort);
+    process.on('message', message => {
+        if (message.type !== 'abort') return;
+        abort();
+    });
+    void (async () => {
+        const session = new Session(options.saved);
+        const imported = new Map();
+        const setCookie = session.jar.setCookie.bind(session.jar);
+        session.jar.setCookie = async (...args) => {
+            const cookie = await setCookie(...args);
+            imported.set(JSON.stringify([cookie.domain, cookie.path, cookie.key]), cookie.toJSON());
+            return cookie;
+        };
+        try {
+            retained = await browserLogin(session, options.credentials, controller.signal,
+                value => send({ type: 'trace', value }), require('playwright-core').chromium, options.keepOpen, options.headless, { force: true });
+            send({ type: 'verified', cookies: [...imported.values()] });
+            if (!retained || controller.signal.aborted) { await retained?.(); finish(); }
+        } catch (error) {
+            send({ type: 'error', name: error.name, code: error.code, message: error.message });
+            finish();
+        }
+    })();
+});
 module.exports = { browserLogin };

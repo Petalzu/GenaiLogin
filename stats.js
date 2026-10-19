@@ -1,5 +1,4 @@
 const { StringDecoder } = require('node:string_decoder');
-const { randomUUID } = require('node:crypto');
 const modelPricing = require('./model-pricing.json');
 
 const DEEPSEEK_PRICING = Object.freeze({
@@ -95,24 +94,29 @@ function createHistory(storage, onError = () => {}, recordStore) {
 	if (!shared) {
 		const total = { requests: 0, tokensIn: 0, tokensOut: 0, inputUsageReports: 0, outputUsageReports: 0 };
 		const models = new Map();
-		shared = { total, models, key: prefix + randomUUID(), pending: Promise.resolve(), saving: false, records: new Map(), recordStore };
+		shared = { total, models, key: prefix + require('node:crypto').randomUUID(), pending: Promise.resolve(), saving: false, records: new Map(), recordStore };
 		historyStores.set(storage, shared);
 	}
 	const { total, models } = shared;
 	const deltaSnapshot = () => ({ ...total, ...(models.size ? { modelUsage: modelUsageRows(models) } : {}) });
+	const copySnapshot = value => ({ ...value, ...(value.modelUsage ? { modelUsage: value.modelUsage.map(row => ({ ...row })) } : {}) });
 	const snapshot = () => {
+		const legacy = storage.get(legacyKey);
+		const stored = (storage.keys?.() || []).filter(key => key.startsWith(prefix) && key !== shared.key).map(key => storage.get(key));
+		if (shared.recordStore && shared.snapshotCache && shared.legacy === legacy && !stored.length) return copySnapshot(shared.snapshotCache);
 		const result = { ...total };
 		const combined = new Map();
 		mergeModelUsage(combined, modelUsageRows(models));
-		const records = [storage.get(legacyKey), ...[...shared.records].filter(([key]) => key !== shared.key).map(([, value]) => value),
-			...(storage.keys?.() || []).filter(key => key.startsWith(prefix) && key !== shared.key).map(key => storage.get(key))];
+		const records = [legacy, ...[...shared.records].filter(([key]) => key !== shared.key).map(([, value]) => value), ...stored];
 		for (const record of records) {
 			for (const field of Object.keys(total)) {
 				if (Number.isSafeInteger(record?.[field]) && record[field] >= 0) result[field] += record[field];
 			}
 			mergeModelUsage(combined, record?.modelUsage);
 		}
-		return { ...result, ...(combined.size ? { modelUsage: modelUsageRows(combined) } : {}) };
+		const value = { ...result, ...(combined.size ? { modelUsage: modelUsageRows(combined) } : {}) };
+		if (shared.recordStore && !stored.length) { shared.snapshotCache = value; shared.legacy = legacy; }
+		return copySnapshot(value);
 	};
 	const save = () => {
 		shared.requested = deltaSnapshot();
@@ -126,10 +130,11 @@ function createHistory(storage, onError = () => {}, recordStore) {
 		}).finally(() => { shared.saving = false; });
 	};
 	return {
-		start() { total.requests++; save(); },
+		start() { total.requests++; shared.snapshotCache = undefined; save(); },
 		finish(request) {
 			if (!request || request.historyCommitted) return;
 			request.historyCommitted = true;
+			shared.snapshotCache = undefined;
 			if (request.hasInput) { total.tokensIn += request.tokensIn; total.inputUsageReports++; }
 			if (request.hasOutput) { total.tokensOut += request.tokensOut; total.outputUsageReports++; }
 			recordModelUsage(models, request);
@@ -140,6 +145,7 @@ function createHistory(storage, onError = () => {}, recordStore) {
 			if (!shared.recordStore) return Promise.resolve();
 			if (!shared.loading) shared.loading = shared.recordStore.read().then(records => {
 				shared.records = new Map(records);
+				shared.snapshotCache = undefined;
 			}).catch(onError).finally(() => { shared.loading = undefined; });
 			return shared.loading;
 		},

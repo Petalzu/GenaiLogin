@@ -16,21 +16,62 @@ function connectionHarness(options = {}) {
     const loginCalls = [];
     const servers = [];
     let provider;
+    let mcpProvider, configurationChanged;
+    let mcpEnabled = options.mcpEnabled || false;
+    const updates = [], notices = [];
+    const loaded = [];
+    const saved = new Map(options.credentials === false ? [] : [['credentials', '{"username":"test","password":"dummy"}']]);
     const disposable = { dispose() {} };
     const fakeVscode = {
-        workspace: { getConfiguration: () => ({ get: (key, fallback) => key === 'idleTimeoutSeconds' ? options.idleSeconds || 0 : fallback }) },
+        workspace: {
+            getConfiguration: () => ({
+                get: (key, fallback) => key === 'idleTimeoutSeconds' ? options.idleSeconds || 0 : key === 'port' ? options.port || fallback : key === 'imageMcp.enabled' ? mcpEnabled : fallback,
+                update: async (...args) => {
+                    updates.push(args); mcpEnabled = args[1];
+                    configurationChanged?.({ affectsConfiguration: name => name === 'genai-login.imageMcp.enabled' });
+                }
+            }),
+            onDidChangeConfiguration: callback => { configurationChanged = callback; return disposable; }
+        },
+        ConfigurationTarget: { Global: 1 },
         window: {
             createOutputChannel: () => ({ ...disposable, appendLine() {}, show() {} }),
             registerWebviewViewProvider: (name, value) => { provider = value; return disposable; },
-            showInformationMessage: async () => {}, showErrorMessage: async () => {},
+            showInformationMessage: async message => { notices.push(message); }, showErrorMessage: async () => {},
             showWarningMessage: options.confirm || (async () => undefined),
-            showInputBox: () => assert.fail('unexpected credential input')
+            showInputBox: options.input || (() => assert.fail('unexpected credential input'))
         },
         commands: { registerCommand: (name, action) => { commands.set(name, action); return disposable; } }
     };
+    if (options.mcpApi) {
+        Object.assign(fakeVscode, {
+            lm: { registerMcpServerDefinitionProvider: (id, value) => { assert.equal(id, 'genai-login.drawing'); mcpProvider = value; return disposable; } },
+            EventEmitter: function () {
+                const callbacks = [];
+                this.event = callback => { callbacks.push(callback); return disposable; };
+                this.fire = () => { for (const callback of callbacks) callback(); };
+                this.dispose = () => {};
+            },
+            Uri: { parse: value => value },
+            McpHttpServerDefinition: function (label, uri, headers, version) { Object.assign(this, { label, uri, headers, version }); }
+        });
+    }
+    if (options.directory) {
+        const { promises } = fs;
+        const uri = path => ({ path, fsPath: path });
+        fakeVscode.Uri = { ...fakeVscode.Uri, joinPath: (base, ...parts) => uri(require('node:path').join(base.fsPath, ...parts)) };
+        fakeVscode.workspace.fs = {
+            createDirectory: target => promises.mkdir(target.fsPath, { recursive: true }),
+            readDirectory: async target => (await promises.readdir(target.fsPath)).map(name => [name, 1]),
+            readFile: target => promises.readFile(target.fsPath),
+            writeFile: (target, bytes) => promises.writeFile(target.fsPath, bytes),
+            rename: (source, destination) => promises.rename(source.fsPath, destination.fsPath)
+        };
+    }
     const fakeHttp = { createServer: handler => {
         const server = Object.assign(new EventEmitter(), { handle: handler,
-            listen: (port, host, ready) => { queueMicrotask(ready); }, closeAllConnections() {}, close() {} });
+            listen: (port, host, ready) => { server.port = port; server.host = host; queueMicrotask(() => { server.listening = true; ready(); }); },
+            closeAllConnections() {}, close() { server.listening = false; } });
         servers.push(server); return server;
     } };
     class Session {
@@ -39,8 +80,9 @@ function connectionHarness(options = {}) {
         request(url, settings) { return options.request ? options.request(url, settings) : Promise.resolve(new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } })); }
     }
     const secrets = {
-        get: async key => key === 'credentials' ? '{"username":"test","password":"dummy"}' : undefined,
-        store: options.store || (async () => {}), delete: options.delete || (async () => {})
+        get: options.get || (async key => saved.get(key)),
+        store: options.store || (async (key, value) => { saved.set(key, value); }),
+        delete: options.delete || (async key => { saved.delete(key); })
     };
     const sandbox = {
         module: { exports: {} }, AbortController, AbortSignal, Buffer, URL,
@@ -48,19 +90,21 @@ function connectionHarness(options = {}) {
         clearTimeout() {}, setInterval: () => ({ unref() {} }), clearInterval() {},
         fetch: async () => { throw new Error('no other owner'); },
         require: name => {
+            loaded.push(name);
             if (name === 'vscode') return fakeVscode;
-            if (name === 'node:http') return fakeHttp;
-            if (name === 'undici') return { Agent: class { destroy() { return Promise.resolve(); } }, fetch() { assert.fail('unexpected network'); } };
+            if (name === 'node:http') return options.realHttp ? require('node:http') : fakeHttp;
+            if (name === './upstream') return { Agent: class { destroy() { return Promise.resolve(); } }, fetch() { assert.fail('unexpected network'); } };
             if (name === './auth') return { ...require('../auth'), Session };
             if (name === './browser-auth') return { browserLogin: async (...args) => { loginCalls.push(args); return options.login?.(...args); } };
             return require(name.startsWith('./') ? '../' + name.slice(2) : name);
         }
     };
-    vm.runInNewContext(fs.readFileSync(require.resolve('../extension.js'), 'utf8'), sandbox);
-    sandbox.module.exports.activate({ subscriptions, secrets, globalState: { get() {}, keys: () => [], update: async () => {} } });
-    provider.resolveWebviewView({ visible: false, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => disposable },
+    vm.runInNewContext(fs.readFileSync(process.env.GENAI_EXTENSION_MODULE || require.resolve('../extension.js'), 'utf8'), sandbox);
+    const ready = sandbox.module.exports.activate({ subscriptions, secrets, globalState: options.globalState || { get() {}, keys: () => [], update: async () => {} },
+        globalStorageUri: options.directory ? { path: options.directory, fsPath: options.directory } : undefined });
+    if (!options.deferDashboard) provider.resolveWebviewView({ visible: false, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => disposable },
         onDidChangeVisibility: () => disposable, onDidDispose: () => disposable });
-    return { loginCalls, timers, servers, messages, secrets,
+    return { loginCalls, timers, servers, messages, secrets, loaded, ready, commands, mcpProvider, updates, notices,
         action: name => commands.get(`genai-login.${name}`)(),
         snapshot: () => provider.getState(),
         dispose: () => { for (const item of subscriptions) item.dispose(); }
@@ -75,6 +119,369 @@ function chatExchange(url = '/v1/chat/completions', body = '{"model":"test","str
         destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from(body); } };
     return { request, response, chunks };
 }
+
+test('activation listens only on loopback without reading credentials or loading authentication', async () => {
+    const harness = connectionHarness({ get: () => assert.fail('startup must not read secrets') });
+    try {
+        await harness.ready;
+        assert.equal(harness.servers.length, 1);
+        assert.equal(harness.servers[0].host, '127.0.0.1');
+        assert.equal(harness.servers[0].port, 58379);
+        assert.equal(harness.snapshot().listening, true);
+        assert.equal(harness.snapshot().active, false);
+        assert.equal(harness.snapshot().connectedAt, null);
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.timers.length, 0);
+        for (const name of ['undici', './upstream', './auth', './browser-auth', './image-mcp']) assert.ok(!harness.loaded.includes(name));
+    } finally { harness.dispose(); }
+});
+
+test('activation without a dashboard does not initialize or read usage history', async () => {
+    const harness = connectionHarness({ deferDashboard: true, globalState: {
+        get: () => assert.fail('idle activation must not read history'),
+        keys: () => assert.fail('idle activation must not enumerate history'),
+        update: () => assert.fail('idle activation must not write history')
+    } });
+    try {
+        await harness.ready;
+        assert.equal(harness.servers[0].listening, true);
+        assert.equal(harness.loaded.includes('node:crypto'), false);
+    } finally { harness.dispose(); }
+});
+
+test('drawing MCP setup is available from the dashboard and command palette', async () => {
+    const harness = connectionHarness({ get: () => assert.fail('setup must not read secrets') });
+    try {
+        await harness.ready;
+        assert.equal(typeof harness.commands.get('genai-login.mcp'), 'function');
+        assert.match(require('../dashboard').dashboardHtml(), /data-command="mcp"/);
+        assert.equal(harness.loginCalls.length, 0);
+    } finally { harness.dispose(); }
+});
+
+test('one click enables the native drawing MCP once without login or user MCP file edits', async () => {
+    for (const port of [58379, 58480]) {
+        const harness = connectionHarness({ port, mcpApi: true, get: () => assert.fail('setup must not read secrets') });
+        try {
+            await harness.ready;
+            let changes = 0;
+            harness.mcpProvider.onDidChangeMcpServerDefinitions(() => { changes++; });
+            assert.equal(harness.mcpProvider.provideMcpServerDefinitions().length, 0);
+            await harness.action('mcp');
+            await harness.action('mcp');
+            assert.deepEqual(harness.updates, [['imageMcp.enabled', true, 1]]);
+            assert.equal(changes, 1);
+            const definitions = harness.mcpProvider.provideMcpServerDefinitions();
+            assert.equal(definitions.length, 1);
+            assert.equal(definitions[0].label, 'GENAI / Qwen Image 2.1');
+            assert.equal(definitions[0].uri, `http://127.0.0.1:${port}/mcp`);
+            assert.equal(definitions[0].headers.Authorization, 'Bearer local-browser-session');
+            assert.equal(harness.loginCalls.length, 0);
+            assert.ok(!harness.loaded.includes('./image-mcp'));
+        } finally { harness.dispose(); }
+    }
+});
+
+test('status queries, unknown routes and rejected requests never start authentication', async () => {
+    const harness = connectionHarness({ get: () => assert.fail('non-API request must not read secrets') });
+    try {
+        await harness.ready;
+        for (const scenario of [
+            { url: '/internal/status', method: 'GET', status: 200 },
+            { url: '/mcp', status: 404 },
+            { url: '/mcp', headers: { authorization: 'wrong' }, status: 403 },
+            { url: '/mcp', headers: { origin: 'https://evil.example' }, status: 403 },
+            { url: '/mcp', headers: { 'sec-fetch-site': 'cross-site' }, status: 403 },
+            { url: '/not-found', status: 404 },
+            { url: '/v1/chat/completions', headers: { authorization: 'wrong' }, status: 403 },
+            { url: '/v1/images/generations', headers: { origin: 'https://evil.example' }, status: 403 },
+            { url: '/v1/models', method: 'GET', headers: { host: 'evil.example' }, status: 403 },
+            { url: '/v1/images/generations', headers: { 'sec-fetch-site': 'cross-site' }, status: 403 }
+        ]) {
+            const exchange = chatExchange(scenario.url);
+            if (scenario.method) exchange.request.method = scenario.method;
+            Object.assign(exchange.request.headers, scenario.headers);
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await finished;
+            assert.equal(exchange.response.status, scenario.status);
+            if (scenario.status === 200) {
+                const state = JSON.parse(Buffer.concat(exchange.chunks).toString()).state;
+                assert.equal(state.listening, true);
+                assert.equal(state.active, false);
+            }
+        }
+        assert.equal(harness.loginCalls.length, 0);
+    } finally { harness.dispose(); }
+});
+
+test('first Copilot chat request connects automatically without the connect command', async () => {
+    const harness = connectionHarness();
+    try {
+        await harness.ready;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await finished; await nextTurn();
+            assert.equal(exchange.response.status, 200);
+            assert.equal(Buffer.concat(exchange.chunks).toString(), 'data: [DONE]\n\n');
+        }
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(harness.loginCalls[0][5], false);
+        assert.equal(harness.loginCalls[0][6], true);
+        assert.equal(harness.snapshot().requests, 2);
+        assert.equal(harness.snapshot().connection, 'connected');
+        assert.equal(harness.servers.length, 1);
+    } finally { harness.dispose(); }
+});
+
+test('first MCP image request connects automatically and returns inline image bytes', async () => {
+    const harness = connectionHarness({ request: async url => url.endsWith('/api/v1/images/generations')
+        ? Response.json([{ url: '/api/v1/files/file-1/content' }]) : new Response(pngImage) });
+    try {
+        await harness.ready;
+        const exchange = chatExchange('/v1/images/generations', '{"model":"qwen-image-2.1","prompt":"a red apple"}');
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await finished;
+        assert.equal(exchange.response.status, 200);
+        assert.deepEqual(Buffer.from(JSON.parse(Buffer.concat(exchange.chunks).toString()).data[0].b64_json, 'base64'), pngImage);
+        assert.equal(harness.loginCalls.length, 1);
+    } finally { harness.dispose(); }
+});
+
+test('model discovery can initialize a connection without a chat request', async () => {
+    const harness = connectionHarness({ request: async url => {
+        assert.equal(url, 'https://chat.genai.um.edu.mo/api/v1/models');
+        return Response.json({ data: [{ id: 'test-model' }] });
+    } });
+    try {
+        await harness.ready;
+        const exchange = chatExchange('/v1/models');
+        exchange.request.method = 'GET';
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await finished;
+        assert.equal(exchange.response.status, 200);
+        assert.equal(JSON.parse(Buffer.concat(exchange.chunks).toString()).data[0].id, 'test-model');
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(harness.snapshot().requests, 0);
+    } finally { harness.dispose(); }
+});
+
+test('concurrent initial API requests share one login while a cancelled caller is released', async () => {
+    let finishLogin, forwarded = 0;
+    const harness = connectionHarness({ login: () => new Promise(resolve => { finishLogin = resolve; }), request: async () => {
+        forwarded++;
+        return Response.json({ choices: [] });
+    } });
+    try {
+        await harness.ready;
+        const cancelled = chatExchange();
+        const remaining = chatExchange();
+        const finished = new Promise(resolve => remaining.response.once('finish', resolve));
+        harness.servers[0].handle(cancelled.request, cancelled.response);
+        harness.servers[0].handle(remaining.request, remaining.response);
+        await nextTurn();
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(forwarded, 0);
+        cancelled.response.destroy(); await nextTurn();
+        assert.equal(cancelled.request.destroyed, true);
+        assert.equal(cancelled.response.listenerCount('close'), 0);
+        assert.equal(harness.loginCalls[0][2].aborted, false);
+        finishLogin();
+        await finished;
+        assert.equal(remaining.response.status, 200);
+        assert.equal(forwarded, 1);
+        assert.equal(harness.snapshot().connection, 'connected');
+    } finally { finishLogin?.(); harness.dispose(); }
+});
+
+test('first request can save missing credentials and cancelled input leaves the listener idle', async () => {
+    for (const cancelled of [false, true]) {
+        const inputs = [];
+        const harness = connectionHarness({ credentials: false, input: async options => {
+            inputs.push(options);
+            if (cancelled) return undefined;
+            return options.password ? 'dummy' : 'test';
+        } });
+        try {
+            await harness.ready;
+            assert.equal(inputs.length, 0);
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await finished;
+            assert.equal(exchange.response.status, cancelled ? 503 : 200);
+            assert.equal(inputs.length, cancelled ? 1 : 2);
+            if (!cancelled) assert.equal(inputs[1].password, true);
+            assert.equal(harness.loginCalls.length, cancelled ? 0 : 1);
+            assert.equal(harness.snapshot().listening, true);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('initial connection failure retains the listener and a later request can retry', async () => {
+    let attempts = 0;
+    const harness = connectionHarness({ login: async () => {
+        if (++attempts === 1) throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE' });
+    } });
+    try {
+        await harness.ready;
+        for (const status of [503, 200]) {
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await finished;
+            assert.equal(exchange.response.status, status);
+            assert.equal(harness.snapshot().listening, true);
+        }
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.servers.length, 1);
+    } finally { harness.dispose(); }
+});
+
+test('initial verification failure blocks repeated MFA until an explicit connection attempt', async () => {
+    for (const failure of [{ name: 'TimeoutError' }, { code: 'CREDENTIALS_REJECTED' }]) {
+        let attempts = 0;
+        const harness = connectionHarness({ login: async () => {
+            if (++attempts === 1) throw Object.assign(new Error('verification incomplete'), failure);
+        } });
+        try {
+            await harness.ready;
+            for (const status of [503, 401, 401]) {
+                const exchange = chatExchange();
+                const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+                harness.servers[0].handle(exchange.request, exchange.response);
+                await finished;
+                assert.equal(exchange.response.status, status);
+            }
+            assert.equal(harness.loginCalls.length, 1);
+            assert.equal(harness.snapshot().keepalive.state, 'needs-login');
+            assert.equal(harness.snapshot().listening, true);
+            await harness.action('connect');
+            assert.equal(harness.loginCalls.length, 2);
+            assert.equal(harness.snapshot().connection, 'connected');
+        } finally { harness.dispose(); }
+    }
+});
+
+test('disposal during listener startup cannot leave a listening server behind', async () => {
+    const harness = connectionHarness();
+    harness.dispose();
+    await harness.ready;
+    assert.equal(harness.snapshot().listening, false);
+    assert.equal(harness.servers[0].listening, false);
+    assert.equal(harness.loginCalls.length, 0);
+});
+
+test('disconnect while credentials are loading prevents a late automatic login', async () => {
+    let release;
+    const harness = connectionHarness({ get: () => new Promise(resolve => { release = resolve; }) });
+    try {
+        await harness.ready;
+        const exchange = chatExchange();
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await nextTurn();
+        await harness.action('disconnect');
+        release('{"username":"test","password":"dummy"}');
+        await nextTurn();
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.snapshot().active, false);
+        assert.equal(harness.snapshot().listening, false);
+        assert.equal(exchange.request.destroyed, true);
+        assert.equal(exchange.response.listenerCount('close'), 0);
+    } finally { harness.dispose(); }
+});
+
+test('real loopback HTTP requests initialize once and forward both chat and image responses', { timeout: 10000 }, async () => {
+    const probe = require('node:http').createServer();
+    await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise(resolve => probe.close(resolve));
+    const harness = connectionHarness({ realHttp: true, port, request: async url => {
+        if (url.endsWith('/api/v1/images/generations')) return Response.json([{ url: '/api/v1/files/file-1/content' }]);
+        if (url.endsWith('/api/v1/files/file-1/content')) return new Response(pngImage);
+        return Response.json({ choices: [{ message: { content: 'connected on demand' } }] });
+    } });
+    try {
+        await harness.ready;
+        const headers = { Authorization: 'Bearer local-browser-session', 'Content-Type': 'application/json' };
+        const base = `http://127.0.0.1:${port}`;
+        const state = await fetch(base + '/internal/status', { headers });
+        assert.equal((await state.json()).state.active, false);
+        const denied = await fetch(base + '/v1/chat/completions', { method: 'POST', body: '{}', headers: { Authorization: 'wrong' } });
+        assert.equal(denied.status, 403);
+        await denied.arrayBuffer();
+        assert.equal(harness.loginCalls.length, 0);
+        const chat = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: '{"model":"test","messages":[]}' });
+        assert.equal(chat.status, 200);
+        assert.equal((await chat.json()).choices[0].message.content, 'connected on demand');
+        const image = await fetch(base + '/v1/images/generations', { method: 'POST', headers, body: '{"prompt":"a red apple"}' });
+        assert.equal(image.status, 200);
+        assert.deepEqual(Buffer.from((await image.json()).data[0].b64_json, 'base64'), pngImage);
+        assert.equal(harness.loginCalls.length, 1);
+    } finally { harness.dispose(); }
+});
+
+test('native MCP discovery stays idle and the first drawing tool call logs in through the real bridge', { timeout: 10000 }, async () => {
+    const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+    const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
+    const directory = await fs.promises.mkdtemp(require('node:path').join(require('node:os').tmpdir(), 'genai-drawing-bridge-'));
+    const probe = require('node:http').createServer();
+    await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise(resolve => probe.close(resolve));
+    const requests = [];
+    const harness = connectionHarness({ directory, port, realHttp: true, mcpEnabled: true, request: async (url, settings) => {
+        requests.push({ url, settings });
+        if (url.endsWith('/api/v1/images/generations')) return Response.json([{ url: '/api/v1/files/image-1/content' }]);
+        if (url.endsWith('/api/v1/files/image-1/content')) return new Response(pngImage);
+        assert.fail('unexpected platform route');
+    } });
+    const client = new Client({ name: 'native-genai-test', version: '1.0.0' });
+    try {
+        await harness.ready;
+        const url = new URL(`http://127.0.0.1:${port}/mcp`);
+        const headers = { Authorization: 'Bearer local-browser-session' };
+        await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
+        assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['generate_image']);
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.loaded.includes('./auth'), false);
+        const denied = await fetch(url, { method: 'POST', headers: { ...headers, Origin: 'https://evil.example' }, body: '{}' });
+        assert.equal(denied.status, 403);
+        await denied.arrayBuffer();
+        const result = await client.callTool({ name: 'generate_image', arguments: { prompt: 'a red apple' } });
+        assert.ok(!result.isError);
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(harness.snapshot().requests, 1);
+        assert.equal(requests.length, 2);
+        assert.equal(JSON.parse(requests[0].settings.body).model, 'qwen-image-2.1');
+        assert.deepEqual(await fs.promises.readFile(result.structuredContent.files[0]), pngImage);
+        assert.deepEqual(Buffer.from(result.content[1].data, 'base64'), pngImage);
+    } finally {
+        await client.close();
+        harness.dispose();
+        await nextTurn();
+        await fs.promises.rm(directory, { recursive: true, force: true });
+    }
+});
+
+test('explicit disconnect closes the idle listener and manual connect can restart it', async () => {
+    const harness = connectionHarness();
+    try {
+        await harness.ready;
+        await harness.action('disconnect');
+        assert.equal(harness.snapshot().listening, false);
+        assert.equal(harness.servers[0].listening, false);
+        assert.equal(harness.loginCalls.length, 0);
+        await harness.action('connect');
+        assert.equal(harness.snapshot().listening, true);
+        assert.equal(harness.snapshot().connection, 'connected');
+        assert.equal(harness.servers.length, 2);
+    } finally { harness.dispose(); }
+});
 
 test('slow or failed session storage does not block successful upstream forwarding', { timeout: 3000 }, async () => {
     for (const failure of [false, true]) {
@@ -554,11 +961,12 @@ test('clear confirmation cannot delete a newly connected session', async () => {
 test('credentials are not written when ownership changes during input', async () => {
     const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
     const start = source.indexOf('const credentials = async () =>');
-    const end = source.indexOf('const connect =', start);
+    const end = source.indexOf('const connectNow =', start);
     for (const owner of ['local', 'other']) {
         let checks = 0;
         const sandbox = {
             active: undefined,
+            connectionVersion: 0, syncDisposed: false,
             requireOwner: async () => {
                 checks++;
                 if (checks === 2 && owner === 'local') sandbox.active = {};
@@ -576,19 +984,21 @@ test('credentials are not written when ownership changes during input', async ()
 
 test('connection initialization failure clears active state and permits retry', async () => {
     const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
-    const start = source.indexOf('const connect = async (');
+    const start = source.indexOf('const connectNow = async (');
     const end = source.indexOf('let configuringModels', start);
     assert.ok(start >= 0 && end > start);
     let loads = 0;
     const sandbox = {
         AbortController,
         syncSharedState: async () => {},
-        history: { reload: async () => {} },
+        startListener: async () => true,
+        syncDisposed: false, connectionVersion: 0,
+        getHistory: () => ({ reload: async () => {} }),
         output: { show() {} }, trace() {}, status() {},
         context: { secrets: { get: async () => '{"username":"test","password":"dummy"}' } },
         require: () => { loads++; throw new Error('dependency failed'); }
     };
-    vm.runInNewContext('let active, sharedState; const stop = () => { active?.abort(); active = undefined; };' + source.slice(start, end) + 'globalThis.connect = connect; globalThis.isActive = () => Boolean(active);', sandbox);
+    vm.runInNewContext('let active, sharedState, connectPromise, listenerReady = false, automaticLoginBlocked = false; const stop = () => { active?.abort(); active = undefined; connectPromise = undefined; };' + source.slice(start, end) + 'globalThis.connect = connect; globalThis.isActive = () => Boolean(active);', sandbox);
     for (let attempt = 0; attempt < 2; attempt++) {
         await assert.rejects(sandbox.connect(), /dependency failed/);
         assert.equal(sandbox.isActive(), false);
@@ -662,7 +1072,7 @@ test('port action validates, cancels, resets and saves only user settings', asyn
     assert.ok(require('../dashboard').dashboardHtml().includes('data-command="port"'));
 });
 
-test('observer synchronizes owner state without opening a server or changing credentials', async () => {
+test('observer yields the occupied port and synchronizes without loading authentication or changing credentials', async () => {
     const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
     const commands = new Map();
     const messages = [];
@@ -704,9 +1114,15 @@ test('observer synchronizes owner state without opening a server or changing cre
             return { ok: true, json: async () => ({ service: 'genai-login', version: 1, state: snapshot }) };
         },
         require: name => {
-            assert.ok(!['undici', './auth', './browser-auth'].includes(name), `Observer loaded heavy dependency: ${name}`);
+            assert.ok(!['undici', './upstream', './auth', './browser-auth'].includes(name), `Observer loaded heavy dependency: ${name}`);
             if (name === 'vscode') return fakeVscode;
-            if (name === 'node:http') return { createServer: () => assert.fail('observer must not start server') };
+            if (name === 'node:http') return { createServer: () => {
+                const server = Object.assign(new EventEmitter(), {
+                    listen() { queueMicrotask(() => server.emit('error', Object.assign(new Error('occupied'), { code: 'EADDRINUSE' }))); },
+                    closeAllConnections() {}, close() {}
+                });
+                return server;
+            } };
             return require(name.startsWith('./') ? '../' + name.slice(2) : name);
         }
     };
@@ -718,7 +1134,7 @@ test('observer synchronizes owner state without opening a server or changing cre
     } });
     try {
         await nextTurn();
-        assert.equal(fetches, 0);
+        assert.equal(fetches, 1);
         assert.equal(poll, undefined);
         assert.ok(commands.has('genai-login.diagnose'));
         assert.ok(require('../package.json').contributes.commands.some(command => command.command === 'genai-login.diagnose'));
@@ -727,7 +1143,7 @@ test('observer synchronizes owner state without opening a server or changing cre
             onDidChangeVisibility: callback => { visibilityChanged = callback; return disposable; },
             onDidDispose: callback => { viewDisposed = callback; return disposable; } };
         provider.resolveWebviewView(view);
-        assert.equal(fetches, 0);
+        assert.equal(fetches, 1);
         view.visible = true; visibilityChanged();
         await nextTurn();
         assert.match(messages.at(-1).status, /shared window/);
@@ -765,10 +1181,10 @@ test('observer synchronizes owner state without opening a server or changing cre
 
 test('local access permits none metadata but requires host and bearer without Origin', () => {
     const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
-    const start = source.indexOf('const fetchSite =');
-    const end = source.indexOf('if (rejected)', start);
+    const start = source.indexOf('const rejectLocalRequest =');
+    const end = source.indexOf('const startListener =', start);
     assert.ok(start >= 0 && end > start);
-    const check = (headers, port = 58379) => vm.runInNewContext(source.slice(start, end) + 'rejected', { request: { headers }, stats: { port } });
+    const check = (headers, port = 58379) => vm.runInNewContext(source.slice(start, end) + 'rejectLocalRequest(request)', { request: { headers }, stats: { port } });
     const base = { host: '127.0.0.1:58379', authorization: 'Bearer local-browser-session' };
     assert.equal(check(base), '');
     assert.equal(check({ ...base, host: '127.0.0.1:58480' }, 58480), '');

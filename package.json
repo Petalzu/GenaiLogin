@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",
@@ -16,7 +16,14 @@
     "url": "https://github.com/Petalzu/GenaiLogin/issues"
   },
   "icon": "media/genai-icon.png",
-  "keywords": ["genai", "umpass", "openai", "copilot", "authentication", "local-bridge"],
+  "keywords": [
+    "genai",
+    "umpass",
+    "openai",
+    "copilot",
+    "authentication",
+    "local-bridge"
+  ],
   "extensionKind": [
     "ui"
   ],
@@ -26,8 +33,10 @@
   "categories": [
     "Other"
   ],
-  "main": "./extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "configuration": {
       "title": "GENAI Login",
@@ -47,9 +56,21 @@
           "maximum": 86400,
           "scope": "application",
           "description": "Upstream idle timeout in seconds; 0 disables it. Applies to new requests."
+        },
+        "genai-login.imageMcp.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Provide the built-in Qwen Image 2.1 drawing MCP server to GitHub Copilot. Uses the local GENAI bridge and saved credentials."
         }
       }
     },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "genai-login.drawing",
+        "label": "GENAI Qwen Image 2.1"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -78,6 +99,10 @@
         "title": "GENAI Login: Manage Copilot models"
       },
       {
+        "command": "genai-login.mcp",
+        "title": "GENAI Login: Add Qwen Image 2.1 drawing MCP server"
+      },
+      {
         "command": "genai-login.connect",
         "title": "GENAI Login: Login and connect"
       },
@@ -100,8 +125,10 @@
     ]
   },
   "scripts": {
-    "lint": "eslint extension.js auth.js browser-auth.js dashboard.js stats.js bridge-stream.js copilot-config.js copilot-models.js test/extension.test.js test/stats.test.js test/bridge-stream.test.cjs test/local-access.test.cjs test/copilot-models.test.cjs",
-    "pretest": "npm run lint",
+    "build": "node esbuild.cjs",
+    "vscode:prepublish": "npm run build",
+    "lint": "eslint extension.js auth.js auth-forms.js browser-auth.js dashboard.js stats.js bridge-stream.js copilot-config.js copilot-models.js upstream.js image-mcp.js esbuild.cjs test/extension.test.js test/stats.test.js test/bridge-stream.test.cjs test/local-access.test.cjs test/copilot-models.test.cjs test/image-mcp.test.cjs test/browser-auth.test.cjs test/history.test.cjs",
+    "pretest": "npm run lint && npm run build",
     "test": "node --test test/*.test.cjs && vscode-test"
   },
   "devDependencies": {
@@ -111,6 +138,7 @@
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
     "eslint": "^10.5.0",
     "globals": "^17.12.0"
   },
@@ -119,10 +147,12 @@
     "serialize-javascript": "^7.0.6"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "cheerio": "^1.2.0",
     "jsonc-parser": "^3.3.1",
     "playwright-core": "^1.63.0",
     "tough-cookie": "^6.0.2",
-    "undici": "^7.30.0"
+    "undici": "^7.30.0",
+    "zod": "^4.6.7"
   }
 }

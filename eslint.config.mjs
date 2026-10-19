@@ -1,7 +1,7 @@
 import globals from "globals";
 
 export default [{
-    files: ["extension.js", "auth.js", "browser-auth.js", "dashboard.js", "stats.js", "bridge-stream.js", "copilot-config.js", "copilot-models.js", "test/extension.test.js", "test/stats.test.js", "test/bridge-stream.test.cjs", "test/local-access.test.cjs", "test/copilot-models.test.cjs"],
+    files: ["extension.js", "auth.js", "auth-forms.js", "browser-auth.js", "dashboard.js", "stats.js", "bridge-stream.js", "copilot-config.js", "copilot-models.js", "upstream.js", "image-mcp.js", "esbuild.cjs", "test/extension.test.js", "test/stats.test.js", "test/bridge-stream.test.cjs", "test/local-access.test.cjs", "test/copilot-models.test.cjs", "test/image-mcp.test.cjs", "test/browser-auth.test.cjs", "test/history.test.cjs"],
     languageOptions: {
         globals: {
             ...globals.commonjs,

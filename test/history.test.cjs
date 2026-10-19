@@ -260,3 +260,31 @@ test('one corrupt history file does not hide healthy records or delete original 
 	assert.equal(errors, 2);
 	assert.equal(data.size, 3);
 });
+
+test('file history snapshots reuse aggregation without exposing mutable cached data', async () => {
+	let reads = 0;
+	const row = { name: 'peer', tokensIn: 20, requests: 2 };
+	const peer = { requests: 2, get modelUsage() { reads++; return [row]; } };
+	const store = { read: async () => [['usageHistory.window.v3.peer', peer]], update: async () => {} };
+	const storage = { get() {}, keys: () => [] };
+	const history = createHistory(storage, () => assert.fail('storage failed'), store);
+	await history.reload();
+	const first = history.snapshot();
+	assert.equal(reads, 1);
+	first.requests = 500;
+	first.modelUsage[0].tokensIn = 999;
+	assert.equal(history.snapshot().requests, 2);
+	assert.equal(history.snapshot().modelUsage[0].tokensIn, 20);
+	assert.equal(reads, 1);
+	history.start();
+	assert.equal(history.snapshot().requests, 3);
+	assert.equal(reads, 2);
+	history.finish({ model: 'local', hasInput: true, tokensIn: 5 });
+	assert.equal(history.snapshot().modelUsage.find(model => model.name === 'local').tokensIn, 5);
+	assert.equal(reads, 3);
+	row.tokensIn = 30;
+	await history.reload();
+	assert.equal(history.snapshot().modelUsage.find(model => model.name === 'peer').tokensIn, 30);
+	assert.equal(reads, 4);
+	await history.flush();
+});

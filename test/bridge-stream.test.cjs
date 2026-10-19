@@ -4,6 +4,41 @@ const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { setTimeout: delay } = require('node:timers/promises');
 const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('../bridge-stream');
+
+test('production network bundle preserves streaming, cookies and request cancellation', { timeout: 5000 }, async () => {
+	const http = require('node:http');
+	const { Agent, fetch } = require('../dist/upstream');
+	const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+	let release;
+	const server = http.createServer((request, response) => {
+		response.writeHead(200, { 'content-type': 'text/event-stream', 'set-cookie': 'token=test; HttpOnly' });
+		response.write('data: first\n\n');
+		if (request.url === '/complete') release = () => response.end('data: [DONE]\n\n');
+	});
+	await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+	const endpoint = `http://127.0.0.1:${server.address().port}`;
+	try {
+		const result = await fetch(endpoint + '/complete', { dispatcher: agent });
+		assert.deepEqual(result.headers.getSetCookie(), ['token=test; HttpOnly']);
+		const reader = result.body.getReader();
+		assert.equal(Buffer.from((await reader.read()).value).toString(), 'data: first\n\n');
+		release();
+		assert.equal(Buffer.from((await reader.read()).value).toString(), 'data: [DONE]\n\n');
+		assert.equal((await reader.read()).done, true);
+		reader.releaseLock();
+		const controller = new AbortController();
+		const cancelled = await fetch(endpoint + '/cancel', { dispatcher: agent, signal: controller.signal });
+		const pending = cancelled.body.getReader();
+		await pending.read();
+		controller.abort();
+		await assert.rejects(pending.read());
+		pending.releaseLock();
+	} finally {
+		await agent.destroy();
+		server.closeAllConnections();
+		await new Promise(resolve => server.close(resolve));
+	}
+});
 const http = require('node:http');
 const { once } = require('node:events');
 const { createHash } = require('node:crypto');

@@ -92,6 +92,15 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
         await context.addInitScript(() => {
             globalThis.dashboardCommands = [];
             globalThis.acquireVsCodeApi = () => ({ postMessage: message => globalThis.dashboardCommands.push(message.command) });
+            globalThis.dashboardTimers = new Set();
+            const schedule = globalThis.setInterval.bind(globalThis);
+            const cancel = globalThis.clearInterval.bind(globalThis);
+            globalThis.setInterval = (callback, milliseconds, ...args) => {
+                const timer = schedule(callback, milliseconds, ...args);
+                if (milliseconds === 1000) globalThis.dashboardTimers.add(timer);
+                return timer;
+            };
+            globalThis.clearInterval = timer => { globalThis.dashboardTimers.delete(timer); cancel(timer); };
         });
         await context.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: dashboardHtml({
             status: 'Disconnected', connection: 'disconnected', active: false, listening: false,
@@ -109,8 +118,31 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
         assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot ');
         assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
         assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), false);
+        assert.equal(await page.evaluate(() => globalThis.dashboardTimers.size), 0);
+        const unchanged = await page.evaluate(data => {
+            const ids = ['model-list', 'token-breakdown', 'cost-breakdown', 'history-breakdown'];
+            const nodes = ids.map(id => document.getElementById(id).firstChild);
+            globalThis.dispatchEvent(new MessageEvent('message', { data: { type: 'state', data } }));
+            return ids.every((id, index) => document.getElementById(id).firstChild === nodes[index]);
+        }, { ...base, connection: 'disconnected', status: 'Disconnected', active: false });
+        assert.equal(unchanged, true);
+        await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false,
+            models: [{ name: 'changed-model', requests: 2 }], modelUsage: [{ name: 'changed-model', tokensIn: 10, inputUsageReports: 1 }],
+            history: { requests: 2, tokensIn: 10, inputUsageReports: 1, modelUsage: [{ name: 'changed-model', tokensIn: 10, inputUsageReports: 1 }] } });
+        assert.match(await page.locator('#model-list').textContent(), /changed-model/);
+        for (const id of ['token-breakdown', 'cost-breakdown', 'history-breakdown']) assert.match(await page.locator('#' + id).textContent(), /changed-model/);
         for (const width of [240, 360, 1200]) {
             await page.setViewportSize({ width, height: 900 });
+            await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, listening: true });
+            assert.equal(await page.locator('#status-text').textContent(), '待命');
+            assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="credentials"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="mcp"]').isEnabled(), true);
+            const drawingLabel = page.locator('[data-command="mcp"] strong');
+            assert.equal(await drawingLabel.textContent(), '添加绘画 MCP');
+            assert.equal(await drawingLabel.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+            assert.equal(await page.locator('#port-badge').textContent(), ':58379');
             await render({ ...base, connection: 'authenticating', status: 'Authenticating', active: true,
                 listening: true, loginPhase: 'mfa', pendingActions: ['connect'] });
             assert.equal(await page.locator('#status-text').textContent(), '正在登录');
@@ -124,6 +156,7 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.match(await page.locator('#keepalive-text').textContent(), /保活暂时失败.*重试/);
             assert.equal(await page.locator('#session-warning').isVisible(), true);
             assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot warning');
+            assert.equal(await page.evaluate(() => globalThis.dashboardTimers.size), 1);
             assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
             await render({ ...base, connection: 'connected', status: 'Connected :58379', active: true, listening: true,
                 connectedAt: Date.now(), keepalive: { state: 'healthy', expiresAt: Date.now() + 45000, nextCheckAt: Date.now() + 10000 } });
@@ -137,12 +170,19 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.match(await page.locator('#keepalive-text').textContent(), /^只读/);
             for (const command of ['connect', 'diagnose', 'credentials', 'clear', 'disconnect']) assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), false);
             assert.equal(await page.locator('[data-command="models"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="mcp"]').isEnabled(), true);
             if (process.env.GENAI_DASHBOARD_SCREENSHOTS) {
                 const { join } = require('node:path');
                 const { tmpdir } = require('node:os');
                 await page.screenshot({ path: join(tmpdir(), `genai-dashboard-${width}.png`), fullPage: true });
             }
         }
+        await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false });
+        assert.equal(await page.evaluate(() => globalThis.dashboardTimers.size), 0);
+        await page.locator('[data-command="mcp"]').click();
+        assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'mcp');
+        await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, pendingActions: ['mcp'] });
+        assert.equal(await page.locator('[data-command="mcp"]').isEnabled(), false);
         await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false });
         await page.locator('[data-command="connect"]').click();
         assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'connect');

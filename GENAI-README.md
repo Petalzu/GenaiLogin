@@ -14,16 +14,18 @@ Version 0.0.16 is the final GitHub Release. Future extension updates will be dis
 
 1. Open **GENAI Login** in the activity bar.
 2. Select **账号设置**, or run **GENAI Login: Save account and password**, and enter your UMPASS credentials.
-3. Select **连接 GENAI**, or run **GENAI Login: Login and connect**.
-4. Complete the required MFA and wait for the dashboard to show a connected session.
+3. Send a request through a configured Copilot GENAI chat model or MCP image tool. The extension connects in the background; manual connection is not required.
+4. Complete any required MFA and wait for the response. If credentials are missing, the first request prompts for them in VS Code.
 
-A valid saved session is reused. Otherwise, the extension opens a temporary headless Edge instance and closes it after verification. MFA approval remains your responsibility.
+A valid saved session is reused. Otherwise, the extension opens a temporary headless Edge instance in a short-lived authentication helper and closes both after verification, releasing the browser automation dependencies instead of retaining them in VS Code. MFA approval remains your responsibility.
+
+The dashboard initially shows **待命**: the local port is listening, but no login, Edge instance or health checks have started. Selecting **连接 GENAI** or running **GENAI Login: Login and connect** remains available to log in before making a request. Status queries do not trigger authentication.
 
 When Duo displays a recognized device-confirmation prompt, the extension selects **Yes, this is my device**. This does not approve MFA or guarantee that future temporary browser sessions will be remembered. Use the extension only on a trusted personal device.
 
 ## Manage the Connection
 
-- **Disconnect** stops the bridge and session checks without deleting saved credentials or history.
+- **Disconnect** stops the bridge listener and session checks without deleting saved credentials or history. Automatic connection stays off until you explicitly connect again or reload the window.
 - **Clear saved credentials and session** requires confirmation, disconnects the bridge, and removes saved credentials and cookies. Usage history remains; the server-side session is not revoked.
 - **Manage Copilot models** adds or removes presets in the current Profile. Addition and deletion are separate operations; unchecking a model during addition does not delete it. Configuration changes require confirmation and create a backup.
 
@@ -31,13 +33,20 @@ Only the window that owns the bridge can disconnect it or change credentials. Ot
 
 ## Image Generation with MCP
 
-1. Connect GENAI and keep the bridge owner window open.
-2. Use a tool-capable chat model with an OpenAI Images-compatible MCP tool such as ImageForge.
-3. Set the tool's provider to `openai`, base URL to `http://127.0.0.1:58379/v1`, API key to `local-browser-session`, and model to `qwen-image-2.1`. Use the configured port if it differs from the default.
+1. Keep a desktop VS Code window with GENAI Login enabled open. Saving credentials once is recommended; there is no need to connect manually before using the tool.
+2. Select **添加绘画 MCP** in the dashboard, or run **GENAI Login: Add Qwen Image 2.1 drawing MCP server**. Repeating the command does not create duplicate servers.
+3. In Copilot **Agent** mode, select a tool-capable chat model and enable `generate_image` from **GENAI / Qwen Image 2.1** in the tools picker. Accept any VS Code server trust or tool-call approval prompts.
+4. Ask Copilot to draw an image. The tool accepts a text `prompt`, optional `size` such as `1024x1024`, and `n` from 1 to 6. It returns image previews and the paths of the original files saved on the local VS Code machine.
 
-The chat model calls the MCP tool, which requests the local `/v1/images/generations` endpoint and can save the result as an image file. The `openai` provider selects the compatible protocol, not the official OpenAI service. The platform's configured image engine determines the actual model used. The MCP process must run on the bridge machine to reach its loopback address.
+The server is embedded in GENAI Login and registered through VS Code's native MCP API. No Node.js/npm, ImageForge installation, API-key prompt or manual `mcp.json` edit is required. The command only enables `genai-login.imageMcp.enabled` in user settings; existing MCP servers are unchanged. Disable this setting to stop advertising the drawing server.
+
+The tool requests the local `/v1/images/generations` endpoint with the fixed model `qwen-image-2.1`. The platform's configured image engine determines the actual model used. Files are saved in the extension's local data directory under `generated-images`; they remain until manually deleted. Remote-SSH agents receive previews, but returned local paths are not paths on the remote host. Copy files explicitly when a remote workspace needs them.
+
+The first request automatically reuses the saved session or starts a background login. Concurrent chat and image requests share the login. Allow enough time in the MCP client's request timeout to complete MFA; cancelling a request does not cancel other clients' login. The extension cannot receive requests if it is disabled or all desktop VS Code windows are closed.
 
 Image models are not offered by **Manage Copilot models**. They do not need to be registered as chat models to be used through MCP. An OpenAI Images-compatible client can use the same endpoint directly.
+
+Existing external tools such as ImageForge can still use `provider: openai`, `base_url: http://127.0.0.1:58379/v1`, `api_key: local-browser-session`, and `model: qwen-image-2.1`. Their MCP process must run on the bridge machine. Use the configured port if it differs from the default.
 
 The image endpoint returns inline `data[].b64_json`, with at most six files and 20 MiB of image data per request. Image requests are counted without invented token usage.
 
@@ -47,7 +56,7 @@ The dashboard displays session health, the next scheduled check, and known expir
 
 Health checks cannot extend a fixed token lifetime. If authentication expires, one automatic login attempt may require MFA. When verification fails, disconnect and reconnect; the extension does not repeatedly initiate MFA. Already-started streams are not automatically replayed.
 
-Hiding the dashboard does not stop the bridge or session checks. Closing or reloading the owner window does. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version.
+Hiding the dashboard does not stop the bridge or session checks. Closing or reloading the owner window ends active requests; after a reload, the window returns to the idle-listener state. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version.
 
 ## Troubleshooting
 
@@ -65,7 +74,7 @@ Check whether another VS Code window already owns the connection. Manage it ther
 
 Temporary service errors do not necessarily indicate expired credentials. Allow the scheduled health retry, or retry the client request after service recovers. If a response was partially delivered, review its content before retrying.
 
-A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed verification requires an explicit disconnect and reconnect.
+A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed initial verification blocks automatic login retries; use **连接 GENAI** after checking credentials or MFA. Failed reauthentication of an existing session still requires disconnecting and reconnecting.
 
 ### Remote Clients Cannot Connect
 

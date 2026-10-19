@@ -1,6 +1,3 @@
-const { Readable, Transform } = require('node:stream');
-const { pipeline } = require('node:stream/promises');
-
 function createRequestLifetime(response, parentSignal, idleMs = 0) {
 	const controller = new AbortController();
 	const signal = AbortSignal.any([parentSignal, controller.signal]);
@@ -74,6 +71,7 @@ function splitMixedEvent(bytes) {
 }
 
 function createMixedReasoningTransform() {
+	const { Transform } = require('node:stream');
 	let parts = [];
 	let size = 0;
 	let passthrough = false;
@@ -130,6 +128,8 @@ function createMixedReasoningTransform() {
 }
 
 async function forwardBody(body, response, lifetime, consume, normalizeMixedReasoning = false) {
+	const { Readable, Transform } = require('node:stream');
+	const { pipeline } = require('node:stream/promises');
 	const monitor = new Transform({
 		transform(chunk, encoding, callback) {
 			lifetime.touch();

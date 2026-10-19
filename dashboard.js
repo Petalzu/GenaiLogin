@@ -255,6 +255,9 @@ function dashboardHtml(initialState = null) {
             <button class="action-tile" data-command="models" title="添加或删除 Copilot 模型">
                 <span class="action-icon">±</span><span class="action-copy"><strong>Copilot 模型</strong><small>添加 / 删除</small></span>
             </button>
+            <button class="action-tile" data-command="mcp" title="添加 Qwen Image 2.1 绘画 MCP 服务器" aria-label="添加绘画 MCP 服务器">
+                <span class="action-icon" aria-hidden="true">M</span><span class="action-copy"><strong>添加绘画 MCP</strong><small>Qwen Image 2.1</small></span>
+            </button>
             <button class="action-tile primary" data-command="connect">
                 <span class="action-icon">+</span><span class="action-copy"><strong>连接 GENAI</strong><small>登录并启动桥接</small></span>
             </button>
@@ -286,6 +289,7 @@ function dashboardHtml(initialState = null) {
         const byId = id => document.getElementById(id);
         const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
         const numberFormatter = new Intl.NumberFormat('zh-CN');
+        const clockFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const formatNumber = value => numberFormatter.format(number(value));
         const formatTokens = value => value === null || value === undefined ? '--' : formatNumber(value);
         const formatDuration = milliseconds => {
@@ -295,7 +299,7 @@ function dashboardHtml(initialState = null) {
             const rest = seconds % 60;
             return hours ? hours + 'h ' + minutes + 'm' : minutes ? minutes + 'm ' + rest + 's' : rest + 's';
         };
-        const formatClock = timestamp => timestamp ? new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--';
+        const formatClock = timestamp => timestamp ? clockFormatter.format(timestamp) : '--';
         const formatShort = value => {
             if (!Number.isFinite(Number(value)) || Number(value) <= 0) return null;
             const tokens = Number(value);
@@ -307,11 +311,31 @@ function dashboardHtml(initialState = null) {
             String(data.status).startsWith('Authenticating') ? 'authenticating' : String(data.status).startsWith('Connecting') ? 'connecting' :
             String(data.status).startsWith('Disconnected') ? 'disconnected' : 'error');
         const connected = data => Boolean(data.connectedAt && connectionState(data) === 'connected');
+        let uptimeTimer;
+        const syncUptimeTimer = () => {
+            if (!snapshot || !connected(snapshot) || document.hidden) {
+                clearInterval(uptimeTimer);
+                uptimeTimer = undefined;
+            } else if (uptimeTimer === undefined) {
+                uptimeTimer = setInterval(() => {
+                    const value = formatDuration(Date.now() - snapshot.connectedAt);
+                    if (byId('uptime-value').textContent !== value) byId('uptime-value').textContent = value;
+                }, 1000);
+            }
+        };
+        const renderedLists = new Map();
+        const listChanged = (id, rows) => {
+            const value = JSON.stringify(rows);
+            if (renderedLists.get(id) === value) return false;
+            renderedLists.set(id, value);
+            return true;
+        };
         const money = value => Number(value).toFixed(6);
         const costText = usage => number(usage.timedReports) === number(usage.pricedReports)
             ? money(usage.costMin) : money(usage.costMin) + ' ~ ' + money(usage.costMax);
         const cacheRate = usage => usage.cacheInputTokens > 0 ? (100 * usage.cachedTokens / usage.cacheInputTokens).toFixed(1) + '%' : '--';
         function renderUsage(id, rows) {
+            if (!listChanged(id, rows)) return;
             const list = byId(id);
             list.replaceChildren();
             for (const usage of rows) {
@@ -336,6 +360,7 @@ function dashboardHtml(initialState = null) {
             }
         }
         function renderModels(models) {
+            if (!listChanged('model-list', models)) return;
             const list = byId('model-list');
             list.replaceChildren();
             byId('model-count').textContent = String(models.length);
@@ -373,13 +398,13 @@ function dashboardHtml(initialState = null) {
                 button.disabled = pending.includes(command) ||
                     (['connect', 'diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
                     (command === 'clear' && (shared || exclusivePending)) ||
-                    (command === 'disconnect' && (!active || shared));
+                    (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || shared));
             }
             const warning = data.sessionPersistence === 'error' || ['error', 'needs-login'].includes(data.keepalive?.state) ||
                 (data.keepalive?.expiresAt && data.keepalive.expiresAt - Date.now() <= 60000);
             const dot = byId('status-dot');
             dot.className = 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : '');
-            const label = { connected: '已连接', disconnected: '未连接', connecting: '正在连接', authenticating: '正在登录', error: '请求暂时失败' }[mode] || '未连接';
+            const label = mode === 'disconnected' && data.listening ? '待命' : { connected: '已连接', disconnected: '未连接', connecting: '正在连接', authenticating: '正在登录', error: '请求暂时失败' }[mode] || '未连接';
             byId('status-text').textContent = label + (shared ? ' · 其他窗口' : '');
             byId('port-badge').textContent = (data.listening ?? isConnected) ? ':' + data.port : '未监听';
             byId('session-warning').hidden = data.sessionPersistence !== 'error';
@@ -398,18 +423,20 @@ function dashboardHtml(initialState = null) {
             byId('cost-value').textContent = costs.pricedReports ? costText(costs) : '--';
             byId('cost-detail').textContent = usageRows.some(usage => !usage.pricedReports) ? '已计价模型合计' : '所有模型合计';
             const costList = byId('cost-breakdown');
-            costList.replaceChildren();
-            for (const usage of usageRows) {
-                const row = document.createElement('div');
-                row.className = 'usage-row';
-                const title = document.createElement('strong');
-                title.textContent = usage.name;
-                const value = document.createElement('small');
-                value.textContent = usage.pricedReports ? 'USD ' + costText(usage) : '未定价';
-                row.append(title, value);
-                costList.append(row);
+            if (listChanged('cost-breakdown', usageRows)) {
+                costList.replaceChildren();
+                for (const usage of usageRows) {
+                    const row = document.createElement('div');
+                    row.className = 'usage-row';
+                    const title = document.createElement('strong');
+                    title.textContent = usage.name;
+                    const value = document.createElement('small');
+                    value.textContent = usage.pricedReports ? 'USD ' + costText(usage) : '未定价';
+                    row.append(title, value);
+                    costList.append(row);
+                }
+                if (!usageRows.length) costList.textContent = '暂无用量';
             }
-            if (!usageRows.length) costList.textContent = '暂无用量';
             const keepalive = data.keepalive || {};
             const expiring = keepalive.expiresAt && keepalive.expiresAt - Date.now() <= 60000;
             const phases = { 'checking-session': '正在验证保存的会话', 'opening-browser': '正在启动 Edge', credentials: '正在提交 UMPASS 登录',
@@ -433,6 +460,7 @@ function dashboardHtml(initialState = null) {
             byId('history-detail').textContent = history ? history.inputUsageReports + history.outputUsageReports
                 ? '调用 ' + formatNumber(history.requests) + ' 次 · IN ' + (formatShort(history.tokensIn) ?? '--') + ' · OUT ' + (formatShort(history.tokensOut) ?? '--')
                 : '调用 ' + formatNumber(history.requests) + ' 次 · 等待 usage' : '未连接，无历史统计';
+            syncUptimeTimer();
         }
         document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => {
             if (!button.disabled) vscode.postMessage({ command: button.dataset.command });
@@ -440,10 +468,7 @@ function dashboardHtml(initialState = null) {
         window.addEventListener('message', event => { if (event.data && event.data.type === 'state') render(event.data.data); });
         const initialState = ${initialJson};
         if (initialState) render(initialState);
-        setInterval(() => {
-            if (!snapshot || !connected(snapshot)) return;
-            byId('uptime-value').textContent = formatDuration(Date.now() - snapshot.connectedAt);
-        }, 1000);
+        document.addEventListener('visibilitychange', syncUptimeTimer);
         vscode.postMessage({ command: 'ready' });
         requestAnimationFrame(() => requestAnimationFrame(() => vscode.postMessage({ command: 'painted' })));
     </script>

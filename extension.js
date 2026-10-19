@@ -1,8 +1,6 @@
 const vscode = require('vscode');
 const http = require('node:http');
-const { Readable } = require('node:stream');
 const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('./bridge-stream');
-const { dashboardHtml } = require('./dashboard');
 const { createStats, createHistory, createHistoryFiles, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
 
 let stopActive;
@@ -41,7 +39,7 @@ class DashboardProvider {
 			const action = this.actions[message?.command];
 			if (action) Promise.resolve(action()).catch(this.onError);
 		});
-		view.webview.html = dashboardHtml(this.getState());
+		view.webview.html = require('./dashboard').dashboardHtml(this.getState());
 		this.trace(`Dashboard HTML assigned: elapsedMs=${Date.now() - startedAt}`);
 		this.visibilitySubscription = view.onDidChangeVisibility(() => {
 			if (view.visible) this.refresh();
@@ -97,7 +95,7 @@ async function readImageResponseBody(response, lifetime, limit) {
 			size += value.byteLength;
 			if (size > limit) throw new Error('Image response too large');
 			lifetime.touch();
-			chunks.push(Buffer.from(value));
+			chunks.push(value);
 		}
 		return Buffer.concat(chunks, size);
 	} finally {
@@ -141,11 +139,19 @@ function activate(context) {
 	const output = vscode.window.createOutputChannel('GENAI Login');
 	context.subscriptions.push(output);
 	const trace = message => output.appendLine(`${new Date().toISOString()} ${message}`);
-	const historyFiles = context.globalStorageUri ? createHistoryFiles(vscode.workspace.fs,
-		vscode.Uri.joinPath(context.globalStorageUri, 'usage-history'), vscode.Uri.joinPath,
-		() => trace('An unreadable history record was preserved and skipped; other totals remain available.')) : undefined;
-	const history = createHistory(context.globalState, () => trace('History storage unavailable; totals may be incomplete or fail to survive reload.'), historyFiles);
-	let server, active, authentication, keepaliveTimer, keepaliveOwner;
+	let history;
+	const getHistory = () => {
+		if (!history) {
+			const files = context.globalStorageUri ? createHistoryFiles(vscode.workspace.fs,
+				vscode.Uri.joinPath(context.globalStorageUri, 'usage-history'), vscode.Uri.joinPath,
+				() => trace('An unreadable history record was preserved and skipped; other totals remain available.')) : undefined;
+			history = createHistory(context.globalState, () => trace('History storage unavailable; totals may be incomplete or fail to survive reload.'), files);
+		}
+		return history;
+	};
+	let server, listenerController, listenerReady = false, listenerStartPromise, requestHandler, connectPromise;
+	let connectionVersion = 0, automaticLoginBlocked = false;
+	let active, authentication, keepaliveTimer, keepaliveOwner;
 	let state = 'Disconnected';
 	let connection = 'disconnected', loginPhase;
 	const pendingActions = new Map();
@@ -157,6 +163,18 @@ function activate(context) {
 	let sessionPersistence, sessionPersistenceInfo = 'idle';
 	const configuredPort = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
 	const stats = createStats(Number.isInteger(configuredPort) && configuredPort >= 1024 && configuredPort <= 65535 ? configuredPort : 58379);
+	const imageMcpEnabled = () => vscode.workspace.getConfiguration('genai-login').get('imageMcp.enabled', false);
+	const mcpChanges = vscode.lm?.registerMcpServerDefinitionProvider ? new vscode.EventEmitter() : undefined;
+	if (mcpChanges) {
+		context.subscriptions.push(mcpChanges, vscode.lm.registerMcpServerDefinitionProvider('genai-login.drawing', {
+			onDidChangeMcpServerDefinitions: mcpChanges.event,
+			provideMcpServerDefinitions: () => imageMcpEnabled() ? [new vscode.McpHttpServerDefinition(
+				'GENAI / Qwen Image 2.1', vscode.Uri.parse(`http://127.0.0.1:${stats.port}/mcp`),
+				{ Authorization: 'Bearer local-browser-session' }, '1.0.0')] : []
+		}), vscode.workspace.onDidChangeConfiguration(event => {
+			if (event.affectsConfiguration('genai-login.imageMcp.enabled')) mcpChanges.fire();
+		}));
+	}
 	let dispatcher;
 	context.subscriptions.push({ dispose: () => { void dispatcher?.destroy().catch(() => {}); } });
 	const status = value => {
@@ -167,9 +185,9 @@ function activate(context) {
 	};
 	const localSnapshot = () => ({
 		status: state,
-		connection, loginPhase, active: Boolean(active), listening: Boolean(server?.listening), shared: false,
+		connection, loginPhase, active: Boolean(active), listening: listenerReady, shared: false,
 		pendingActions: [...pendingActions.keys()],
-		history: history.snapshot(),
+		history: getHistory().snapshot(),
 		port: stats.port,
 		connectedAt: stats.connectedAt,
 		requests: stats.requests,
@@ -187,7 +205,7 @@ function activate(context) {
 	});
 	const stateSnapshot = () => !active && sharedState ? { ...sharedState, shared: true, pendingActions: [...pendingActions.keys()], status: `${sharedState.status} (shared window)` } : localSnapshot();
 	const syncSharedState = () => {
-		if (syncDisposed || active) return Promise.resolve();
+		if (syncDisposed || active || listenerReady) return Promise.resolve();
 		if (syncInFlight) return syncInFlight;
 		const currentController = syncController;
 		syncInFlight = (async () => {
@@ -205,7 +223,7 @@ function activate(context) {
 					Array.isArray(payload.state.models) && payload.state.keepalive) next = payload.state;
 			} catch {}
 			finally {
-				if (!syncDisposed && !active && !currentController.signal.aborted) { sharedState = next; dashboard?.refresh(); }
+				if (!syncDisposed && !active && !listenerReady && !currentController.signal.aborted) { sharedState = next; dashboard?.refresh(); }
 			}
 		})().finally(() => { if (currentController === syncController) syncInFlight = undefined; });
 		return syncInFlight;
@@ -219,26 +237,115 @@ function activate(context) {
 			syncInFlight = undefined;
 			return;
 		}
-		void history.reload().then(() => { if (!syncDisposed) dashboard?.refresh(); });
+		void getHistory().reload().then(() => { if (!syncDisposed) dashboard?.refresh(); });
+		if (active || listenerReady) return;
 		void syncSharedState();
 		syncTimer = setInterval(() => { void syncSharedState(); }, 2000);
 		syncTimer.unref?.();
 	};
 	const requireOwner = async () => {
-		if (!active) await syncSharedState();
+		if (!active && !listenerReady) await syncSharedState();
 		if (!active && sharedState) {
 			await vscode.window.showInformationMessage('GENAI is connected in another VS Code window. Manage the connection in that window.');
 			return false;
 		}
 		return true;
 	};
-	const stop = () => {
+	const sendError = (response, code, message) => { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message } })); };
+	const rejectLocalRequest = request => {
+		const fetchSite = request.headers['sec-fetch-site'];
+		return request.headers.host !== `127.0.0.1:${stats.port}` ? 'host mismatch' : request.headers.origin ? 'Origin present' : fetchSite !== undefined && fetchSite !== 'none' ? `Fetch Metadata rejected (${['same-origin', 'same-site', 'cross-site'].includes(fetchSite) ? fetchSite : 'unrecognized'})` : request.headers.authorization !== 'Bearer local-browser-session' ? (request.headers.authorization ? 'Authorization mismatch' : 'Authorization missing') : '';
+	};
+	const startListener = async () => {
+		if (listenerReady) return true;
+		if (listenerStartPromise) return listenerStartPromise;
+		const operation = (async () => {
+			const owner = new AbortController();
+			listenerController = owner;
+			const candidate = http.createServer((request, response) => {
+				void (async () => {
+					const rejected = rejectLocalRequest(request);
+					if (rejected) { trace(`Local request rejected: ${rejected}`); return sendError(response, 403, `Local authenticated clients only: ${rejected}`); }
+					if (request.method === 'GET' && request.url === '/internal/status') {
+						response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+						return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot() }));
+					}
+					if (request.url === '/mcp') {
+						if (!imageMcpEnabled()) return sendError(response, 404, 'Drawing MCP is disabled');
+						return require('./image-mcp').handleImageMcp(request, response, {
+							port: stats.port, directory: context.globalStorageUri?.fsPath, signal: owner.signal, detectImageMimeType
+						});
+					}
+					const supported = request.method === 'POST' && ['/v1/chat/completions', '/v1/images/generations'].includes(request.url) || request.method === 'GET' && request.url === '/v1/models';
+					if (!supported) return sendError(response, 404, 'Not found');
+					if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
+					if (!requestHandler) {
+						const waiting = createRequestLifetime(response, owner.signal);
+						const cancelRequest = () => request.destroy();
+						waiting.signal.addEventListener('abort', cancelRequest, { once: true });
+						try {
+							waiting.signal.throwIfAborted();
+							await waitForSignal(connect(false, true), waiting.signal);
+							waiting.signal.throwIfAborted();
+						} catch (error) {
+							if (waiting.signal.aborted) return;
+							trace(`Automatic connection failed: code=${transportCode(error)}`);
+							if (!response.destroyed && !response.headersSent) sendError(response, 503, 'GENAI automatic connection failed; retry the request after checking login.');
+							return;
+						} finally {
+							waiting.signal.removeEventListener('abort', cancelRequest);
+							waiting.dispose();
+						}
+					}
+					if (!requestHandler) return sendError(response, 503, 'GENAI is not connected; retry after saving credentials.');
+					try {
+						await requestHandler(request, response);
+					} catch (error) {
+						trace(`Proxy failed: code=${transportCode(error)}`);
+						if (response.destroyed) return;
+						if (!response.headersSent) sendError(response, 502, 'Upstream request failed. Retry when network is available.');
+						else response.destroy();
+					}
+				})().catch(error => {
+					trace(`Local request failed: code=${transportCode(error)}`);
+					if (!response.destroyed && !response.headersSent) sendError(response, 502, 'GENAI request failed.');
+				});
+			});
+			server = candidate;
+			try {
+				await new Promise((resolve, reject) => { candidate.once('error', reject); candidate.listen(stats.port, '127.0.0.1', resolve); });
+				if (owner.signal.aborted || server !== candidate || syncDisposed) { candidate.close(); return false; }
+				listenerReady = true;
+				sharedState = undefined;
+				clearInterval(syncTimer); syncTimer = undefined;
+				trace(`Local bridge listener ready on 127.0.0.1:${stats.port}`);
+				dashboard?.refresh();
+				return true;
+			} catch (error) {
+				if (server === candidate) server = undefined;
+				candidate.closeAllConnections?.(); candidate.close?.();
+				if (owner.signal.aborted || syncDisposed) return false;
+				if (error.code === 'EADDRINUSE') { await syncSharedState(); if (sharedState) return false; }
+				throw error;
+			}
+		})();
+		listenerStartPromise = operation;
+		try { return await operation; } finally { if (listenerStartPromise === operation) listenerStartPromise = undefined; }
+	};
+	const stop = (closeListener = true) => {
+		connectionVersion++;
 		active?.abort(); active = undefined; authentication = undefined;
+		connectPromise = undefined;
+		requestHandler = undefined;
+		automaticLoginBlocked = false;
 		pendingActions.delete('connect'); pendingActions.delete('diagnose');
 		clearTimeout(keepaliveTimer); keepaliveTimer = undefined; keepaliveOwner = undefined;
 		keepaliveInfo = { state: 'idle', lastCheckAt: null };
 		sessionPersistenceInfo = 'idle';
-		server?.closeAllConnections(); server?.close(); server = undefined;
+		if (closeListener) {
+			listenerController?.abort(); listenerController = undefined; listenerStartPromise = undefined;
+			server?.closeAllConnections(); server?.close(); server = undefined; listenerReady = false;
+		}
 		stats.connectedAt = null; stats.requests = 0; stats.tokensIn = 0; stats.tokensOut = 0; stats.usageReports = 0; stats.usageMissing = 0; stats.models.clear(); stats.otherModels = 0;
 		stats.inputUsageReports = 0; stats.outputUsageReports = 0;
 		stats.modelUsage.clear();
@@ -248,32 +355,36 @@ function activate(context) {
 	const credentials = async () => {
 		if (!await requireOwner()) return false;
 		if (active) throw new Error('Disconnect before changing credentials.');
+		const version = connectionVersion;
 		const username = await vscode.window.showInputBox({ title: 'UMPASS account', prompt: 'Full UMPASS login name', ignoreFocusOut: true });
 		if (!username) return false;
 		const password = await vscode.window.showInputBox({ title: 'UMPASS password', password: true, ignoreFocusOut: true });
 		if (!password) return false;
 		if (!await requireOwner()) return false;
 		if (active) throw new Error('Disconnect before changing credentials.');
+		if (version !== connectionVersion || syncDisposed) return false;
 		await context.secrets.store('credentials', JSON.stringify({ username, password }));
 		await sessionPersistence?.flush();
 		await context.secrets.delete('session');
 		return true;
 	};
-	const connect = async (diagnostic = false) => {
+	const connectNow = async (diagnostic = false, automatic = false) => {
 		if (active) return;
-		await syncSharedState();
-		if (active || sharedState) return;
-		await history.reload();
-		if (active || sharedState) return;
+		if (!automatic) automaticLoginBlocked = false;
+		const version = connectionVersion;
+		if (!await startListener() || version !== connectionVersion || syncDisposed) return;
+		await getHistory().reload();
+		if (active || sharedState || version !== connectionVersion || syncDisposed) return;
 		if (diagnostic) output.show(true);
-		trace(diagnostic ? 'Visible diagnostic connection requested' : 'Manual connection requested');
+		trace(diagnostic ? 'Visible diagnostic connection requested' : automatic ? 'Automatic connection requested' : 'Manual connection requested');
 		let stored = await context.secrets.get('credentials');
+		if (version !== connectionVersion || syncDisposed) return;
 		if (!stored) { if (!await credentials()) return; stored = await context.secrets.get('credentials'); }
-		if (active) return;
+		if (active || version !== connectionVersion || syncDisposed) return;
 		const controller = new AbortController(); active = controller;
 		try {
 		status('Connecting');
-		const { Agent, fetch: upstreamFetch } = require('undici');
+		const { Agent, fetch: upstreamFetch } = require('./upstream');
 		const { Session, createKeepaliveSchedule, createSessionPersistence, ORIGIN } = require('./auth');
 		const { browserLogin: login } = require('./browser-auth');
 		dispatcher ??= new Agent({ headersTimeout: 0, bodyTimeout: 0 });
@@ -394,7 +505,6 @@ function activate(context) {
 			if (!keepaliveInFlight && !reauthenticationBlocked) keepaliveInfo = { state: 'healthy', lastCheckAt: keepaliveInfo.lastCheckAt };
 			scheduleKeepalive();
 		};
-		const sendError = (response, code, message) => { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message } })); };
 		const downloadPlatformImage = async (url, lifetime, limit) => {
 			const target = new URL(url, ORIGIN);
 			if (target.origin !== ORIGIN || target.username || target.password || !/^\/api\/v1\/files\/[^/]+\/content$/.test(target.pathname)) throw new Error('Untrusted image file reference');
@@ -404,18 +514,11 @@ function activate(context) {
 			return readImageResponseBody(image, lifetime, limit);
 		};
 		const settleRequest = requestStats => {
-			history.finish(requestStats);
+			getHistory().finish(requestStats);
 			if (active !== controller || controller.signal.aborted) return;
 			if (commitRequest(stats, requestStats)) dashboard?.refresh();
 		};
 		const handle = async (request, response) => {
-			const fetchSite = request.headers['sec-fetch-site'];
-			const rejected = request.headers.host !== `127.0.0.1:${stats.port}` ? 'host mismatch' : request.headers.origin ? 'Origin present' : fetchSite !== undefined && fetchSite !== 'none' ? `Fetch Metadata rejected (${['same-origin', 'same-site', 'cross-site'].includes(fetchSite) ? fetchSite : 'unrecognized'})` : request.headers.authorization !== 'Bearer local-browser-session' ? (request.headers.authorization ? 'Authorization mismatch' : 'Authorization missing') : '';
-			if (rejected) { trace(`Local request rejected: ${rejected}`); return sendError(response, 403, `Local authenticated clients only: ${rejected}`); }
-			if (request.method === 'GET' && request.url === '/internal/status') {
-				response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-				return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot() }));
-			}
 			const route = request.method === 'POST' && request.url === '/v1/chat/completions' ? '/api/v1/chat/completions'
 				: request.method === 'POST' && request.url === '/v1/images/generations' ? '/api/v1/images/generations'
 					: request.method === 'GET' && request.url === '/v1/models' ? '/api/v1/models' : null;
@@ -439,7 +542,7 @@ function activate(context) {
 			const options = { method: request.method, body: request.method === 'POST' ? Buffer.concat(chunks) : undefined, headers: { 'content-type': 'application/json', Accept: 'application/json' }, signal: lifetime.signal, fetch: upstreamFetch, dispatcher };
 			if (request.method === 'POST') {
 				requestStats = recordRequest(stats, options.body);
-				history.start();
+				getHistory().start();
 				dashboard?.refresh();
 			}
 			const forwardUpstream = async (routePath, requestOptions) => {
@@ -487,6 +590,7 @@ function activate(context) {
 					const id = `chatcmpl-image-${created}`;
 					const usage = null;
 					if (requestPayload.stream) {
+						const { Readable } = require('node:stream');
 						response.writeHead(200, { 'content-type': 'text/event-stream' });
 						const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestPayload.model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 						function* events() {
@@ -547,21 +651,34 @@ function activate(context) {
 				settleRequest(requestStats);
 			}
 		};
-		server = http.createServer((request, response) => { handle(request, response).catch(() => {
-			if (response.destroyed) return;
-			if (active === controller && !controller.signal.aborted) status('Network error; retry request');
-			if (!response.headersSent) sendError(response, 502, 'Upstream request failed. Retry when network is available.'); else response.destroy();
-		}); });
-			status('Connecting');
-			await new Promise((resolve, reject) => { server.once('error', reject); server.listen(stats.port, '127.0.0.1', resolve); });
 			await authenticate();
+			if (!isCurrentConnection()) return;
+			requestHandler = handle;
 			startKeepalive();
 		} catch (error) {
 			if (controller.signal.aborted) return;
 			trace('Connection failed; inspect preceding stage (no credentials logged)'); output.show(true);
-			if (active === controller) stop();
+			if (active === controller) stop(false);
+			if (automatic && (error.name === 'TimeoutError' || error.code === 'CREDENTIALS_REJECTED')) {
+				automaticLoginBlocked = true;
+				keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
+				status('Authentication required; reconnect');
+			}
 			if (error.code === 'EADDRINUSE') { await syncSharedState(); if (sharedState) return; }
 			throw error;
+		}
+	};
+	const connect = async (diagnostic = false, automatic = false) => {
+		if (connectPromise) return connectPromise;
+		if (active) return;
+		if (automatic && ['credentials', 'clear', 'diagnose'].some(name => pendingActions.has(name))) throw new Error('GENAI configuration is changing; retry after it completes.');
+		const pending = automatic ? {} : undefined;
+		if (pending) { pendingActions.set('connect', pending); dashboard?.refresh(); }
+		const operation = connectNow(diagnostic, automatic);
+		connectPromise = operation;
+		try { return await operation; } finally {
+			if (connectPromise === operation) connectPromise = undefined;
+			if (pending && pendingActions.get('connect') === pending) { pendingActions.delete('connect'); dashboard?.refresh(); }
 		}
 	};
 	let configuringModels = false;
@@ -570,6 +687,13 @@ function activate(context) {
 		configuringModels = true;
 		try { await require('./copilot-config').configureModels(stats.port); }
 		finally { configuringModels = false; }
+	};
+	const mcp = async () => {
+		try {
+			if (!mcpChanges) throw new Error('当前 VS Code 不支持 MCP provider，请更新桌面版 VS Code。');
+			if (!imageMcpEnabled()) await vscode.workspace.getConfiguration('genai-login').update('imageMcp.enabled', true, vscode.ConfigurationTarget.Global);
+			void vscode.window.showInformationMessage('已启用 GENAI / Qwen Image 2.1 绘画 MCP。可在 Copilot Agent 中使用 generate_image；首次启动仍需按 VS Code 提示信任服务器。');
+		} catch (error) { await vscode.window.showErrorMessage(`GENAI 绘画 MCP 配置失败：${error.message}`); }
 	};
 	const port = async () => {
 		try {
@@ -593,7 +717,7 @@ function activate(context) {
 		if (active) { await vscode.window.showInformationMessage('Disconnect GENAI before starting a visible diagnostic login.'); return; }
 		await connect(true);
 	};
-	const actions = { connect, diagnose, credentials, models, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => {
+	const actions = { connect, diagnose, credentials, models, mcp, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => {
 		if (!await requireOwner()) return;
 		const owner = active;
 		const answer = await vscode.window.showWarningMessage('清除保存的账号和 Cookie？', { modal: true, detail: '当前连接将断开，账号和 Cookie 将删除。历史用量保留；此操作不会撤销服务器端会话。' }, '清除凭据');
@@ -628,6 +752,10 @@ function activate(context) {
 	dashboard = new DashboardProvider(stateSnapshot, actions, reportError, setSyncVisible, trace);
 	context.subscriptions.push({ dispose: () => { syncDisposed = true; clearInterval(syncTimer); syncController.abort(); } });
 	context.subscriptions.push(vscode.window.registerWebviewViewProvider('genai-login.session', dashboard, { webviewOptions: { retainContextWhenHidden: false } }), { dispose: () => dashboard.dispose() }, { dispose: stop });
+	return startListener().catch(error => {
+		trace(`Local bridge listener unavailable: code=${transportCode(error)}`);
+		void reportError(error);
+	});
 }
 function deactivate() { stopActive?.(); }
 module.exports = { activate, deactivate };

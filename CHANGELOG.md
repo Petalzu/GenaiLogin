@@ -1,5 +1,20 @@
 # Change Log
 
+## [0.0.18]
+
+- Further reduce standby work by delaying history/random-key initialization and streaming internals. Prefer tree-shakeable official ESM dependency exports, deduplicate the MCP validator runtime, share a fixed drawing-tool schema and compile its input validator only on actual tool calls.
+- Reuse unchanged dashboard lists and time formatters, stop the uptime timer when disconnected or hidden, avoid redundant image-download chunk copies, and decode/save generated MCP images sequentially with the original cancellation, format, size and rollback checks preserved.
+- Add a one-click dashboard action and command to enable a native VS Code drawing MCP provider for Qwen Image 2.1. The embedded Streamable HTTP server uses the existing authenticated loopback bridge, with no separate Node.js/npm or ImageForge setup and no changes to other MCP servers.
+- Expose `generate_image` with prompt, size and image-count inputs, image previews and original-file saving in local extension storage. Preserve MCP trust/approval, lazy authentication, access restrictions, cancellation and image limits; load the official MCP SDK only when an enabled MCP endpoint is requested.
+- Build small, separate on-demand CommonJS runtime bundles instead of shipping and resolving the complete general-purpose dependency tree. Keep the Playwright runtime and assets intact; defer dashboard templates, network dependencies and legacy HTML form parsing until needed.
+- Run browser authentication in a short-lived child process with local IPC for credentials and Cookie updates. Normal verification, cancellation, startup failure and manually closing diagnostic Edge release the helper without retaining Playwright in the extension host; valid saved sessions do not spawn it.
+- Cache file-history aggregation until usage or reloaded records change, retain defensive snapshot copies and live legacy-storage semantics, remove unnecessary owner-window polling, and avoid duplicate login-wait controllers and unchanged-session serialization on the connected request path.
+- Add production-bundle transport, browser-helper and history-cache regressions, including real Edge lifecycle checks and a VS Code host cancellation check without university network access.
+- Start a lightweight loopback listener after VS Code startup and connect lazily when Copilot chat models, MCP image tools or model-discovery clients send their first authorized API request. Idle activation does not read credentials, load authentication dependencies, start Edge or schedule health checks.
+- Share one initial login across concurrent requests, release cancelled callers without replaying their requests, preserve manual connection and diagnostic commands, and stop repeated MFA after verification failure until an explicit connection attempt.
+- Show the idle listener as a disconnectable standby state. Explicit disconnect closes the port until reconnect or reload; additional windows share the listener owner's status without logging in or taking over its port.
+- Add simulated and real-loopback regression coverage for lazy startup, first chat/image/model requests, access checks, concurrent login, cancellation, failed initialization, disconnect races and idle dashboard controls.
+
 ## [0.0.17]
 
 - Retained compatibility for chats sent to an image model id (`qwen-image*`): the bridge translates them into a platform image generation call and returns Markdown image data. Image generation is intended to be called through MCP or an OpenAI Images-compatible client instead of the Copilot model picker.

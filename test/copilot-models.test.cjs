@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { readConfig, isConfigured, preset, appendModels } = require('../copilot-models');
+const modelApi = require(process.env.GENAI_MODELS_MODULE || '../copilot-models');
+const { readConfig, isConfigured, preset, appendModels } = modelApi;
 const endpoint = 'http://127.0.0.1:58379/v1/chat/completions';
 test('external change during backup refuses edit even with unchanged editor version', async () => {
 	const fs = require('node:fs');
@@ -35,13 +36,13 @@ test('external change during backup refuses edit even with unchanged editor vers
 	assert.match(errors[0], /备份期间发生变化/);
 });
 test('deleting the only model and setting supports JSONC trailing commas', () => {
-	const { removableModels, removeModels } = require('../copilot-models');
+		const { removableModels, removeModels } = modelApi;
 	const text = '[{"models":[' + JSON.stringify(preset('DeepSeek-V4.1-Flash', endpoint)) + ',],"settings":{"DeepSeek-V4.1-Flash":{"reasoningEffort":"max"},},"untouched":42},]';
 	const result = removeModels(text, removableModels(readConfig(text), endpoint), endpoint);
 	assert.deepEqual(readConfig(result), [{ models: [], settings: {}, untouched: 42 }]);
 });
 test('single deletion preserves untouched model text, custom parameters and comments', () => {
-	const { removableModels, removeModels } = require('../copilot-models');
+		const { removableModels, removeModels } = modelApi;
 	const catalog = require('../genai-models.json');
 	for (const spacing of [undefined, 2, '\t']) {
 		const provider = structuredClone(catalog);
@@ -88,7 +89,7 @@ test('configuration cancelled at confirmation never writes or backs up files', a
 	assert.equal(step, 2);
 });
 test('removal preserves other endpoints, shared settings and unrelated providers', () => {
-	const { removableModels, removeModels } = require('../copilot-models');
+		const { removableModels, removeModels } = modelApi;
 	const id = 'DeepSeek-V4.1-Flash';
 	const text = JSON.stringify([{ models: [preset(id, endpoint), preset(id, 'https://example.com/v1/chat/completions'), preset('GLM-5.3-Flash', endpoint)], settings: { [id]: { reasoningEffort: 'low' }, 'GLM-5.3-Flash': { reasoningEffort: 'max' }, other: {} } }, { name: 'unrelated' }]);
 	const entries = removableModels(readConfig(text), endpoint);
@@ -151,6 +152,21 @@ test('all seven chat models append once with valid context budgets', () => {
 
 test('image models are not available as Copilot presets', () => {
 	assert.throws(() => preset('qwen-image-2.1', endpoint), /not in the reviewed catalog/);
+});
+
+test('production model bundle preserves JSONC edits without external parser files', () => {
+	const compiled = require('../dist/copilot-models');
+	const original = '[\n// keep comment\n{"name":"unrelated","models":[],},\n]';
+	const models = require('../genai-models.json').models.map(model => compiled.preset(model.id, endpoint));
+	const actual = compiled.appendModels(original, models, endpoint);
+	assert.equal(actual, appendModels(original, models, endpoint));
+	assert.ok(actual.includes('// keep comment'));
+	const configured = compiled.readConfig(actual);
+	assert.equal(configured[1].models.length, 7);
+	const entries = compiled.removableModels(configured, endpoint);
+	const removed = compiled.removeModels(actual, entries, endpoint);
+	assert.equal(compiled.readConfig(removed)[1].models.length, 0);
+	assert.deepEqual(compiled.readConfig(removed)[0], { name: 'unrelated', models: [] });
 });
 
 test('configure command offers chat models only, backs up additions and skips duplicates', async () => {

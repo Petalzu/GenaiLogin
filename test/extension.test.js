@@ -1,21 +1,63 @@
 const assert = require('assert');
 
 const vscode = require('vscode');
-const http = require('node:http');
-
 suite('Extension Test Suite', () => {
-	test('Activation registers commands without opening a server', async () => {
-		const original = http.Server.prototype.listen;
-		let listens = 0;
-		http.Server.prototype.listen = function (...args) { listens++; return original.apply(this, args); };
+	test('Activation registers commands and makes the idle listener reachable', async () => {
+		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
+		assert.ok(extension);
+		await extension.activate();
+		const commands = await vscode.commands.getCommands(true);
+		for (const name of ['connect', 'diagnose', 'credentials', 'disconnect', 'clear', 'models', 'mcp', 'port']) assert.ok(commands.includes(`genai-login.${name}`));
+		const port = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
+		const response = await fetch(`http://127.0.0.1:${port}/internal/status`, {
+			headers: { Authorization: 'Bearer local-browser-session' }, signal: AbortSignal.timeout(3000)
+		});
+		assert.equal(response.status, 200);
+		const payload = await response.json();
+		assert.equal(payload.service, 'genai-login');
+		assert.equal(payload.state.listening, true);
+		assert.equal(payload.state.port, port);
+	});
+	test('One-click drawing MCP enables a native server and discovers its tool inside VS Code', async function () {
+		this.timeout(15000);
+		const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+		const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
+		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
+		await extension.activate();
+		assert.ok(extension.packageJSON.contributes.mcpServerDefinitionProviders.some(provider => provider.id === 'genai-login.drawing'));
+		assert.equal(typeof vscode.lm.registerMcpServerDefinitionProvider, 'function');
+		const configuration = vscode.workspace.getConfiguration('genai-login');
+		const previous = configuration.inspect('imageMcp.enabled').globalValue;
+		const client = new Client({ name: 'genai-vscode-host', version: '1.0.0' });
 		try {
-			const extension = vscode.extensions.getExtension('Petalzu.genai-login');
-			assert.ok(extension);
-			await extension.activate();
-			const commands = await vscode.commands.getCommands(true);
-			for (const name of ['connect', 'diagnose', 'credentials', 'disconnect', 'clear', 'models', 'port']) assert.ok(commands.includes(`genai-login.${name}`));
-			assert.equal(listens, 0);
-		} finally { http.Server.prototype.listen = original; }
+			await vscode.commands.executeCommand('genai-login.mcp');
+			await vscode.commands.executeCommand('genai-login.mcp');
+			assert.equal(vscode.workspace.getConfiguration('genai-login').get('imageMcp.enabled'), true);
+			const port = configuration.get('port', 58379);
+			await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+				requestInit: { headers: { Authorization: 'Bearer local-browser-session' } }
+			}));
+			assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['generate_image']);
+		} finally {
+			await client.close();
+			await configuration.update('imageMcp.enabled', previous, vscode.ConfigurationTarget.Global);
+		}
+	});
+	test('Browser authentication child starts and cancels inside the VS Code host without network access', async function () {
+		this.timeout(15000);
+		const { Session } = require('../dist/auth');
+		const { browserLogin } = require('../dist/browser-auth');
+		const controller = new AbortController();
+		const traces = [];
+		try {
+			await assert.rejects(browserLogin(new Session(), {}, controller.signal, message => {
+				traces.push(message);
+				if (message === 'Starting temporary headless Edge') controller.abort();
+			}, undefined, false, true, { force: true }));
+			assert.ok(traces.includes('Starting temporary headless Edge'));
+			assert.ok(!traces.some(message => message.startsWith('Authentication navigation:')));
+			assert.ok(!Object.keys(require.cache).some(path => path.includes('playwright-core')));
+		} finally { controller.abort(); }
 	});
 	test('Dashboard view is contributed as a Webview', async () => {
 		const extension = vscode.extensions.getExtension('Petalzu.genai-login');

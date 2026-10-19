@@ -1,4 +1,4 @@
-const { CookieJar } = require('tough-cookie');
+const { Cookie, CookieJar } = require('tough-cookie');
 const ORIGIN = 'https://chat.genai.um.edu.mo';
 const HOSTS = new Set(['chat.genai.um.edu.mo', 'login.um.edu.mo', 'websso.um.edu.mo']);
 const sessionWrites = new WeakMap();
@@ -42,8 +42,9 @@ function createSessionPersistence(session, secrets, isCurrent, onState = () => {
     const save = () => {
         if (!isCurrent()) return Promise.resolve(false);
         const snapshot = session.jar.toJSON();
-        const next = { fingerprint: fingerprint(snapshot), value: JSON.stringify(snapshot) };
-        if (next.fingerprint === saved && !pending) return Promise.resolve(true);
+        const nextFingerprint = fingerprint(snapshot);
+        if (nextFingerprint === saved && !pending) return Promise.resolve(true);
+        const next = { fingerprint: nextFingerprint, value: JSON.stringify(snapshot) };
         requested = next;
         if (pending) return pending;
         const previous = sessionWrites.get(secrets) || Promise.resolve();
@@ -143,17 +144,7 @@ class Session {
 }
 
 function forms(html, url) {
-    const { load } = require('cheerio');
-    const document = load(html);
-    return document('form').toArray().map(element => {
-        const form = document(element);
-        const fields = [];
-        form.find('input').each((index, input) => {
-            const field = document(input);
-            if (field.attr('name')) fields.push({ name: field.attr('name'), type: field.attr('type') || 'text', value: field.attr('value') || '' });
-        });
-        return { action: new URL(form.attr('action') || url, url).href, method: (form.attr('method') || 'GET').toUpperCase(), fields };
-    });
+    return require('./auth-forms').forms(html, url);
 }
 async function login(session, credentials, signal, trace = () => {}) {
     trace('Checking saved session');
@@ -192,4 +183,4 @@ async function login(session, credentials, signal, trace = () => {}) {
     }
     throw new Error('Authentication step limit exceeded');
 }
-module.exports = { Session, createKeepaliveSchedule, createSessionPersistence, forms, ORIGIN, login };
+module.exports = { Cookie, Session, createKeepaliveSchedule, createSessionPersistence, forms, ORIGIN, login };

@@ -1,6 +1,136 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { browserLogin } = require('../browser-auth');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { Session, ORIGIN } = require('../auth');
+
+function isolatedHarness(mode) {
+    const children = [];
+    const modulePath = process.env.GENAI_BROWSER_MODULE || require.resolve('../browser-auth');
+    const authPath = require('node:path').join(require('node:path').dirname(modulePath), 'auth.js');
+    const source = fs.readFileSync(require.resolve('../browser-auth'), 'utf8');
+    const setup = `
+        const Module = require('node:module');
+        const load = Module._load;
+        const mode = ${JSON.stringify(mode)};
+        const { Session, ORIGIN } = require(${JSON.stringify(authPath)});
+        Session.prototype.valid = async function () { return (await this.jar.getCookieString(ORIGIN)).includes('worker-token'); };
+        Module._load = function (name, parent, isMain) {
+            if (name !== 'playwright-core') return load.call(this, name, parent, isMain);
+            const { chromium } = load.call(this, name, parent, isMain);
+            return { chromium: { launch: async options => {
+                const browser = await chromium.launch(options);
+                process.on('message', message => {
+                    if (message.type === 'test-close-browser') void browser.close();
+                });
+                const newContext = browser.newContext.bind(browser);
+                browser.newContext = async () => {
+                    const context = await newContext();
+                    await context.route('**/*', route => {
+                        if (mode === 'failure') return route.abort('failed');
+                        return route.fulfill({ contentType: 'text/html; charset=utf-8',
+                            headers: { 'set-cookie': 'token=worker-token; Path=/; Secure; HttpOnly; SameSite=Lax' }, body: '<p>Verified</p>' });
+                    });
+                    return context;
+                };
+                return browser;
+            } } };
+        };
+        process.argv[1] = ${JSON.stringify(modulePath)};
+        Module.runMain();
+    `;
+    const launchChild = (filename, args, options) => {
+        const { spawn } = require('node:child_process');
+        const child = spawn(process.execPath, ['-e', setup], options);
+        children.push(child);
+        return child;
+    };
+    const sandbox = { module: { exports: {} }, __filename: modulePath, AbortController, AbortSignal, URL, Buffer,
+        process,
+        require: name => name === 'node:child_process' ? { fork: launchChild } :
+            require(name.startsWith('./') ? '../' + name.slice(2) : name) };
+    vm.runInNewContext(source, sandbox);
+    return { login: sandbox.module.exports.browserLogin, children };
+}
+
+test('authentication process startup failure rejects without waiting for an exit event', async () => {
+    const { EventEmitter } = require('node:events');
+    const source = fs.readFileSync(require.resolve('../browser-auth'), 'utf8');
+    const sandbox = { module: { exports: {} }, __filename: require.resolve('../browser-auth'), AbortController, AbortSignal, URL, Buffer, process,
+        require: name => name === 'node:child_process' ? { fork: () => {
+            const child = Object.assign(new EventEmitter(), { send() {}, connected: false });
+            queueMicrotask(() => {
+                child.emit('error', Object.assign(new Error('spawn failed'), { code: 'EAGAIN' }));
+                child.emit('close', -1);
+            });
+            return child;
+        } } : require(name.startsWith('./') ? '../' + name.slice(2) : name) };
+    vm.runInNewContext(source, sandbox);
+    const session = new Session();
+    session.valid = async () => false;
+    await assert.rejects(sandbox.module.exports.browserLogin(session, {}), { code: 'EAGAIN' });
+});
+
+test('isolated Edge login returns cookies and releases the Playwright process after ordinary login', { timeout: 20000 }, async () => {
+    const harness = isolatedHarness('success');
+    const session = new Session();
+    session.valid = async () => false;
+    const traces = [];
+    try {
+        await harness.login(session, { username: 'test', password: 'dummy' }, AbortSignal.timeout(15000), message => traces.push(message));
+        assert.ok((await session.jar.getCookieString(ORIGIN)).includes('worker-token'));
+        assert.equal(harness.children[0].exitCode, 0);
+        assert.ok(traces.includes('Browser session verified'));
+        assert.ok(traces.includes('Temporary Edge closed'));
+        assert.ok(!Object.keys(require.cache).some(path => path.includes('playwright-core')));
+    } finally { for (const child of harness.children) if (child.exitCode === null) child.kill(); }
+});
+
+test('isolated diagnostic browser and process are released by idempotent close', { timeout: 20000 }, async () => {
+    const harness = isolatedHarness('success');
+    const session = new Session();
+    const controller = new AbortController();
+    try {
+        const close = await harness.login(session, {}, controller.signal, () => {}, undefined, true, true);
+        assert.equal(harness.children[0].exitCode, null);
+        await close(); await close(); controller.abort();
+        assert.equal(harness.children[0].exitCode, 0);
+        assert.ok((await session.jar.getCookieString(ORIGIN)).includes('worker-token'));
+    } finally { controller.abort(); for (const child of harness.children) if (child.exitCode === null) child.kill(); }
+});
+
+test('manually closing diagnostic Edge releases its process without requiring disconnect', { timeout: 20000 }, async () => {
+    const harness = isolatedHarness('success');
+    const controller = new AbortController();
+    try {
+        const close = await harness.login(new Session(), {}, controller.signal, () => {}, undefined, true, true);
+        const child = harness.children[0];
+        const exited = new Promise(resolve => child.once('exit', resolve));
+        child.send({ type: 'test-close-browser' });
+        await exited;
+        assert.equal(child.exitCode, 0);
+        await close();
+    } finally { controller.abort(); for (const child of harness.children) if (child.exitCode === null) child.kill(); }
+});
+
+test('isolated login cancellation and navigation failures terminate processes without publishing cookies', { timeout: 45000 }, async () => {
+    for (const cancelled of [true, false]) {
+        const harness = isolatedHarness('failure');
+        const session = new Session();
+        session.valid = async () => false;
+        const controller = new AbortController();
+        try {
+            const pending = harness.login(session, {}, AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]), message => {
+                if (cancelled && message === 'Starting temporary headless Edge') controller.abort();
+            });
+            await assert.rejects(pending);
+            assert.equal(harness.children[0].exitCode, 0);
+            assert.equal(await session.jar.getCookieString(ORIGIN), '');
+        } finally { controller.abort(); for (const child of harness.children) if (child.exitCode === null) child.kill(); }
+    }
+});
+
 test('diagnostic browser stays open until disconnect', async () => {
     let closed = false;
     const controller = new AbortController();
