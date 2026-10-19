@@ -1,5 +1,18 @@
 # Change Log
 
+## [0.0.17]
+
+- Retained compatibility for chats sent to an image model id (`qwen-image*`): the bridge translates them into a platform image generation call and returns Markdown image data. Image generation is intended to be called through MCP or an OpenAI Images-compatible client instead of the Copilot model picker.
+- The image model accepts the last user message as the prompt, honors an optional `n` (1-6) and `size` (`WxH`), keeps streaming and non-streaming chat behavior, and records the request in the usage dashboard.
+- Removed the Qwen-Image preset from Manage Copilot models. One-click configuration continues to offer the seven chat models, while image generation remains available through `/v1/images/generations` for MCP tools and compatible clients.
+- Reject empty latest prompts instead of falling back to earlier user messages, keep unreported image token usage unknown, and use the existing backpressure-aware streaming pipeline for image chat replies. Other chat models retain their forwarding behavior.
+- Bound image results to six platform file-content URLs and 20 MiB of recognized PNG, JPEG, WebP or GIF data; refresh idle timeouts during downloads and cancel reading when the client disconnects.
+- Added regression coverage for model configuration, non-streaming and streamed images, multiple image formats, prompt validation, authentication retries, malformed files, download limits and cancellation.
+
+- Added a local bridge route for image generation: `POST /v1/images/generations` forwards to the platform image endpoint and converts its internal file descriptors into the OpenAI Images `data[].b64_json` shape, so OpenAI-compatible image clients such as imageforge-mcp can generate images through the GENAI session.
+- The conversion downloads only platform-hosted result files; cross-origin image references are refused before any request is made.
+- Added regression coverage for the conversion, upstream error forwarding and cross-origin refusal.
+
 ## [0.0.16]
 
 - Publish the first VS Code Marketplace version while preserving the `Petalzu.genai-login` extension ID.

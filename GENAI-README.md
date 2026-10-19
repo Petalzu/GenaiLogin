@@ -29,6 +29,18 @@ When Duo displays a recognized device-confirmation prompt, the extension selects
 
 Only the window that owns the bridge can disconnect it or change credentials. Other windows display read-only connection status. Use the same port across participating windows.
 
+## Image Generation with MCP
+
+1. Connect GENAI and keep the bridge owner window open.
+2. Use a tool-capable chat model with an OpenAI Images-compatible MCP tool such as ImageForge.
+3. Set the tool's provider to `openai`, base URL to `http://127.0.0.1:58379/v1`, API key to `local-browser-session`, and model to `qwen-image-2.1`. Use the configured port if it differs from the default.
+
+The chat model calls the MCP tool, which requests the local `/v1/images/generations` endpoint and can save the result as an image file. The `openai` provider selects the compatible protocol, not the official OpenAI service. The platform's configured image engine determines the actual model used. The MCP process must run on the bridge machine to reach its loopback address.
+
+Image models are not offered by **Manage Copilot models**. They do not need to be registered as chat models to be used through MCP. An OpenAI Images-compatible client can use the same endpoint directly.
+
+The image endpoint returns inline `data[].b64_json`, with at most six files and 20 MiB of image data per request. Image requests are counted without invented token usage.
+
 ## Session Health
 
 The dashboard displays session health, the next scheduled check, and known expiry information. Successful request activity reduces redundant checks. During healthy operation, checks run after two idle minutes or at least once every five minutes. Temporary failures use backoff and respect server rate limits.

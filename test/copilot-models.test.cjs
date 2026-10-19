@@ -137,7 +137,7 @@ test('presets preserve reviewed parameters and isolate port overrides', () => {
 	}
 });
 
-test('all seven models append once with valid context budgets', () => {
+test('all seven chat models append once with valid context budgets', () => {
 	const catalog = require('../genai-models.json');
 	const limits = { 'gemma-4-31B-it': 180000, 'gpt-oss-120b': 131072, 'GLM-OCR': 131072,
 		'Qwen3.8-27B': 262144, 'Qwen3.5-397B-A17B': 262144, 'DeepSeek-V4.1-Flash': 1048576, 'GLM-5.3-Flash': 1048576 };
@@ -147,4 +147,70 @@ test('all seven models append once with valid context budgets', () => {
 	const result = appendModels('[]', models, endpoint);
 	assert.equal(readConfig(result)[0].models.length, 7);
 	assert.equal(appendModels(result, models, endpoint), result);
+});
+
+test('image models are not available as Copilot presets', () => {
+	assert.throws(() => preset('qwen-image-2.1', endpoint), /not in the reviewed catalog/);
+});
+
+test('configure command offers chat models only, backs up additions and skips duplicates', async () => {
+	const fs = require('node:fs');
+	const vm = require('node:vm');
+	for (const port of [58379, 58480]) {
+		const localEndpoint = endpoint.replace('58379', String(port));
+		const existing = [
+			{ name: 'Other', vendor: 'customendpoint', apiKey: '${input:unchanged}', apiType: 'messages', models: [{ id: 'other', url: 'https://example.com/v1/messages' }], settings: { other: { reasoningEffort: 'high' } } },
+			{ name: 'GENAI Chat', vendor: 'customendpoint', apiKey: 'local-browser-session', apiType: 'chat-completions',
+				models: [preset('DeepSeek-V4.1-Flash', localEndpoint), preset('GLM-5.3-Flash', localEndpoint)],
+				settings: { 'DeepSeek-V4.1-Flash': { reasoningEffort: 'low' }, 'GLM-5.3-Flash': { reasoningEffort: 'max' } } }
+		];
+		const original = JSON.stringify(existing, null, '\t').replace('[', '[\n// keep profile comment');
+		let text = original, disk = original, staged, backups = 0, writes = 0, saves = 0, picks = 0;
+		const uri = { path: '/User/chatLanguageModels.json', toString: () => 'vscode-userdata:/User/chatLanguageModels.json', with: value => value };
+		const document = { uri, isDirty: false, version: 1, getText: () => text, positionAt: offset => offset,
+			save: async () => { saves++; disk = text; document.isDirty = false; return true; } };
+		const api = {
+			commands: { executeCommand: async command => assert.equal(command, 'workbench.action.openLanguageModelsJson') },
+			window: {
+				activeTextEditor: { document },
+				showQuickPick: async items => {
+					if (++picks % 2 === 1) return '添加模型';
+					assert.equal(items.length, 7);
+					assert.ok(items.every(item => !item.id.startsWith('qwen-image')));
+					const chatModel = items.find(item => item.id === 'Qwen3.8-27B');
+					assert.ok(chatModel);
+					assert.equal(chatModel.picked, writes > 0);
+					return [chatModel];
+				},
+				showWarningMessage: async () => '确认保存', showInformationMessage: async () => {},
+				showErrorMessage: message => assert.fail(message)
+			},
+			workspace: {
+				openTextDocument: async () => document,
+				fs: { readFile: async () => Buffer.from(disk), copy: async (source, backup, options) => {
+					assert.equal(source, uri);
+					assert.match(backup.path, /chatLanguageModels\.json\.genai-\d+\.bak$/);
+					assert.equal(options.overwrite, false);
+					assert.equal(disk, original);
+					backups++;
+				} },
+				applyEdit: async () => { writes++; text = staged; document.version++; document.isDirty = true; return true; }
+			},
+			WorkspaceEdit: function () { this.replace = (target, range, value) => { assert.equal(target, uri); staged = value; }; },
+			Range: function () {}
+		};
+		const sandbox = { Buffer, module: { exports: {} }, require: name => name === 'vscode' ? api : require('../' + name.slice(2)) };
+		vm.runInNewContext(fs.readFileSync(require.resolve('../copilot-config'), 'utf8'), sandbox);
+		await sandbox.module.exports.configureModels(port);
+		const configured = readConfig(disk);
+		assert.ok(disk.includes('// keep profile comment'));
+		assert.deepEqual(configured[0], existing[0]);
+		assert.deepEqual(configured[1], { ...existing[1], models: [...existing[1].models, preset('Qwen3.8-27B', localEndpoint)],
+			settings: { ...existing[1].settings, 'Qwen3.8-27B': { reasoningEffort: 'xhigh' } } });
+		await sandbox.module.exports.configureModels(port);
+		assert.equal(readConfig(disk)[1].models.length, 3);
+		assert.equal(backups, 1);
+		assert.equal(writes, 1);
+		assert.equal(saves, 1);
+	}
 });

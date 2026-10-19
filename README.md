@@ -53,13 +53,17 @@ Node.js and npm are not required to install or use the extension. Finish active 
 
 - **Base URL:** `http://127.0.0.1:58379/v1`
 - **API key:** `local-browser-session`
-- **Supported endpoints:** `GET /v1/models` and `POST /v1/chat/completions`
+- **Supported endpoints:** `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/images/generations`
 
-The bridge supports streaming chat responses. It is not a complete implementation of the OpenAI API, and browser-origin requests are rejected.
+The bridge supports streaming chat responses. Image generation follows the platform's configured image engine (for example Qwen-Image); its response is converted to the OpenAI Images shape (`data[].b64_json`) so OpenAI-compatible image clients can consume it. It is not a complete implementation of the OpenAI API, and browser-origin requests are rejected.
+
+Image results are limited to six files and 20 MiB of decoded image bytes per request. Only platform file-content URLs and recognized PNG, JPEG, WebP or GIF bytes are accepted. Image requests are counted in the dashboard, but token usage is left unknown rather than estimated.
 
 ### GitHub Copilot
 
 Run **GENAI Login: Manage Copilot models** to add or remove models in the current VS Code Profile. Presets are defined in [genai-models.json](genai-models.json).
+
+Copilot presets include chat models only. For image generation, keep a tool-capable chat model selected and use an OpenAI Images-compatible MCP tool such as ImageForge with `provider: openai`, `base_url: http://127.0.0.1:58379/v1`, `api_key: local-browser-session`, and `model: qwen-image-2.1`. The tool calls `/v1/images/generations`; no image chat-model registration is needed. The platform's configured image engine determines the actual model used. See the [User Guide](GENAI-README.md#image-generation-with-mcp) for connection requirements.
 
 Changes require confirmation and create a backup before saving. Unrelated providers and model settings are preserved; unsaved or concurrently modified configuration files must be resolved before proceeding.
 

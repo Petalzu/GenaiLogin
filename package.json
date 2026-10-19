@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",
@@ -100,7 +100,7 @@
     ]
   },
   "scripts": {
-    "lint": "eslint extension.js auth.js browser-auth.js dashboard.js stats.js bridge-stream.js test/extension.test.js test/stats.test.js test/bridge-stream.test.cjs",
+    "lint": "eslint extension.js auth.js browser-auth.js dashboard.js stats.js bridge-stream.js copilot-config.js copilot-models.js test/extension.test.js test/stats.test.js test/bridge-stream.test.cjs test/local-access.test.cjs test/copilot-models.test.cjs",
     "pretest": "npm run lint",
     "test": "node --test test/*.test.cjs && vscode-test"
   },

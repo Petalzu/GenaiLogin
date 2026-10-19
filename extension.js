@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const http = require('node:http');
+const { Readable } = require('node:stream');
 const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('./bridge-stream');
 const { dashboardHtml } = require('./dashboard');
 const { createStats, createHistory, createHistoryFiles, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
@@ -61,6 +62,79 @@ class DashboardProvider {
 		this.disposeSubscription?.dispose();
 		this.view = undefined;
 	}
+}
+
+// The platform answers image generation with its internal file descriptors
+// ([{ id, url, name, content_type }]); OpenAI Images clients expect the decoded
+// bytes inline, so the proxy downloads each platform file and re-wraps it as
+// data[].b64_json.
+async function convertImageResponse(payload, downloadImage) {
+	const entries = Array.isArray(payload) ? payload : [];
+	if (entries.length > 6) throw new Error('Too many generated images');
+	const data = [];
+	let remaining = 20 * 1024 * 1024;
+	for (const entry of entries) {
+		if (!entry || typeof entry.url !== 'string' || !entry.url.trim()) throw new Error('Invalid image file reference');
+		const bytes = await downloadImage(entry.url, remaining);
+		if (!detectImageMimeType(bytes)) throw new Error('Unsupported image file format');
+		remaining -= bytes.length;
+		data.push({ b64_json: bytes.toString('base64') });
+	}
+	return data;
+}
+
+async function readImageResponseBody(response, lifetime, limit) {
+	lifetime.signal.throwIfAborted();
+	if (!response.body) throw new Error('Empty image response');
+	const reader = response.body.getReader();
+	const chunks = [];
+	let size = 0, complete = false;
+	try {
+		if (Number(response.headers.get('content-length')) > limit) throw new Error('Image response too large');
+		while (true) {
+			const { done, value } = await waitForSignal(reader.read(), lifetime.signal);
+			if (done) { complete = true; break; }
+			size += value.byteLength;
+			if (size > limit) throw new Error('Image response too large');
+			lifetime.touch();
+			chunks.push(Buffer.from(value));
+		}
+		return Buffer.concat(chunks, size);
+	} finally {
+		if (!complete) await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+}
+
+const imageChatModelPattern = /^qwen-image(?:-[\w.]+)*$/i;
+
+function isImageChatModel(model) {
+	return typeof model === 'string' && imageChatModelPattern.test(model.trim());
+}
+
+// Image chats arrive as regular chat completions; only the last user message is
+// the prompt, while system prompts and tool priming are ignored.
+function extractImagePrompt(messages) {
+	if (!Array.isArray(messages)) return '';
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || message.role !== 'user') continue;
+		if (typeof message.content === 'string') return message.content.trim();
+		if (Array.isArray(message.content)) {
+			const text = message.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n').trim();
+			return text;
+		}
+		return '';
+	}
+	return '';
+}
+
+function detectImageMimeType(bytes) {
+	if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+	if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+	if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) return 'image/gif';
+	return undefined;
 }
 
 function activate(context) {
@@ -321,6 +395,14 @@ function activate(context) {
 			scheduleKeepalive();
 		};
 		const sendError = (response, code, message) => { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message } })); };
+		const downloadPlatformImage = async (url, lifetime, limit) => {
+			const target = new URL(url, ORIGIN);
+			if (target.origin !== ORIGIN || target.username || target.password || !/^\/api\/v1\/files\/[^/]+\/content$/.test(target.pathname)) throw new Error('Untrusted image file reference');
+			const image = await session.request(target.href, { signal: lifetime.signal, fetch: upstreamFetch, dispatcher, checkSession: true });
+			lifetime.touch();
+			if (!image.ok || !image.body) { await image.body?.cancel(); throw new Error(`Image file download failed with HTTP ${image.status}`); }
+			return readImageResponseBody(image, lifetime, limit);
+		};
 		const settleRequest = requestStats => {
 			history.finish(requestStats);
 			if (active !== controller || controller.signal.aborted) return;
@@ -334,7 +416,9 @@ function activate(context) {
 				response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
 				return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot() }));
 			}
-			const route = request.method === 'POST' && request.url === '/v1/chat/completions' ? '/api/v1/chat/completions' : request.method === 'GET' && request.url === '/v1/models' ? '/api/v1/models' : null;
+			const route = request.method === 'POST' && request.url === '/v1/chat/completions' ? '/api/v1/chat/completions'
+				: request.method === 'POST' && request.url === '/v1/images/generations' ? '/api/v1/images/generations'
+					: request.method === 'GET' && request.url === '/v1/models' ? '/api/v1/models' : null;
 			if (!route) return sendError(response, 404, 'Not found');
 			const lifetime = createRequestLifetime(response, controller.signal);
 			const cancelRequest = () => request.destroy();
@@ -358,25 +442,89 @@ function activate(context) {
 				history.start();
 				dashboard?.refresh();
 			}
-			let result = await session.request(ORIGIN + route, options);
-			if (result.status === 401) {
+			const forwardUpstream = async (routePath, requestOptions) => {
+				let result = await session.request(ORIGIN + routePath, requestOptions);
+				if (result.status !== 401) return result;
 				await result.body?.cancel();
 				trace('Proxy: authentication rejected with HTTP 401; attempting one login before forwarding');
 				lifetime.setIdleTimeout(0);
 				try { await waitForSignal(authenticate(true), lifetime.signal); } catch (error) {
 					if (lifetime.signal.aborted) throw error;
-					sendError(response, 401, 'Automatic login failed; disconnect and reconnect after checking credentials or verification.'); return;
+					sendError(response, 401, 'Automatic login failed; disconnect and reconnect after checking credentials or verification.');
+					return undefined;
 				}
 				lifetime.signal.throwIfAborted();
 				lifetime.setIdleTimeout(idleMs);
-				result = await session.request(ORIGIN + route, options);
+				return session.request(ORIGIN + routePath, requestOptions);
+			};
+			if (route === '/api/v1/chat/completions') {
+				let requestPayload;
+				try { requestPayload = JSON.parse(options.body.toString('utf8')); } catch { requestPayload = undefined; }
+				if (requestPayload && isImageChatModel(requestPayload.model)) {
+					const prompt = extractImagePrompt(requestPayload.messages);
+					if (!prompt) return sendError(response, 400, 'The image model requires a text prompt in the last user message');
+					const imagePayload = { prompt, n: Number.isInteger(requestPayload.n) && requestPayload.n >= 1 && requestPayload.n <= 6 ? requestPayload.n : 1 };
+					if (typeof requestPayload.size === 'string' && /^\d{1,5}x\d{1,5}$/.test(requestPayload.size)) imagePayload.size = requestPayload.size;
+					const imageResult = await forwardUpstream('/api/v1/images/generations', { method: 'POST', body: Buffer.from(JSON.stringify(imagePayload)), headers: { 'content-type': 'application/json', Accept: 'application/json' }, signal: lifetime.signal, fetch: upstreamFetch, dispatcher });
+					if (!imageResult) return;
+					lifetime.touch();
+					void persist();
+					if (!imageResult.ok) {
+						response.writeHead(imageResult.status, { 'content-type': imageResult.headers.get('content-type') || 'application/json' });
+						if (!imageResult.body) return response.end();
+						await forwardBody(imageResult.body, response, lifetime, chunk => { bytes += chunk.length; });
+						trace(`Proxy completed: status=${imageResult.status} elapsedMs=${Date.now() - startedAt} bytes=${bytes} image=chat`);
+						return;
+					}
+					noteActivity();
+					let platformPayload;
+					const platformBody = await readImageResponseBody(imageResult, lifetime, 1024 * 1024);
+					try { platformPayload = JSON.parse(platformBody.toString('utf8')); } catch { platformPayload = undefined; }
+					const generated = await convertImageResponse(platformPayload, (url, limit) => downloadPlatformImage(url, lifetime, limit));
+					if (!generated.length) return sendError(response, 502, 'Image generation did not return a downloadable image');
+					const content = generated.map(image => `![Qwen-Image](data:${detectImageMimeType(Buffer.from(image.b64_json, 'base64'))};base64,${image.b64_json})`).join('\n\n');
+					const created = Math.floor(Date.now() / 1000);
+					const id = `chatcmpl-image-${created}`;
+					const usage = null;
+					if (requestPayload.stream) {
+						response.writeHead(200, { 'content-type': 'text/event-stream' });
+						const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestPayload.model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+						function* events() {
+							yield Buffer.from(chunk({ role: 'assistant', content: '' }));
+							for (let offset = 0; offset < content.length; offset += 65536) yield Buffer.from(chunk({ content: content.slice(offset, offset + 65536) }));
+							yield Buffer.from(chunk({}, 'stop'));
+							if (requestPayload.stream_options?.include_usage) yield Buffer.from(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestPayload.model, choices: [], usage })}\n\n`);
+							yield Buffer.from('data: [DONE]\n\n');
+						}
+						await forwardBody(Readable.toWeb(Readable.from(events(), { objectMode: false })), response, lifetime, chunk => { bytes += chunk.length; });
+						trace(`Proxy completed: status=200 elapsedMs=${Date.now() - startedAt} bytes=${bytes} image=chat stream=true`);
+						return;
+					}
+					const body = Buffer.from(JSON.stringify({ id, object: 'chat.completion', created, model: requestPayload.model, choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage }));
+					response.writeHead(200, { 'content-type': 'application/json' });
+					trace(`Proxy completed: status=200 elapsedMs=${Date.now() - startedAt} bytes=${body.length} image=chat`);
+					return response.end(body);
+				}
 			}
+			const result = await forwardUpstream(route, options);
+			if (!result) return;
 			lifetime.touch();
 			void persist();
 			const contentType = result.headers.get('content-type') || 'application/json';
 			const sessionAccepted = result.ok && /application\/json|text\/event-stream/i.test(contentType);
 			if (sessionAccepted) noteActivity();
 			if (isCurrentConnection() && !authentication && !reauthenticationBlocked) status(`Connected :${stats.port}`);
+			if (route === '/api/v1/images/generations' && result.ok) {
+				let payload;
+				const platformBody = await readImageResponseBody(result, lifetime, 1024 * 1024);
+				try { payload = JSON.parse(platformBody.toString('utf8')); } catch { payload = undefined; }
+				const data = await convertImageResponse(payload, (url, limit) => downloadPlatformImage(url, lifetime, limit));
+				if (!data.length) return sendError(response, 502, 'Image generation did not return a downloadable image');
+				const body = Buffer.from(JSON.stringify({ created: Math.floor(Date.now() / 1000), data }));
+				response.writeHead(200, { 'content-type': 'application/json' });
+				trace(`Proxy completed: status=200 elapsedMs=${Date.now() - startedAt} bytes=${body.length} images=${data.length}`);
+				return response.end(body);
+			}
 			response.writeHead(result.status, { 'content-type': contentType });
 			if (!result.body) { settleRequest(requestStats); return response.end(); }
 			usageParser = createUsageParser(contentType, requestStats);

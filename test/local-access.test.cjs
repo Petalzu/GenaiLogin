@@ -6,6 +6,8 @@ const { setImmediate: nextTurn } = require('node:timers/promises');
 const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 
+const pngImage = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+nmf0AAAAASUVORK5CYII=', 'base64');
+
 function connectionHarness(options = {}) {
     const commands = new Map();
     const messages = [];
@@ -41,7 +43,7 @@ function connectionHarness(options = {}) {
         store: options.store || (async () => {}), delete: options.delete || (async () => {})
     };
     const sandbox = {
-        module: { exports: {} }, AbortController, AbortSignal, Buffer,
+        module: { exports: {} }, AbortController, AbortSignal, Buffer, URL,
         setTimeout: (callback, milliseconds) => { const timer = { callback, milliseconds, unref() {} }; timers.push(timer); return timer; },
         clearTimeout() {}, setInterval: () => ({ unref() {} }), clearInterval() {},
         fetch: async () => { throw new Error('no other owner'); },
@@ -65,12 +67,12 @@ function connectionHarness(options = {}) {
     };
 }
 
-function chatExchange() {
+function chatExchange(url = '/v1/chat/completions', body = '{"model":"test","stream":true}') {
     const chunks = [];
     const response = new Writable({ write(chunk, encoding, done) { chunks.push(Buffer.from(chunk)); done(); } });
     response.writeHead = status => { response.status = status; response.headersSent = true; };
-    const request = { method: 'POST', url: '/v1/chat/completions', headers: { host: '127.0.0.1:58379', authorization: 'Bearer local-browser-session' },
-        destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from('{"model":"test","stream":true}'); } };
+    const request = { method: 'POST', url, headers: { host: '127.0.0.1:58379', authorization: 'Bearer local-browser-session' },
+        destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from(body); } };
     return { request, response, chunks };
 }
 
@@ -93,6 +95,270 @@ test('slow or failed session storage does not block successful upstream forwardi
             if (failure) assert.equal(harness.snapshot().sessionPersistence, 'error');
         } finally { release?.(); harness.dispose(); }
     }
+});
+
+test('image generation responses convert platform files into inline OpenAI image data', async () => {
+    const requested = [];
+    const harness = connectionHarness({ request: async url => {
+        requested.push(url);
+        if (url.endsWith('/api/v1/images/generations')) {
+            return new Response(JSON.stringify([{ id: 'file-1', url: '/api/v1/files/file-1/content', name: 'generated-image.png', content_type: 'image/png' }]),
+                { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response(pngImage, { status: 200, headers: { 'content-type': 'image/png' } });
+    } });
+    try {
+        await harness.action('connect');
+        const { request, response, chunks } = chatExchange('/v1/images/generations', '{"model":"Qwen-Image-2.1","prompt":"a red apple"}');
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(Buffer.concat(chunks).toString());
+        assert.deepEqual(Buffer.from(payload.data[0].b64_json, 'base64'), pngImage);
+        assert.ok(Number.isSafeInteger(payload.created));
+        assert.deepEqual(requested, ['https://chat.genai.um.edu.mo/api/v1/images/generations', 'https://chat.genai.um.edu.mo/api/v1/files/file-1/content']);
+    } finally { harness.dispose(); }
+});
+
+test('image generation failures are forwarded unchanged', async () => {
+    const harness = connectionHarness({ request: async () => new Response(JSON.stringify({ detail: 'Access prohibited' }),
+        { status: 403, headers: { 'content-type': 'application/json' } }) });
+    try {
+        await harness.action('connect');
+        const { request, response, chunks } = chatExchange('/v1/images/generations', '{"prompt":"a red apple"}');
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 403);
+        assert.equal(Buffer.concat(chunks).toString(), '{"detail":"Access prohibited"}');
+    } finally { harness.dispose(); }
+});
+
+test('cross-origin image file references are refused', async () => {
+    const requested = [];
+    const harness = connectionHarness({ request: async url => {
+        requested.push(url);
+        return new Response(JSON.stringify([{ id: 'file-1', url: 'https://evil.example/steal', name: 'x.png', content_type: 'image/png' }]),
+            { status: 200, headers: { 'content-type': 'application/json' } });
+    } });
+    try {
+        await harness.action('connect');
+        const { request, response } = chatExchange('/v1/images/generations', '{"prompt":"a red apple"}');
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 502);
+        assert.deepEqual(requested, ['https://chat.genai.um.edu.mo/api/v1/images/generations']);
+    } finally { harness.dispose(); }
+});
+
+test('image chat model turns the last user message into a generated image reply', async () => {
+    const requested = [];
+    const harness = connectionHarness({ request: async (url, settings) => {
+        requested.push(url);
+        if (url.endsWith('/api/v1/images/generations')) {
+            assert.equal(JSON.parse(settings.body.toString()).prompt, 'a red apple');
+            return new Response(JSON.stringify([{ id: 'file-1', url: '/api/v1/files/file-1/content', name: 'generated-image.png', content_type: 'image/png' }]),
+                { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response(pngImage, { status: 200, headers: { 'content-type': 'image/png' } });
+    } });
+    try {
+        await harness.action('connect');
+        const payload = { model: 'qwen-image-2.1', messages: [{ role: 'system', content: 'ignored' }, { role: 'user', content: 'a red apple' }] };
+        const { request, response, chunks } = chatExchange('/v1/chat/completions', JSON.stringify(payload));
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 200);
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        assert.equal(body.choices[0].message.role, 'assistant');
+        assert.ok(body.choices[0].message.content.startsWith('![Qwen-Image](data:image/png;base64,'));
+        assert.ok(body.choices[0].message.content.includes(pngImage.toString('base64')));
+        assert.equal(body.choices[0].finish_reason, 'stop');
+        assert.equal(body.usage, null);
+        assert.equal(harness.snapshot().requests, 1);
+        assert.equal(harness.snapshot().usageMissing, 1);
+        assert.equal(harness.snapshot().usageReports, 0);
+        assert.equal(harness.snapshot().tokensIn, 0);
+        assert.equal(harness.snapshot().tokensOut, 0);
+        assert.deepEqual(requested, ['https://chat.genai.um.edu.mo/api/v1/images/generations', 'https://chat.genai.um.edu.mo/api/v1/files/file-1/content']);
+    } finally { harness.dispose(); }
+});
+
+test('image chat model streams the generated image as chat completion chunks', async () => {
+    const harness = connectionHarness({ request: async url => url.endsWith('/api/v1/images/generations')
+        ? new Response(JSON.stringify([{ id: 'file-1', url: '/api/v1/files/file-1/content', name: 'x.png', content_type: 'image/png' }]), { status: 200, headers: { 'content-type': 'application/json' } })
+        : new Response(pngImage, { status: 200, headers: { 'content-type': 'image/png' } }) });
+    try {
+        await harness.action('connect');
+        const payload = { model: 'Qwen-Image-2.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'a red apple' }] };
+        const { request, response, chunks } = chatExchange('/v1/chat/completions', JSON.stringify(payload));
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        await nextTurn();
+        assert.equal(response.status, 200);
+        const text = Buffer.concat(chunks).toString();
+        assert.ok(text.endsWith('data: [DONE]\n\n'));
+        const events = text.split('\n\n').filter(Boolean).map(block => block.replace(/^data: /, '')).filter(data => data !== '[DONE]').map(data => JSON.parse(data));
+        const streamed = events.filter(event => event.choices?.[0]?.delta?.content).map(event => event.choices[0].delta.content).join('');
+        assert.ok(streamed.startsWith('![Qwen-Image](data:image/png;base64,'));
+        assert.ok(streamed.includes(pngImage.toString('base64')));
+        assert.equal(events.at(-2).choices[0].finish_reason, 'stop');
+        assert.equal(events.at(-1).usage, null);
+        assert.equal(harness.snapshot().usageReports, 0);
+        assert.equal(harness.snapshot().usageMissing, 1);
+    } finally { harness.dispose(); }
+});
+
+test('image chat model requires a text prompt and forwards upstream failures', async () => {
+    const requested = [];
+    const harness = connectionHarness({ request: async url => {
+        requested.push(url);
+        return new Response(JSON.stringify({ detail: 'Access prohibited' }),
+            { status: 403, headers: { 'content-type': 'application/json' } });
+    } });
+    try {
+        await harness.action('connect');
+        for (const content of ['  ', [], [{ type: 'text', text: '  ' }], [{ type: 'image_url', image_url: { url: 'data:image/png;base64,UE5H' } }], null]) {
+            const empty = chatExchange('/v1/chat/completions', JSON.stringify({ model: 'qwen-image', messages: [
+                { role: 'user', content: 'an obsolete prompt' }, { role: 'user', content }
+            ] }));
+            const emptyDone = new Promise(resolve => empty.response.once('finish', resolve));
+            harness.servers.at(-1).handle(empty.request, empty.response);
+            await emptyDone;
+            assert.equal(empty.response.status, 400);
+        }
+        assert.equal(requested.length, 0);
+        const failure = chatExchange('/v1/chat/completions', JSON.stringify({ model: 'qwen-image', messages: [{ role: 'user', content: 'a red castle' }] }));
+        const failureDone = new Promise(resolve => failure.response.once('finish', resolve));
+        harness.servers.at(-1).handle(failure.request, failure.response);
+        await failureDone;
+        assert.equal(failure.response.status, 403);
+        assert.equal(Buffer.concat(failure.chunks).toString(), '{"detail":"Access prohibited"}');
+    } finally { harness.dispose(); }
+});
+
+test('image chat preserves text parts and image options and returns multiple detected image formats', async () => {
+    const images = [Buffer.from([0xff, 0xd8, 0xff, 0xd9]), Buffer.from('RIFF0000WEBP'), Buffer.from('GIF89a')];
+    const harness = connectionHarness({ request: async (url, settings) => {
+        if (url.endsWith('/api/v1/images/generations')) {
+            assert.deepEqual(JSON.parse(settings.body.toString()), { prompt: 'a red apple\non a blue table', n: 3, size: '1024x768' });
+            return Response.json(images.map((image, index) => ({ url: `/api/v1/files/${index}/content` })));
+        }
+        return new Response(images[Number(url.split('/').at(-2))], { headers: { 'content-type': 'application/octet-stream' } });
+    } });
+    try {
+        await harness.action('connect');
+        const payload = { model: 'Qwen-Image-2.1', n: 3, size: '1024x768', tools: [{ type: 'function' }], messages: [
+            { role: 'system', content: 'not a prompt' }, { role: 'user', content: 'obsolete' },
+            { role: 'user', content: [{ type: 'text', text: 'a red apple' }, { type: 'text', text: 'on a blue table' }] },
+            { role: 'assistant', content: 'also not a prompt' }
+        ] };
+        const { request, response, chunks } = chatExchange('/v1/chat/completions', JSON.stringify(payload));
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 200);
+        const content = JSON.parse(Buffer.concat(chunks).toString()).choices[0].message.content;
+        for (const mime of ['image/jpeg', 'image/webp', 'image/gif']) assert.ok(content.includes(`data:${mime};base64,`));
+        for (const image of images) assert.ok(content.includes(image.toString('base64')));
+    } finally { harness.dispose(); }
+});
+
+test('image chat retries one generation request after an unauthorized response', async () => {
+    let attempts = 0;
+    const harness = connectionHarness({ request: async url => {
+        if (url.endsWith('/api/v1/images/generations')) {
+            if (++attempts === 1) return new Response('expired', { status: 401 });
+            return Response.json([{ url: '/api/v1/files/file-1/content' }]);
+        }
+        return new Response(pngImage);
+    } });
+    try {
+        await harness.action('connect');
+        const { request, response } = chatExchange('/v1/chat/completions', '{"model":"qwen-image-2.1","messages":[{"role":"user","content":"a red apple"}]}');
+        const finished = new Promise(resolve => response.once('finish', resolve));
+        harness.servers.at(-1).handle(request, response);
+        await finished;
+        assert.equal(response.status, 200);
+        assert.equal(attempts, 2);
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.snapshot().requests, 1);
+    } finally { harness.dispose(); }
+});
+
+test('image conversion rejects malformed references, excess files and non-image downloads', async () => {
+    for (const scenario of [
+        { payload: [] }, { payload: { detail: 'not an image result' } }, { payload: [null] }, { payload: [{ url: '' }] },
+        { payload: [{ url: '/api/v1/auths/' }] }, { payload: [{ url: 'https://user:password@chat.genai.um.edu.mo/api/v1/files/file-1/content' }] },
+        { payload: Array.from({ length: 7 }, () => ({ url: '/api/v1/files/file-1/content' })) },
+        { payload: [{ url: '/api/v1/files/file-1/content' }], download: '<html>Login required</html>', downloads: 1 }
+    ]) {
+        let downloads = 0;
+        const harness = connectionHarness({ request: async url => {
+            if (url.endsWith('/api/v1/images/generations')) return Response.json(scenario.payload);
+            downloads++;
+            return new Response(scenario.download, { headers: { 'content-type': 'image/png' } });
+        } });
+        try {
+            await harness.action('connect');
+            const { request, response } = chatExchange('/v1/images/generations', '{"prompt":"a red apple"}');
+            const finished = new Promise(resolve => response.once('finish', resolve));
+            harness.servers.at(-1).handle(request, response);
+            await finished;
+            assert.equal(response.status, 502);
+            assert.equal(downloads, scenario.downloads || 0);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('image download limits apply to declared and streamed bytes and cancel oversized bodies', async () => {
+    for (const declared of [true, false]) {
+        let cancelled = false;
+        const harness = connectionHarness({ request: async url => {
+            if (url.endsWith('/api/v1/images/generations')) return Response.json([{ url: '/api/v1/files/file-1/content' }]);
+            return new Response(new ReadableStream({
+                start(controller) { if (!declared) controller.enqueue(Buffer.alloc(20 * 1024 * 1024 + 1)); },
+                cancel() { cancelled = true; }
+            }), { headers: declared ? { 'content-length': String(20 * 1024 * 1024 + 1) } : {} });
+        } });
+        try {
+            await harness.action('connect');
+            const { request, response } = chatExchange('/v1/images/generations', '{"prompt":"a red apple"}');
+            const finished = new Promise(resolve => response.once('finish', resolve));
+            harness.servers.at(-1).handle(request, response);
+            await finished;
+            assert.equal(response.status, 502);
+            assert.equal(cancelled, true);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('client disconnect cancels image download without disconnecting the shared session', async () => {
+    let beginDownload, downloadSignal, cancelled = false;
+    const downloading = new Promise(resolve => { beginDownload = resolve; });
+    const harness = connectionHarness({ request: async (url, settings) => {
+        if (url.endsWith('/api/v1/images/generations')) return Response.json([{ url: '/api/v1/files/file-1/content' }]);
+        downloadSignal = settings.signal;
+        return new Response(new ReadableStream({
+            pull(controller) { controller.enqueue(pngImage); beginDownload(); return new Promise(() => {}); },
+            cancel() { cancelled = true; }
+        }));
+    } });
+    try {
+        await harness.action('connect');
+        const { request, response } = chatExchange('/v1/chat/completions', '{"model":"qwen-image-2.1","messages":[{"role":"user","content":"a red apple"}]}');
+        harness.servers.at(-1).handle(request, response);
+        await downloading;
+        response.destroy();
+        await nextTurn();
+        assert.equal(downloadSignal.aborted, true);
+        assert.equal(cancelled, true);
+        assert.equal(harness.snapshot().connection, 'connected');
+    } finally { harness.dispose(); }
 });
 
 test('late authentication cannot mark a replacement connection as connected', async () => {
