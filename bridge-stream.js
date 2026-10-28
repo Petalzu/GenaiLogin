@@ -142,8 +142,8 @@ async function forwardBody(body, response, lifetime, consume, normalizeMixedReas
 }
 
 function transportCode(error) {
-	const code = error?.cause?.code || error?.code || error?.name;
-	return typeof code === 'string' && /^[A-Za-z0-9_]+$/.test(code) ? code : 'UNKNOWN';
+	return [error?.cause?.code, error?.code, error?.name].find(code =>
+		typeof code === 'string' && /^[A-Za-z0-9_]+$/.test(code)) || 'UNKNOWN';
 }
 
 module.exports = { createRequestLifetime, waitForSignal, forwardBody, transportCode };

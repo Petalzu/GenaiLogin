@@ -151,6 +151,7 @@ function activate(context) {
 	};
 	let server, listenerController, listenerReady = false, listenerStartPromise, requestHandler, connectPromise;
 	let connectionVersion = 0, automaticLoginBlocked = false;
+	let automaticRetryAt = 0, automaticFailures = 0;
 	let active, authentication, keepaliveTimer, keepaliveOwner, reconnectActive;
 	let state = 'Disconnected';
 	let connection = 'disconnected', loginPhase;
@@ -252,6 +253,14 @@ function activate(context) {
 		return true;
 	};
 	const sendError = (response, code, message, headers = {}) => { response.writeHead(code, { 'content-type': 'application/json', ...headers }); response.end(JSON.stringify({ error: { message } })); };
+	const temporaryAuthenticationFailure = error => error.retryAuthentication !== false &&
+		(error.code === 'SESSION_UNAVAILABLE' && [429, 502, 503, 504].includes(error.status) ||
+			error.code === 'SESSION_CHECK_TIMEOUT' ||
+			error.retryAuthentication === true && error.name === 'TimeoutError' ||
+		['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
+			'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_TIMED_OUT'].includes(transportCode(error)));
+	const automaticRetryHeaders = () => automaticRetryAt > Date.now() ?
+		{ 'retry-after': String(Math.max(1, Math.ceil((automaticRetryAt - Date.now()) / 1000))) } : {};
 	const rejectLocalRequest = request => {
 		const fetchSite = request.headers['sec-fetch-site'];
 		return request.headers.host !== `127.0.0.1:${stats.port}` ? 'host mismatch' : request.headers.origin ? 'Origin present' : fetchSite !== undefined && fetchSite !== 'none' ? `Fetch Metadata rejected (${['same-origin', 'same-site', 'cross-site'].includes(fetchSite) ? fetchSite : 'unrecognized'})` : request.headers.authorization !== 'Bearer local-browser-session' ? (request.headers.authorization ? 'Authorization mismatch' : 'Authorization missing') : '';
@@ -279,6 +288,8 @@ function activate(context) {
 					const supported = request.method === 'POST' && ['/v1/chat/completions', '/v1/images/generations'].includes(request.url) || request.method === 'GET' && request.url === '/v1/models';
 					if (!supported) return sendError(response, 404, 'Not found');
 					if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
+					if (!requestHandler && automaticRetryAt > Date.now()) return sendError(response, 503,
+						'GENAI automatic connection is cooling down after a temporary network or service failure; retry later or reconnect explicitly.', automaticRetryHeaders());
 					if (!requestHandler) {
 						const waiting = createRequestLifetime(response, owner.signal);
 						const cancelRequest = () => request.destroy();
@@ -289,8 +300,9 @@ function activate(context) {
 							waiting.signal.throwIfAborted();
 						} catch (error) {
 							if (waiting.signal.aborted) return;
-							trace(`Automatic connection failed: code=${transportCode(error)}`);
-							if (!response.destroyed && !response.headersSent) sendError(response, 503, 'GENAI automatic connection failed; retry the request after checking login.');
+							if (!response.destroyed && !response.headersSent) sendError(response, 503, error.code === 'SESSION_CHECK_TIMEOUT' && !automaticLoginBlocked ?
+								'GENAI session check timed out; retry the request. Automatic connection remains enabled.' :
+								`GENAI automatic connection failed (${transportCode(error)}); retry after the cooldown or reconnect explicitly.`, automaticRetryHeaders());
 							return;
 						} finally {
 							waiting.signal.removeEventListener('abort', cancelRequest);
@@ -344,6 +356,7 @@ function activate(context) {
 		keepaliveInfo = { state: 'idle', lastCheckAt: null };
 		sessionPersistenceInfo = 'idle';
 		if (closeListener) {
+			automaticRetryAt = 0; automaticFailures = 0;
 			listenerController?.abort(); listenerController = undefined; listenerStartPromise = undefined;
 			server?.closeAllConnections(); server?.close(); server = undefined; listenerReady = false;
 		}
@@ -371,7 +384,7 @@ function activate(context) {
 	};
 	const connectNow = async (diagnostic = false, automatic = false) => {
 		if (active) return;
-		if (!automatic) automaticLoginBlocked = false;
+		if (!automatic) { automaticLoginBlocked = false; automaticRetryAt = 0; automaticFailures = 0; }
 		const version = connectionVersion;
 		if (!await startListener() || version !== connectionVersion || syncDisposed) return;
 		await getHistory().reload();
@@ -407,11 +420,6 @@ function activate(context) {
 		let retainedBrowser, reauthenticationBlocked = false;
 		let authenticationRetryAt = 0, authenticationFailures = 0, sessionVersion = 0;
 		let healthFailures = 0, healthRecoveryAttempted = false;
-		const temporaryAuthenticationFailure = error => error.retryAuthentication !== false &&
-			(error.code === 'SESSION_UNAVAILABLE' && [429, 502, 503, 504].includes(error.status) ||
-				error.retryAuthentication === true && error.name === 'TimeoutError' ||
-			['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
-				'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_TIMED_OUT'].includes(transportCode(error)));
 		const retryHeaders = () => ({ 'retry-after': String(Math.max(1, Math.ceil((authenticationRetryAt - Date.now()) / 1000))) });
 		const sendAuthenticationError = response => sendError(response, reauthenticationBlocked ? 401 : 503, reauthenticationBlocked ?
 			'Automatic login failed; reconnect after checking credentials or verification.' :
@@ -425,13 +433,14 @@ function activate(context) {
 				message.startsWith('Waiting for UMPASS') ? 'umpass' : message === 'Checking GENAI callback' ? 'callback' : message === 'Waiting for identity redirect' ? 'redirect' : undefined;
 			if (phase && loginPhase !== phase) { loginPhase = phase; dashboard?.refresh(); }
 		};
-		const authenticate = (force = false, explicit = false) => {
+		const authenticate = (force = false) => {
 			if (!authentication) {
 				loginPhase = 'checking-session';
 				status('Authenticating');
 				authentication = (async () => {
 					await retainedBrowser?.(); retainedBrowser = undefined;
-					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic, { force, recoverSession: explicit || !automatic && !force });
+					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic,
+						{ force: true });
 					controller.signal.throwIfAborted();
 					if (active !== controller) return;
 					sessionVersion++;
@@ -470,7 +479,7 @@ function activate(context) {
 			authenticationFailures = 0;
 			healthFailures = 0;
 			healthRecoveryAttempted = false;
-			try { await authenticate(true, true); } catch (error) { await reportError(error); }
+			try { await authenticate(true); } catch (error) { await reportError(error); }
 		};
 		const scheduleKeepalive = () => {
 			if (!isCurrentConnection()) return;
@@ -730,16 +739,30 @@ function activate(context) {
 		};
 			await authenticate();
 			if (!isCurrentConnection()) return;
+			automaticRetryAt = 0; automaticFailures = 0;
 			requestHandler = handle;
 			startKeepalive();
 		} catch (error) {
 			if (controller.signal.aborted) return;
-			trace('Connection failed; inspect preceding stage (no credentials logged)'); output.show(true);
+			trace(`Connection failed: code=${transportCode(error)}; inspect preceding stage (no credentials logged)`); output.show(true);
 			if (active === controller) stop(false);
-			if (automatic && (error.name === 'TimeoutError' || error.code === 'CREDENTIALS_REJECTED')) {
+			if (automatic && (error.retryAuthentication === false ||
+				error.name === 'TimeoutError' && error.retryAuthentication !== true || error.code === 'CREDENTIALS_REJECTED')) {
 				automaticLoginBlocked = true;
 				keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
 				status('Authentication required; reconnect');
+			} else if (error.code === 'SESSION_CHECK_TIMEOUT') {
+				keepaliveInfo = { state: 'error', reason: 'session-check-timeout', lastCheckAt: Date.now() };
+				status('Session check timed out; retry available');
+				trace('Initial session check timed out; automatic connection remains available for the next request');
+			}
+			if (automatic && !automaticLoginBlocked && temporaryAuthenticationFailure(error)) {
+				const milliseconds = Math.max(Math.min(30000 * 2 ** Math.min(automaticFailures++, 4), 300000), error.retryAfterMs || 0);
+				automaticRetryAt = Date.now() + milliseconds;
+				keepaliveInfo = { state: 'error', reason: error.code === 'SESSION_CHECK_TIMEOUT' ? 'session-check-timeout' : 'connection-unavailable',
+					lastCheckAt: Date.now(), nextCheckAt: automaticRetryAt };
+				status(error.code === 'SESSION_CHECK_TIMEOUT' ? 'Session check timed out; retry after cooldown' : 'Connection temporarily unavailable; retry after cooldown');
+				trace(`Automatic connection: temporary failure code=${transportCode(error)}; retry available in ${milliseconds}ms`);
 			}
 			if (error.code === 'EADDRINUSE') { await syncSharedState(); if (sharedState) return; }
 			throw error;
@@ -804,6 +827,9 @@ function activate(context) {
 	const reportError = async error => {
 		if (error?.name === 'AbortError') return;
 		const message = error?.code === 'EADDRINUSE' ? `端口 ${stats.port} 已占用。请关闭其他桥接，或设置另一个端口后重载。` :
+			error?.code === 'SESSION_CHECK_TIMEOUT' ? (error.retryAuthentication === false ?
+				'GENAI 登录后的会话验证网络超时。为避免重复 MFA，请稍后重新连接；无需清除账号。' :
+				'GENAI 会话检查网络超时，自动连接未禁用。请稍后重试请求或重新连接；无需清除账号。') :
 			error?.code === 'SESSION_UNAVAILABLE' ? 'GENAI 暂时不可用或请求受限。现有凭据未清除，请稍后重试。' :
 			/msedge|executable.*exist|browser.*not found/i.test(error?.message || '') ? '无法启动 Microsoft Edge。请确认 Edge 已安装，再重试连接。' :
 			error?.code === 'CREDENTIALS_REJECTED' ? 'UMPASS 未接受登录。请检查账号和密码，再重试。' :

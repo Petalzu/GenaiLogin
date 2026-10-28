@@ -59,6 +59,25 @@ suite('Extension Test Suite', () => {
 			assert.ok(!Object.keys(require.cache).some(path => path.includes('playwright-core')));
 		} finally { controller.abort(); }
 	});
+	test('Session-check timeouts recover or remain retryable inside VS Code without MFA', async function () {
+		this.timeout(10000);
+		const { browserLogin } = require('../dist/browser-auth');
+		const { transportCode } = require('../dist/bridge-stream');
+		for (const persistent of [false, true]) {
+			let checks = 0;
+			const session = { valid: async () => {
+				if (++checks <= (persistent ? 2 : 1)) throw new DOMException('Check timed out', 'TimeoutError');
+				return true;
+			} };
+			const connect = () => browserLogin(session, {}, undefined, () => {}, { launch: () => assert.fail('unexpected MFA') });
+			if (persistent) {
+				await assert.rejects(connect(), { name: 'Error', code: 'SESSION_CHECK_TIMEOUT' });
+				await connect();
+			} else await connect();
+			assert.equal(checks, persistent ? 3 : 2);
+		}
+		assert.equal(transportCode(new DOMException('Timed out', 'TimeoutError')), 'TimeoutError');
+	});
 	test('Dashboard view is contributed as a Webview', async () => {
 		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
 		await extension.activate();

@@ -335,6 +335,9 @@ test('upstream failures reject instead of becoming successful truncated response
 	await assert.rejects(forwardBody(body, response, { signal: new AbortController().signal, touch() {} }, () => {}), /terminated/);
 	assert.equal(response.destroyed, true);
 	assert.equal(transportCode({ cause: { code: 'UND_ERR_SOCKET' } }), 'UND_ERR_SOCKET');
+	assert.equal(transportCode(new DOMException('Check timed out', 'TimeoutError')), 'TimeoutError');
+	assert.equal(transportCode(new DOMException('Cancelled', 'AbortError')), 'AbortError');
+	assert.equal(transportCode({ code: 23, cause: { code: 'ECONNRESET' }, name: 'TimeoutError' }), 'ECONNRESET');
 	assert.equal(transportCode({ name: 'secret value' }), 'UNKNOWN');
 });
 

@@ -447,6 +447,7 @@ function dashboardHtml(initialState = null) {
             const health = mode === 'authenticating' ? phases[data.loginPhase] || '正在验证登录' :
                 keepalive.state === 'needs-login' ? '验证未完成，请重新连接' :
                 keepalive.state === 'retrying' ? '重登暂时失败' + (keepalive.nextCheckAt ? '，' + formatClock(keepalive.nextCheckAt) + ' 自动重试' : '，等待自动重试') :
+                keepalive.state === 'error' && keepalive.reason === 'session-check-timeout' ? '会话检查超时，连接可重试' :
                 keepalive.state === 'error' ? '保活暂时失败' + (keepalive.nextCheckAt ? '，' + formatClock(keepalive.nextCheckAt) + ' 重试' : '，等待重试') :
                 keepalive.state === 'checking' ? '正在检查会话' : keepalive.state === 'reauthenticating' ? '认证已失效，正在重认证' :
                 expiring ? '会话即将或已经到期，服务端可能要求重新登录' :

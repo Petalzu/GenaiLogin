@@ -1,6 +1,7 @@
 const { setTimeout: delay } = require('node:timers/promises');
 const { fork } = require('node:child_process');
 const { Cookie, Session, ORIGIN } = require('./auth');
+const { waitForSignal } = require('./bridge-stream');
 
 function retryableSessionFailure(error) {
     if (error.retryAfterMs > 10000) return false;
@@ -8,21 +9,29 @@ function retryableSessionFailure(error) {
         ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code || error.code);
 }
 
-async function checkBrowserSession(session, signal, trace) {
+async function checkBrowserSession(session, signal, trace, fetch) {
     const bounded = AbortSignal.any([signal, AbortSignal.timeout(30000)]);
-    for (let attempt = 0; ; attempt++) {
-        bounded.throwIfAborted();
-        try {
-            const valid = await session.valid(bounded);
+    try {
+        for (let attempt = 0; ; attempt++) {
             bounded.throwIfAborted();
-            return valid;
-        } catch (error) {
-            bounded.throwIfAborted();
-            if (!retryableSessionFailure(error) || attempt >= 2) throw error;
-            const milliseconds = Math.max(1000 * 2 ** attempt, error.retryAfterMs || 0);
-            trace(`Session check temporarily unavailable; retry ${attempt + 1}/2 in ${milliseconds}ms`);
-            await delay(milliseconds, undefined, { signal: bounded });
+            try {
+                const valid = await session.valid(bounded, fetch);
+                bounded.throwIfAborted();
+                return valid;
+            } catch (error) {
+                bounded.throwIfAborted();
+                if (!retryableSessionFailure(error) || attempt >= 2) throw error;
+                const milliseconds = Math.max(1000 * 2 ** attempt, error.retryAfterMs || 0);
+                trace(`Session check temporarily unavailable; retry ${attempt + 1}/2 in ${milliseconds}ms`);
+                await delay(milliseconds, undefined, { signal: bounded });
+            }
         }
+    } catch (error) {
+        signal.throwIfAborted();
+        if (error.name === 'TimeoutError' || bounded.reason?.name === 'TimeoutError') {
+            throw Object.assign(new Error('Session check timed out'), { code: 'SESSION_CHECK_TIMEOUT' });
+        }
+        throw error;
     }
 }
 
@@ -90,13 +99,22 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
     bounded.throwIfAborted();
     trace('Checking saved session');
     if (!keepOpen && !force) {
-        try {
-            if (await checkBrowserSession(session, bounded, trace)) return;
-        } catch (error) {
-            bounded.throwIfAborted();
-            if (!recoverSession || !retryableSessionFailure(error)) throw error;
-            trace('Saved session check unavailable; opening GENAI home for explicit reconnect');
-            if (error.retryAfterMs > 0) await delay(error.retryAfterMs, undefined, { signal: bounded });
+        for (let attempt = 0; ; attempt++) {
+            try {
+                if (await checkBrowserSession(session, bounded, trace)) return;
+                break;
+            } catch (error) {
+                bounded.throwIfAborted();
+                if (error.code === 'SESSION_CHECK_TIMEOUT' && attempt === 0) {
+                    trace('Saved session check timed out; retry 1/1 in 1000ms');
+                    await delay(1000, undefined, { signal: bounded });
+                    continue;
+                }
+                if (!recoverSession || !(error.code === 'SESSION_CHECK_TIMEOUT' || retryableSessionFailure(error))) throw error;
+                trace('Saved session check unavailable; opening GENAI home for recovery');
+                if (error.retryAfterMs > 0) await delay(error.retryAfterMs, undefined, { signal: bounded });
+                break;
+            }
         }
     }
     bounded.throwIfAborted();
@@ -115,7 +133,34 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
         browser = await launcher.launch({ channel: 'msedge', headless, timeout: 30000 });
         bounded.throwIfAborted();
         const context = await browser.newContext();
+        const savedCookies = await session.jar?.getCookies?.(ORIGIN) || [];
+        if (savedCookies.length) await context.addCookies(savedCookies.map(cookie => ({
+            name: cookie.key, value: cookie.value, domain: cookie.hostOnly ? cookie.domain : `.${cookie.domain}`, path: cookie.path || '/',
+            secure: Boolean(cookie.secure), httpOnly: Boolean(cookie.httpOnly),
+            ...(cookie.sameSite ? { sameSite: cookie.sameSite[0].toUpperCase() + cookie.sameSite.slice(1) } : {}),
+            expires: Number.isFinite(cookie.expiryTime()) ? Math.floor(cookie.expiryTime() / 1000) : -1
+        })));
+        const importCookies = async () => {
+            const cookies = await context.cookies(ORIGIN);
+            for (const cookie of cookies) {
+                await session.jar.setCookie(new Cookie({ key: cookie.name, value: cookie.value, domain: cookie.domain.replace(/^\./, ''), hostOnly: !cookie.domain.startsWith('.'), path: cookie.path, secure: cookie.secure, httpOnly: cookie.httpOnly, sameSite: cookie.sameSite.toLowerCase(), expires: cookie.expires > 0 ? new Date(cookie.expires * 1000) : 'Infinity' }), ORIGIN);
+            }
+            return cookies.some(cookie => cookie.name === 'token' && cookie.value);
+        };
         const page = await context.newPage();
+        const fetchSession = async (url, options) => {
+            const result = await waitForSignal(page.evaluate(async address => {
+                try {
+                    const response = await globalThis.fetch(address, { credentials: 'same-origin', redirect: 'manual', signal: AbortSignal.timeout(30000) });
+                    await response.body?.cancel();
+                    return { status: response.status, ok: response.ok, url: response.url, headers: Array.from(response.headers) };
+                } catch (error) {
+                    return { error: { name: error.name } };
+                }
+            }, url.href), options.signal);
+            if (result.error) throw Object.assign(new Error('Browser session check failed'), result.error);
+            return { ...result, headers: new Headers(result.headers), body: null };
+        };
         let inspectAt = Date.now() + 10000;
         let navigationFailure;
         page.on('framenavigated', frame => {
@@ -213,13 +258,10 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
                 }
             }
             if (origin === ORIGIN) {
-                const cookies = await context.cookies(ORIGIN);
-                for (const cookie of cookies) {
-                    await session.jar.setCookie(new Cookie({ key: cookie.name, value: cookie.value, domain: cookie.domain.replace(/^\./, ''), hostOnly: !cookie.domain.startsWith('.'), path: cookie.path, secure: cookie.secure, httpOnly: cookie.httpOnly, sameSite: cookie.sameSite.toLowerCase(), expires: cookie.expires > 0 ? new Date(cookie.expires * 1000) : 'Infinity' }), ORIGIN);
-                }
-                const hasToken = cookies.some(cookie => cookie.name === 'token' && cookie.value);
+                const hasToken = await importCookies();
                 if (hasToken) phase = 'verify-session';
-                if (hasToken && await checkBrowserSession(session, bounded, trace)) {
+                if (hasToken && await checkBrowserSession(session, bounded, trace, fetchSession)) {
+                    await importCookies();
                     bounded.throwIfAborted();
                     trace('Browser session verified');
                     if (keepOpen) {

@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { browserLogin } = require('../browser-auth');
+const { browserLogin } = require(process.env.GENAI_BROWSER_MODULE || '../browser-auth');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { Session, ORIGIN } = require('../auth');
@@ -132,7 +132,7 @@ test('isolated login cancellation and navigation failures terminate processes wi
     }
 });
 
-test('isolated authentication errors preserve recovery safety, status and Retry-After', { timeout: 20000 }, async () => {
+test('isolated authentication errors preserve recovery safety, status and Retry-After', { timeout: 20000 }, async context => {
     const harness = isolatedHarness('unavailable');
     const session = new Session();
     session.valid = async () => false;
@@ -144,6 +144,7 @@ test('isolated authentication errors preserve recovery safety, status and Retry-
         assert.equal(harness.children[0].exitCode, 0);
         assert.equal(await session.jar.getCookieString(ORIGIN), '');
     } catch (error) {
+        context.diagnostic(`Authentication stages: ${JSON.stringify(traces)}`);
         error.message += `; stages=${JSON.stringify(traces)}`;
         throw error;
     } finally { for (const child of harness.children) if (child.exitCode === null) child.kill(); }
@@ -184,6 +185,78 @@ test('valid saved session does not even load Playwright', () => {
 test('transient session check failure does not start a new login', async () => {
     await assert.rejects(browserLogin({ valid: async () => { throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE' }); } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }), { code: 'SESSION_UNAVAILABLE' });
 });
+test('saved-session check timeout is distinct from an MFA timeout', async () => {
+    let checks = 0;
+    await assert.rejects(browserLogin({ valid: async () => {
+        checks++;
+        throw new DOMException('Session check timed out', 'TimeoutError');
+    } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }), {
+        name: 'Error', code: 'SESSION_CHECK_TIMEOUT'
+    });
+    assert.equal(checks, 2);
+});
+test('session-check deadline expiry is retryable without replacing the outer login deadline', async () => {
+    const timeouts = [];
+    const sandbox = { module: { exports: {} }, __filename: require.resolve('../browser-auth'), AbortController, URL, Buffer, process,
+        AbortSignal: { any: signals => AbortSignal.any(signals), timeout: milliseconds => {
+            const controller = new AbortController();
+            timeouts.push({ milliseconds, controller });
+            return controller.signal;
+        } },
+        require: name => require(name.startsWith('./') ? '../' + name.slice(2) : name) };
+    vm.runInNewContext(fs.readFileSync(process.env.GENAI_BROWSER_MODULE || require.resolve('../browser-auth'), 'utf8'), sandbox);
+    let checks = 0;
+    await assert.rejects(sandbox.module.exports.browserLogin({ valid: async signal => {
+        checks++;
+        assert.equal(timeouts.at(-1).milliseconds, 30000);
+        timeouts.at(-1).controller.abort(new DOMException('Check deadline', 'TimeoutError'));
+        signal.throwIfAborted();
+    } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }), {
+        name: 'Error', code: 'SESSION_CHECK_TIMEOUT'
+    });
+    assert.equal(checks, 2);
+    assert.deepEqual(timeouts.map(item => item.milliseconds), [180000, 30000, 30000]);
+    assert.equal(timeouts[0].controller.signal.aborted, false);
+});
+test('parent cancellation and login deadlines never become retryable session-check timeouts', async () => {
+    for (const name of ['AbortError', 'TimeoutError']) {
+        const controller = new AbortController();
+        const reason = new DOMException('Outer signal stopped', name);
+        let checks = 0;
+        await assert.rejects(browserLogin({ valid: async () => {
+            checks++;
+            controller.abort(reason);
+            throw new DOMException('Check timed out too', 'TimeoutError');
+        } }, {}, controller.signal, () => {}, { launch: () => assert.fail('unexpected launch') }), error => error === reason);
+        assert.equal(checks, 1);
+    }
+});
+test('cancelling the timeout retry never opens a browser or performs another check', async () => {
+    const controller = new AbortController();
+    let checks = 0;
+    await assert.rejects(browserLogin({ valid: async () => {
+        checks++;
+        throw new DOMException('Check timed out', 'TimeoutError');
+    } }, {}, controller.signal, message => {
+        if (message === 'Saved session check timed out; retry 1/1 in 1000ms') controller.abort();
+    }, { launch: () => assert.fail('unexpected launch') }, false, true, { recoverSession: true }), { name: 'AbortError' });
+    assert.equal(checks, 1);
+});
+test('explicit reconnect can recover a timed-out check without forcing repeated MFA', async () => {
+    let checks = 0, launches = 0, closed = 0;
+    const page = { on() {}, goto: async () => {}, url: () => ORIGIN + '/', locator: () => ({}) };
+    await browserLogin({ valid: async () => {
+        if (++checks <= 2) throw new DOMException('Check timed out', 'TimeoutError');
+        return true;
+    }, jar: { setCookie: async () => {} } }, {}, undefined, () => {}, { launch: async () => {
+        launches++;
+        return { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+            cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    } }, false, true, { recoverSession: true });
+    assert.equal(checks, 3);
+    assert.equal(launches, 1);
+    assert.equal(closed, 1);
+});
 test('saved session check retries gateway and transport failures without opening a browser', async () => {
     let checks = 0;
     await browserLogin({ valid: async () => {
@@ -193,6 +266,22 @@ test('saved session check retries gateway and transport failures without opening
         return true;
     } }, {}, AbortSignal.timeout(10000), () => {}, { launch: () => assert.fail('unexpected launch') });
     assert.equal(checks, 3);
+});
+test('a session rejected after a timed-out check starts exactly one browser login', async () => {
+    let checks = 0, launches = 0, closed = 0;
+    const page = { on() {}, goto: async () => {}, url: () => ORIGIN + '/', locator: () => ({}) };
+    await browserLogin({ valid: async () => {
+        checks++;
+        if (checks === 1) throw new DOMException('Check timed out', 'TimeoutError');
+        return checks > 2;
+    }, jar: { setCookie: async () => {} } }, {}, undefined, () => {}, { launch: async () => {
+        launches++;
+        return { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+            cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    } });
+    assert.equal(checks, 3);
+    assert.equal(launches, 1);
+    assert.equal(closed, 1);
 });
 test('explicit reconnect can open the home page after bounded saved-session failures', async () => {
     let checks = 0;
@@ -209,7 +298,24 @@ test('explicit reconnect can open the home page after bounded saved-session fail
     assert.deepEqual(visits, [ORIGIN + '/']);
     assert.equal(closed, 1);
 });
-test('automatic saved-session failure remains bounded without launching MFA', async () => {
+test('automatic transport recovery opens GENAI home once after consecutive connection resets', async () => {
+    let checks = 0, launches = 0, closed = 0;
+    const visits = [];
+    const page = { on() {}, goto: async url => { visits.push(url); }, url: () => ORIGIN + '/', locator: () => ({}) };
+    await browserLogin({ valid: async () => {
+        if (++checks <= 3) throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+        return true;
+    }, jar: { setCookie: async () => {} } }, {}, AbortSignal.timeout(10000), () => {}, { launch: async () => {
+        launches++;
+        return { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+            cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    } }, false, true, { recoverSession: true });
+    assert.equal(checks, 4);
+    assert.equal(launches, 1);
+    assert.equal(closed, 1);
+    assert.deepEqual(visits, [ORIGIN + '/']);
+});
+test('saved-session failure without recovery remains bounded without launching MFA', async () => {
     let checks = 0;
     await assert.rejects(browserLogin({ valid: async () => {
         checks++;

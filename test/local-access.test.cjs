@@ -19,7 +19,7 @@ function connectionHarness(options = {}) {
     let mcpProvider, configurationChanged;
     let mcpEnabled = options.mcpEnabled || false;
     const updates = [], notices = [];
-    const loaded = [];
+    const loaded = [], traces = [];
     const saved = new Map(options.credentials === false ? [] : [['credentials', '{"username":"test","password":"dummy"}']]);
     const disposable = { dispose() {} };
     const fakeVscode = {
@@ -35,7 +35,7 @@ function connectionHarness(options = {}) {
         },
         ConfigurationTarget: { Global: 1 },
         window: {
-            createOutputChannel: () => ({ ...disposable, appendLine() {}, show() {} }),
+            createOutputChannel: () => ({ ...disposable, appendLine: message => traces.push(message), show() {} }),
             registerWebviewViewProvider: (name, value) => { provider = value; return disposable; },
             showInformationMessage: async message => { notices.push(message); }, showErrorMessage: async () => {},
             showWarningMessage: options.confirm || (async () => undefined),
@@ -75,8 +75,8 @@ function connectionHarness(options = {}) {
         servers.push(server); return server;
     } };
     class Session {
-        constructor() { this.jar = { toJSON: () => ({ cookies: [{ key: 'token', value: 'dummy' }] }) }; }
-        valid(signal) { return options.valid ? options.valid(signal) : Promise.resolve(true); }
+        constructor() { this.jar = { toJSON: () => ({ cookies: [{ key: 'token', value: 'dummy' }] }), setCookie: async () => {} }; }
+        valid(signal, fetch) { return options.valid ? options.valid(signal, fetch) : Promise.resolve(true); }
         request(url, settings) { return options.request ? options.request(url, settings) : Promise.resolve(new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } })); }
     }
     const secrets = {
@@ -86,8 +86,9 @@ function connectionHarness(options = {}) {
     };
     const sandbox = {
         module: { exports: {} }, AbortController, AbortSignal, Buffer, URL,
+        Date: options.now ? class extends Date { static now() { return options.now(); } } : Date,
         setTimeout: (callback, milliseconds) => { const timer = { callback, milliseconds, unref() {} }; timers.push(timer); return timer; },
-        clearTimeout() {}, setInterval: () => ({ unref() {} }), clearInterval() {},
+        clearTimeout(timer) { if (timer) timer.cancelled = true; }, setInterval: () => ({ unref() {} }), clearInterval() {},
         fetch: async () => { throw new Error('no other owner'); },
         require: name => {
             loaded.push(name);
@@ -104,7 +105,7 @@ function connectionHarness(options = {}) {
         globalStorageUri: options.directory ? { path: options.directory, fsPath: options.directory } : undefined });
     if (!options.deferDashboard) provider.resolveWebviewView({ visible: false, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => disposable },
         onDidChangeVisibility: () => disposable, onDidDispose: () => disposable });
-    return { loginCalls, timers, servers, messages, secrets, loaded, ready, commands, mcpProvider, updates, notices,
+    return { loginCalls, timers, servers, messages, secrets, loaded, ready, commands, mcpProvider, updates, notices, traces,
         action: name => commands.get(`genai-login.${name}`)(),
         snapshot: () => provider.getState(),
         dispose: () => { for (const item of subscriptions) item.dispose(); }
@@ -230,7 +231,7 @@ test('first Copilot chat request connects automatically without the connect comm
         assert.equal(harness.loginCalls.length, 1);
         assert.equal(harness.loginCalls[0][5], false);
         assert.equal(harness.loginCalls[0][6], true);
-        assert.equal(harness.loginCalls[0][7].recoverSession, false);
+        assert.equal(harness.loginCalls[0][7].force, true);
         assert.equal(harness.snapshot().requests, 2);
         assert.equal(harness.snapshot().connection, 'connected');
         assert.equal(harness.servers.length, 1);
@@ -343,8 +344,173 @@ test('initial connection failure retains the listener and a later request can re
     } finally { harness.dispose(); }
 });
 
+test('automatic and manual connections use identical headless login settings', async () => {
+    const settings = [];
+    for (const automatic of [false, true]) {
+        const harness = connectionHarness();
+        try {
+            await harness.ready;
+            if (automatic) {
+                const exchange = chatExchange();
+                const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+                harness.servers[0].handle(exchange.request, exchange.response); await finished;
+                assert.equal(exchange.response.status, 200);
+            } else await harness.action('connect');
+            const call = harness.loginCalls[0];
+            assert.equal(call[5], false);
+            assert.equal(call[6], true);
+            assert.equal(call[7].force, true);
+            settings.push(JSON.parse(JSON.stringify(call.slice(5))));
+        } finally { harness.dispose(); }
+    }
+    assert.deepEqual(settings[0], settings[1]);
+});
+
+test('initial automatic connection starts headless Edge before checking the session and forwards the original prompt', async () => {
+    const { browserLogin } = require(process.env.GENAI_BROWSER_MODULE || '../browser-auth');
+    for (const path of ['/', '/oauth/oidc/callback']) {
+        let checks = 0, forwarded = 0, launches = 0, closed = 0;
+        const page = { on() {}, goto: async () => {}, url: () => 'https://chat.genai.um.edu.mo' + path, locator: () => ({}) };
+        const harness = connectionHarness({ valid: async (signal, fetch) => {
+            assert.equal(launches, 1, 'Node prechecks must not block browser login');
+            assert.equal(typeof fetch, 'function');
+            checks++;
+            return true;
+        }, login: (session, credentials, signal, trace, launcher, keepOpen, headless, settings) =>
+            browserLogin(session, credentials, signal, trace, { launch: async options => {
+                launches++;
+                assert.equal(options.headless, true);
+                return { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+                    cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+            } }, keepOpen, headless, settings),
+        request: async () => { forwarded++; return Response.json({ choices: [] }); } });
+        try {
+            await harness.ready;
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response); await finished;
+            assert.equal(exchange.response.status, 200);
+            assert.equal(harness.snapshot().listening, true);
+            assert.equal(checks, 1);
+            assert.equal(harness.loginCalls.length, 1);
+            assert.equal(launches, 1);
+            assert.equal(closed, launches);
+            assert.equal(harness.servers.length, 1);
+            assert.equal(harness.snapshot().connection, 'connected');
+            assert.equal(forwarded, 1);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('initial automatic failures cool down across requests and retry after the deadline', async () => {
+    for (const failure of [{ cause: { code: 'ECONNRESET' } }, { code: 'SESSION_CHECK_TIMEOUT' },
+        { code: 'SESSION_UNAVAILABLE', status: 503 }, { code: 'SESSION_UNAVAILABLE', status: 429, retryAfterMs: 90000 }]) {
+        let now = Date.now();
+        const harness = connectionHarness({ now: () => now, login: async () => {
+            if (harness.loginCalls.length === 1) throw Object.assign(new Error('temporarily unavailable'), failure);
+        } });
+        try {
+            await harness.ready;
+            const retrySeconds = failure.retryAfterMs ? failure.retryAfterMs / 1000 : 30;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const exchange = chatExchange();
+                const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+                harness.servers[0].handle(exchange.request, exchange.response); await finished;
+                assert.equal(exchange.response.status, 503);
+                assert.equal(exchange.response.headers['retry-after'], String(retrySeconds));
+                assert.equal(harness.loginCalls.length, 1);
+                assert.equal(harness.snapshot().active, false);
+                assert.equal(harness.snapshot().keepalive.nextCheckAt, now + retrySeconds * 1000);
+            }
+            now += retrySeconds * 1000;
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response); await finished;
+            assert.equal(exchange.response.status, 200);
+            assert.equal(harness.loginCalls.length, 2);
+            assert.equal(harness.servers.length, 1);
+            assert.equal(harness.snapshot().connection, 'connected');
+            assert.equal(harness.traces.filter(message => message.includes('Connection failed:')).length, 1);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('initial automatic connection cooldown grows to five minutes without background MFA', async () => {
+    let now = Date.now();
+    const harness = connectionHarness({ now: () => now, login: async () => {
+        throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+    } });
+    try {
+        await harness.ready;
+        for (const seconds of [30, 60, 120, 240, 300, 300]) {
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response); await finished;
+            assert.equal(exchange.response.status, 503);
+            assert.equal(exchange.response.headers['retry-after'], String(seconds));
+            now += seconds * 1000;
+        }
+        assert.equal(harness.loginCalls.length, 6);
+        assert.ok(harness.timers.every(timer => timer.cancelled));
+    } finally { harness.dispose(); }
+});
+
+test('explicit Connect can recover during the initial transport cooldown', async () => {
+    const harness = connectionHarness({ login: async () => {
+        if (harness.loginCalls.length === 1) throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+    } });
+    try {
+        await harness.ready;
+        const exchange = chatExchange();
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response); await finished;
+        assert.equal(exchange.response.status, 503);
+        await harness.action('connect');
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.loginCalls[1][7].force, true);
+        assert.equal(harness.snapshot().connection, 'connected');
+    } finally { harness.dispose(); }
+});
+
+test('concurrent callers share headless verification and a cancelled request is never forwarded', async () => {
+    const { browserLogin } = require(process.env.GENAI_BROWSER_MODULE || '../browser-auth');
+    let checks = 0, forwarded = 0, checkStarted, verify;
+    const checking = new Promise(resolve => { checkStarted = resolve; });
+    const verified = new Promise(resolve => { verify = resolve; });
+    const page = { on() {}, goto: async () => {}, url: () => 'https://chat.genai.um.edu.mo/', locator: () => ({}) };
+    const harness = connectionHarness({ valid: async () => {
+        checks++;
+        checkStarted();
+        await verified;
+        return true;
+    }, login: (session, credentials, signal, trace, launcher, keepOpen, headless, settings) =>
+        browserLogin(session, credentials, signal, trace, { launch: async () => ({ close: async () => {},
+            newContext: async () => ({ newPage: async () => page,
+                cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) }) }, keepOpen, headless, settings),
+    request: async () => { forwarded++; return Response.json({ choices: [] }); } });
+    try {
+        await harness.ready;
+        const cancelled = chatExchange(), remaining = chatExchange();
+        const finished = new Promise(resolve => remaining.response.once('finish', resolve));
+        harness.servers[0].handle(cancelled.request, cancelled.response);
+        harness.servers[0].handle(remaining.request, remaining.response);
+        await checking;
+        cancelled.response.destroy(); await nextTurn();
+        assert.equal(harness.loginCalls[0][2].aborted, false);
+        verify();
+        await finished;
+        assert.equal(remaining.response.status, 200);
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(checks, 1);
+        assert.equal(forwarded, 1);
+        assert.equal(cancelled.request.destroyed, true);
+    } finally { verify(); harness.dispose(); }
+});
+
 test('initial verification failure blocks repeated MFA until an explicit connection attempt', async () => {
-    for (const failure of [{ name: 'TimeoutError' }, { code: 'CREDENTIALS_REJECTED' }]) {
+    for (const failure of [{ name: 'TimeoutError' }, { code: 'CREDENTIALS_REJECTED' },
+        { code: 'SESSION_CHECK_TIMEOUT', retryAuthentication: false },
+        { code: 'SESSION_UNAVAILABLE', status: 503, retryAuthentication: false }]) {
         let attempts = 0;
         const harness = connectionHarness({ login: async () => {
             if (++attempts === 1) throw Object.assign(new Error('verification incomplete'), failure);
@@ -363,10 +529,43 @@ test('initial verification failure blocks repeated MFA until an explicit connect
             assert.equal(harness.snapshot().listening, true);
             await harness.action('connect');
             assert.equal(harness.loginCalls.length, 2);
-            assert.equal(harness.loginCalls[1][7].recoverSession, true);
+            assert.equal(harness.loginCalls[1][7].force, true);
             assert.equal(harness.snapshot().connection, 'connected');
         } finally { harness.dispose(); }
     }
+});
+
+test('disconnect cancels the pending initial headless verification without reconnecting later', async () => {
+    const { browserLogin } = require(process.env.GENAI_BROWSER_MODULE || '../browser-auth');
+    let checks = 0, checkStarted, finishedLogin, closed = 0;
+    const checking = new Promise(resolve => { checkStarted = resolve; });
+    const finished = new Promise(resolve => { finishedLogin = resolve; });
+    const page = { on() {}, goto: async () => {}, url: () => 'https://chat.genai.um.edu.mo/', locator: () => ({}) };
+    const harness = connectionHarness({ valid: async signal => {
+        checks++;
+        checkStarted();
+        return new Promise((resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+    }, login: (session, credentials, signal, trace, launcher, keepOpen, headless, settings) =>
+        browserLogin(session, credentials, signal, trace, { launch: async () => ({ close: async () => { closed++; },
+            newContext: async () => ({ newPage: async () => page,
+                cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) }) }, keepOpen, headless, settings).finally(finishedLogin),
+    request: () => assert.fail('cancelled request must not be forwarded') });
+    try {
+        await harness.ready;
+        const exchange = chatExchange();
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await checking;
+        await harness.action('disconnect');
+        await finished; await nextTurn();
+        assert.equal(checks, 1);
+        assert.equal(closed, 1);
+        assert.equal(harness.loginCalls[0][2].aborted, true);
+        assert.equal(harness.snapshot().active, false);
+        assert.equal(harness.snapshot().listening, false);
+        assert.equal(harness.snapshot().connection, 'disconnected');
+    } finally { harness.dispose(); }
 });
 
 test('disposal during listener startup cannot leave a listening server behind', async () => {
@@ -1045,7 +1244,7 @@ test('Connect recovers a blocked session without disconnecting existing streams 
         assert.equal(harness.snapshot().keepalive.state, 'needs-login');
         await harness.action('connect');
         assert.equal(harness.loginCalls.length, 3);
-        assert.equal(harness.loginCalls[2][7].recoverSession, true);
+        assert.equal(harness.loginCalls[2][7].force, true);
         assert.equal(harness.loginCalls[0][2].aborted, false);
         assert.equal(harness.servers.length, 1);
         assert.equal(harness.snapshot().requests, 1);
@@ -1196,10 +1395,11 @@ test('connection initialization failure clears active state and permits retry', 
         syncDisposed: false, connectionVersion: 0,
         getHistory: () => ({ reload: async () => {} }),
         output: { show() {} }, trace() {}, status() {},
+        transportCode: require('../bridge-stream').transportCode,
         context: { secrets: { get: async () => '{"username":"test","password":"dummy"}' } },
         require: () => { loads++; throw new Error('dependency failed'); }
     };
-    vm.runInNewContext('let active, sharedState, connectPromise, listenerReady = false, automaticLoginBlocked = false; const stop = () => { active?.abort(); active = undefined; connectPromise = undefined; };' + source.slice(start, end) + 'globalThis.connect = connect; globalThis.isActive = () => Boolean(active);', sandbox);
+    vm.runInNewContext('let active, sharedState, connectPromise, listenerReady = false, automaticLoginBlocked = false, automaticRetryAt = 0, automaticFailures = 0; const stop = () => { active?.abort(); active = undefined; connectPromise = undefined; };' + source.slice(start, end) + 'globalThis.connect = connect; globalThis.isActive = () => Boolean(active);', sandbox);
     for (let attempt = 0; attempt < 2; attempt++) {
         await assert.rejects(sandbox.connect(), /dependency failed/);
         assert.equal(sandbox.isActive(), false);

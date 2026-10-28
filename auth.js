@@ -118,8 +118,8 @@ class Session {
         }
         throw new Error('Too many authentication redirects');
     }
-    async valid(signal) {
-        const response = await this.request(`${ORIGIN}/api/v1/auths/`, { signal, checkSession: true });
+    async valid(signal, fetch) {
+        const response = await this.request(`${ORIGIN}/api/v1/auths/`, { signal, checkSession: true, ...(fetch ? { fetch } : {}) });
         const contentType = (response.headers.get('content-type') || '').toLowerCase();
         await response.body?.cancel();
         if (response.ok && contentType.includes('application/json')) return true;

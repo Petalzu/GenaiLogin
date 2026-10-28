@@ -1,5 +1,19 @@
 # Change Log
 
+## [0.0.23]
+
+- Use the same headless Edge connection flow for the first automatic request and ordinary manual Connect. Start the browser before any Node session check, import saved cookies, and reuse valid sessions without repeating UMPASS/MFA. Visible diagnostics remain the only visible-browser entry.
+- Verify the browser session through Edge's network and synchronize refreshed cookies before closing the authentication helper. Keep the original prompt waiting for the shared login and forward it once verification succeeds.
+- Back off temporary initial-connection failures across requests from 30 seconds to five minutes, preserve Retry-After, and log one failure per connection attempt instead of per waiting caller. Preserve cancellation, access controls, rate limits and the stop-after-credential-submission safeguard.
+- Add matching manual/automatic parameters, first-prompt continuation, real Edge cookie reuse/refresh, concurrent cancellation and cooldown regressions. Anonymous probes reproduced immediate Node connection resets while Edge could return HTTP; service/network availability and real university MFA remain external requirements, not guaranteed successes.
+
+## [0.0.22]
+
+- Distinguish the 30-second session-check network deadline from the outer login/MFA deadline. A timed-out initial check no longer disables future automatic connections or claims that verification failed.
+- Retry a timed-out saved-session check once after a one-second pause. Keep the overall login deadline, concurrent-login sharing, cancellation, rate limits and no-automatic-MFA-on-unavailable-checks protections. If checks remain unavailable, return HTTP 503 and permit the next request to connect; explicit reconnect can still use the browser fallback.
+- Preserve the stop-after-credential-submission safeguard for initial authentication failures as well as reauthentication. Display separate network-check and post-login verification messages; report native timeout/abort names instead of UNKNOWN when their numeric DOMException codes are present.
+- Add deadline-origin, timeout recovery, persistent failure, cancellation, concurrent request, 401 transition, dashboard and VS Code host regressions, including the actual production login module.
+
 ## [0.0.21]
 
 - Recover an existing connection after three consecutive unavailable session checks with one bounded browser recovery per outage. Do not use this fallback for forbidden responses, rate limits, or responses carrying Retry-After.

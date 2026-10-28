@@ -3,8 +3,38 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright-core');
 const { CookieJar } = require('tough-cookie');
 const { browserLogin } = require('../browser-auth');
-const { ORIGIN } = require('../auth');
+const { Session, ORIGIN } = require('../auth');
 const { dashboardHtml } = require('../dashboard');
+test('headless connection reuses saved cookies and verifies the session through Edge instead of Node fetch', { timeout: 20000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    const session = new Session();
+    await session.jar.setCookie('token=saved; Secure; HttpOnly; Path=/; SameSite=Lax', ORIGIN);
+    const request = session.request.bind(session);
+    session.request = (url, settings) => {
+        assert.equal(typeof settings.fetch, 'function', 'session verification must use the browser network');
+        return request(url, settings);
+    };
+    const visits = [];
+    try {
+        const context = await browser.newContext();
+        await context.route('**/*', route => {
+            const url = new URL(route.request().url());
+            visits.push(url.pathname);
+            assert.equal(url.origin, ORIGIN);
+            assert.match(route.request().headers().cookie || '', /token=saved/);
+            if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<p>Signed in</p>' });
+            assert.equal(url.pathname, '/api/v1/auths/');
+            return route.fulfill({ contentType: 'application/json', headers: { 'set-cookie': 'token=refreshed; Secure; HttpOnly; Path=/; SameSite=Lax' }, body: '{}' });
+        });
+        await browserLogin(session, {}, AbortSignal.timeout(15000), () => {}, { launch: async options => {
+            assert.equal(options.headless, true);
+            return { newContext: async () => context, close: () => browser.close() };
+        } }, false, true, { force: true });
+        assert.deepEqual(visits, ['/', '/api/v1/auths/']);
+        assert.equal(await session.jar.getCookieString(ORIGIN), 'token=refreshed');
+        assert.equal(browser.isConnected(), false);
+    } finally { await browser.close(); }
+});
 test('ADFS duplicate username fields only fill visible password form', async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
@@ -83,7 +113,7 @@ test('unavailable home pages stop after bounded retries without validating a ses
         }
     } finally { await browser.close(); }
 });
-for (const mode of ['button', 'Enter', 'callback unavailable', 'Duo device confirmation', 'Duo Chinese device confirmation', 'Duo Chinese link confirmation', 'Duo lookalike host', 'Duo incomplete confirmation']) test(`MFA callback is not bounded by the submit action timeout (${mode})`, async () => {
+for (const mode of ['button', 'Enter', 'callback unavailable', 'callback timeout', 'Duo device confirmation', 'Duo Chinese device confirmation', 'Duo Chinese link confirmation', 'Duo lookalike host', 'Duo incomplete confirmation']) test(`MFA callback is not bounded by the submit action timeout (${mode})`, async () => {
     const submitButton = mode !== 'Enter';
     const duo = mode.startsWith('Duo');
     const chinese = mode.startsWith('Duo Chinese');
@@ -139,7 +169,11 @@ for (const mode of ['button', 'Enter', 'callback unavailable', 'Duo device confi
         });
         const page = await context.newPage();
         page.setDefaultTimeout(1000);
-        const session = { jar, valid: async () => (await jar.getCookieString(ORIGIN)).includes('token=test') };
+        const session = { jar, valid: async () => {
+            const tokenPresent = (await jar.getCookieString(ORIGIN)).includes('token=test');
+            if (tokenPresent && mode === 'callback timeout') throw new DOMException('Callback check timed out', 'TimeoutError');
+            return tokenPresent;
+        } };
         const login = browserLogin(session, { username: 'test', password: 'test-password' }, AbortSignal.timeout(10000), message => {
             traces.push(message);
             if (message === 'Credentials submitted; waiting for MFA / redirect') approve();
@@ -148,12 +182,13 @@ for (const mode of ['button', 'Enter', 'callback unavailable', 'Duo device confi
             throw error;
         });
         if (mode === 'callback unavailable') await assert.rejects(login, { code: 'SESSION_UNAVAILABLE', status: 503, retryAuthentication: false });
+        else if (mode === 'callback timeout') await assert.rejects(login, { name: 'Error', code: 'SESSION_CHECK_TIMEOUT', retryAuthentication: false });
         else if (blocked) await assert.rejects(login, { name: 'AbortError' });
         else await login;
         assert.equal(submissions, 1);
         assert.equal(remembered, duo && !blocked ? 1 : 0);
         assert.equal(traces.includes('Duo device confirmation detected; remembering this device'), duo && !blocked);
-        assert.equal(traces.includes('Browser session verified'), !blocked && mode !== 'callback unavailable');
+        assert.equal(traces.includes('Browser session verified'), !blocked && !mode.startsWith('callback '));
     } finally { approve(); await browser.close(); }
 });
 
@@ -215,6 +250,11 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.equal(await drawingLabel.textContent(), '添加绘画 MCP');
             assert.equal(await drawingLabel.evaluate(element => element.scrollWidth <= element.clientWidth), true);
             assert.equal(await page.locator('#port-badge').textContent(), ':58379');
+            await render({ ...base, connection: 'error', status: 'Session check timed out; retry available', active: false, listening: true,
+                keepalive: { state: 'error', reason: 'session-check-timeout', lastCheckAt: Date.now() } });
+            assert.equal(await page.locator('#keepalive-text').textContent(), '会话检查超时，连接可重试');
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
             await render({ ...base, connection: 'authenticating', status: 'Authenticating', active: true,
                 listening: true, loginPhase: 'mfa', pendingActions: ['connect'] });
             assert.equal(await page.locator('#status-text').textContent(), '正在登录');
