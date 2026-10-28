@@ -151,7 +151,7 @@ function activate(context) {
 	};
 	let server, listenerController, listenerReady = false, listenerStartPromise, requestHandler, connectPromise;
 	let connectionVersion = 0, automaticLoginBlocked = false;
-	let active, authentication, keepaliveTimer, keepaliveOwner;
+	let active, authentication, keepaliveTimer, keepaliveOwner, reconnectActive;
 	let state = 'Disconnected';
 	let connection = 'disconnected', loginPhase;
 	const pendingActions = new Map();
@@ -251,7 +251,7 @@ function activate(context) {
 		}
 		return true;
 	};
-	const sendError = (response, code, message) => { response.writeHead(code, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message } })); };
+	const sendError = (response, code, message, headers = {}) => { response.writeHead(code, { 'content-type': 'application/json', ...headers }); response.end(JSON.stringify({ error: { message } })); };
 	const rejectLocalRequest = request => {
 		const fetchSite = request.headers['sec-fetch-site'];
 		return request.headers.host !== `127.0.0.1:${stats.port}` ? 'host mismatch' : request.headers.origin ? 'Origin present' : fetchSite !== undefined && fetchSite !== 'none' ? `Fetch Metadata rejected (${['same-origin', 'same-site', 'cross-site'].includes(fetchSite) ? fetchSite : 'unrecognized'})` : request.headers.authorization !== 'Bearer local-browser-session' ? (request.headers.authorization ? 'Authorization mismatch' : 'Authorization missing') : '';
@@ -335,6 +335,7 @@ function activate(context) {
 	const stop = (closeListener = true) => {
 		connectionVersion++;
 		active?.abort(); active = undefined; authentication = undefined;
+		reconnectActive = undefined;
 		connectPromise = undefined;
 		requestHandler = undefined;
 		automaticLoginBlocked = false;
@@ -404,23 +405,39 @@ function activate(context) {
 		sessionPersistence = persistence;
 		const persist = () => persistence.save();
 		let retainedBrowser, reauthenticationBlocked = false;
+		let authenticationRetryAt = 0, authenticationFailures = 0, sessionVersion = 0;
+		let healthFailures = 0, healthRecoveryAttempted = false;
+		const temporaryAuthenticationFailure = error => error.retryAuthentication !== false &&
+			(error.code === 'SESSION_UNAVAILABLE' && [429, 502, 503, 504].includes(error.status) ||
+				error.retryAuthentication === true && error.name === 'TimeoutError' ||
+			['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
+				'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_TIMED_OUT'].includes(transportCode(error)));
+		const retryHeaders = () => ({ 'retry-after': String(Math.max(1, Math.ceil((authenticationRetryAt - Date.now()) / 1000))) });
+		const sendAuthenticationError = response => sendError(response, reauthenticationBlocked ? 401 : 503, reauthenticationBlocked ?
+			'Automatic login failed; reconnect after checking credentials or verification.' :
+			'GENAI authentication is recovering; retry after the cooldown.', reauthenticationBlocked ? {} : retryHeaders());
 		const loginTrace = message => {
 			trace(message);
 			if (!isCurrentConnection()) return;
 			const phase = message === 'Checking saved session' ? 'checking-session' : message.startsWith('Starting temporary') ? 'opening-browser' :
+				message === 'Opening GENAI home page' || message === 'Waiting for GENAI sign-in page' || message.startsWith('GENAI login page returned') ? 'webui-entry' :
 				message === 'Filling verified UMPASS login form' ? 'credentials' : message.startsWith('Waiting for Duo') || message.startsWith('Credentials submitted') ? 'mfa' :
 				message.startsWith('Waiting for UMPASS') ? 'umpass' : message === 'Checking GENAI callback' ? 'callback' : message === 'Waiting for identity redirect' ? 'redirect' : undefined;
 			if (phase && loginPhase !== phase) { loginPhase = phase; dashboard?.refresh(); }
 		};
-		const authenticate = (force = false) => {
+		const authenticate = (force = false, explicit = false) => {
 			if (!authentication) {
 				loginPhase = 'checking-session';
 				status('Authenticating');
 				authentication = (async () => {
 					await retainedBrowser?.(); retainedBrowser = undefined;
-					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic, { force });
+					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic, { force, recoverSession: explicit || !automatic && !force });
 					controller.signal.throwIfAborted();
 					if (active !== controller) return;
+					sessionVersion++;
+					authenticationRetryAt = 0;
+					authenticationFailures = 0;
+					healthFailures = 0;
 					void persist();
 					if (!isCurrentConnection()) return;
 					keepaliveSchedule.checked();
@@ -428,14 +445,32 @@ function activate(context) {
 					stats.connectedAt ??= Date.now(); trace('Authenticated; session persistence scheduled'); status(`Connected :${stats.port}`);
 				})().catch(error => {
 					if (force && isCurrentConnection()) {
-						reauthenticationBlocked = true;
-						keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
-						status('Authentication required; reconnect');
+						if (temporaryAuthenticationFailure(error) && ++authenticationFailures <= 2) {
+							keepaliveSchedule.failed(error.retryAfterMs);
+							authenticationRetryAt = keepaliveSchedule.snapshot().nextCheckAt;
+							keepaliveInfo = { state: 'retrying', lastCheckAt: Date.now() };
+							trace(`Authentication: temporary failure code=${transportCode(error)} status=${error.status || 'unknown'}; recovery retry ${authenticationFailures}/2 scheduled`);
+							status('Connection interrupted; retrying');
+						} else {
+							reauthenticationBlocked = true;
+							keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now(), nextCheckAt: null };
+							status('Authentication required; reconnect');
+						}
 					}
 					throw error;
 				}).finally(() => { if (active === controller) { authentication = undefined; if (!keepaliveInFlight) scheduleKeepalive(); } });
 			}
 			return authentication;
+		};
+		reconnectActive = async () => {
+			if (!isCurrentConnection() || authentication) return authentication;
+			trace('Manual recovery requested; preserving listener and active streams');
+			reauthenticationBlocked = false;
+			authenticationRetryAt = 0;
+			authenticationFailures = 0;
+			healthFailures = 0;
+			healthRecoveryAttempted = false;
+			try { await authenticate(true, true); } catch (error) { await reportError(error); }
 		};
 		const scheduleKeepalive = () => {
 			if (!isCurrentConnection()) return;
@@ -452,22 +487,47 @@ function activate(context) {
 			if (!isCurrentConnection() || keepaliveInFlight) return;
 			if (authentication || reauthenticationBlocked) return;
 			const activityVersion = keepaliveSchedule.snapshot().activityVersion;
+			const checkedSessionVersion = sessionVersion;
 			keepaliveInFlight = true;
 			keepaliveInfo = { state: 'checking', lastCheckAt: Date.now() };
 			dashboard?.refresh();
 			try {
-				const valid = await session.valid(AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]));
+				if (authenticationRetryAt) {
+					await authenticate(true);
+					return;
+				}
+				let valid;
+				try {
+					valid = await session.valid(AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]));
+				} catch (error) {
+					if (!isCurrentConnection()) return;
+					if (checkedSessionVersion !== sessionVersion) return;
+					if (activityVersion !== keepaliveSchedule.snapshot().activityVersion) throw error;
+					healthFailures++;
+					if (healthFailures < 3 || healthRecoveryAttempted || !(temporaryAuthenticationFailure(error) || error.name === 'TimeoutError') ||
+						error.status === 429 || error.retryAfterMs > 0) throw error;
+					if (authenticationRetryAt > Date.now()) throw error;
+					healthRecoveryAttempted = true;
+					trace('Keepalive: repeated session checks unavailable; attempting one browser recovery');
+					await authenticate(true);
+					return;
+				}
 				if (!isCurrentConnection()) return;
-				if (activityVersion !== keepaliveSchedule.snapshot().activityVersion) {
+				if (checkedSessionVersion !== sessionVersion || activityVersion !== keepaliveSchedule.snapshot().activityVersion) {
 					keepaliveSchedule.checked();
 					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
-					trace('Keepalive: stale check ignored after successful upstream activity');
+					trace('Keepalive: stale check ignored after newer authentication or successful upstream activity');
 					return;
 				}
 				if (valid) {
+					healthFailures = 0;
+					healthRecoveryAttempted = false;
+					authenticationRetryAt = 0;
+					authenticationFailures = 0;
 					void persist();
 					keepaliveSchedule.checked();
 					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
+					status(`Connected :${stats.port}`);
 					trace('Keepalive: session valid');
 				} else {
 					keepaliveInfo = { state: 'reauthenticating', lastCheckAt: Date.now() };
@@ -487,6 +547,10 @@ function activate(context) {
 						void reportError(error);
 						return;
 					}
+					if (authenticationRetryAt > Date.now()) {
+						trace('Keepalive: temporary reauthentication failure; waiting for recovery cooldown');
+						return;
+					}
 					const recentSuccess = activityVersion !== keepaliveSchedule.snapshot().activityVersion;
 					if (recentSuccess && !error.retryAfterMs) keepaliveSchedule.checked(); else keepaliveSchedule.failed(error.retryAfterMs);
 					keepaliveInfo = { state: recentSuccess ? 'healthy' : 'error', lastCheckAt: Date.now() };
@@ -502,7 +566,8 @@ function activate(context) {
 		const noteActivity = (authenticated = true) => {
 			if (!isCurrentConnection()) return;
 			keepaliveSchedule.activity(authenticated);
-			if (!keepaliveInFlight && !reauthenticationBlocked) keepaliveInfo = { state: 'healthy', lastCheckAt: keepaliveInfo.lastCheckAt };
+			if (authenticated) { healthFailures = 0; healthRecoveryAttempted = false; authenticationRetryAt = 0; authenticationFailures = 0; }
+			if (!keepaliveInFlight && !reauthenticationBlocked && !authenticationRetryAt) keepaliveInfo = { state: 'healthy', lastCheckAt: keepaliveInfo.lastCheckAt };
 			scheduleKeepalive();
 		};
 		const downloadPlatformImage = async (url, lifetime, limit) => {
@@ -530,9 +595,15 @@ function activate(context) {
 			let bytes = 0;
 			let requestStats, usageParser;
 			try {
-			if (reauthenticationBlocked) return sendError(response, 401, 'Session authentication failed. Disconnect and reconnect after completing verification.');
-			if (authentication) await waitForSignal(authentication, lifetime.signal);
+			if (reauthenticationBlocked) return sendAuthenticationError(response);
+			if (authentication) {
+				try { await waitForSignal(authentication, lifetime.signal); } catch (error) {
+					if (lifetime.signal.aborted) throw error;
+					return sendAuthenticationError(response);
+				}
+			}
 			lifetime.signal.throwIfAborted();
+			if (authenticationRetryAt > Date.now()) return sendError(response, 503, 'GENAI authentication is recovering; retry after the cooldown.', retryHeaders());
 			const chunks = []; let size = 0;
 			for await (const chunk of request) { lifetime.signal.throwIfAborted(); size += chunk.length; if (size > 20 * 1024 * 1024) return sendError(response, 413, 'Request too large'); chunks.push(chunk); }
 			lifetime.signal.throwIfAborted();
@@ -546,14 +617,20 @@ function activate(context) {
 				dashboard?.refresh();
 			}
 			const forwardUpstream = async (routePath, requestOptions) => {
+				const version = sessionVersion;
 				let result = await session.request(ORIGIN + routePath, requestOptions);
 				if (result.status !== 401) return result;
 				await result.body?.cancel();
-				trace('Proxy: authentication rejected with HTTP 401; attempting one login before forwarding');
+				if (reauthenticationBlocked) { sendAuthenticationError(response); return undefined; }
+				if (authenticationRetryAt > Date.now()) {
+					sendError(response, 503, 'GENAI authentication is recovering; retry after the cooldown.', retryHeaders());
+					return undefined;
+				}
+				trace(version === sessionVersion ? 'Proxy: authentication rejected with HTTP 401; attempting one login before forwarding' : 'Proxy: stale HTTP 401 from previous session; retrying with the refreshed session');
 				lifetime.setIdleTimeout(0);
-				try { await waitForSignal(authenticate(true), lifetime.signal); } catch (error) {
+				try { if (authentication || version === sessionVersion) await waitForSignal(authentication || authenticate(true), lifetime.signal); } catch (error) {
 					if (lifetime.signal.aborted) throw error;
-					sendError(response, 401, 'Automatic login failed; disconnect and reconnect after checking credentials or verification.');
+					sendAuthenticationError(response);
 					return undefined;
 				}
 				lifetime.signal.throwIfAborted();
@@ -617,7 +694,7 @@ function activate(context) {
 			const contentType = result.headers.get('content-type') || 'application/json';
 			const sessionAccepted = result.ok && /application\/json|text\/event-stream/i.test(contentType);
 			if (sessionAccepted) noteActivity();
-			if (isCurrentConnection() && !authentication && !reauthenticationBlocked) status(`Connected :${stats.port}`);
+			if (isCurrentConnection() && !authentication && !reauthenticationBlocked && !authenticationRetryAt) status(`Connected :${stats.port}`);
 			if (route === '/api/v1/images/generations' && result.ok) {
 				let payload;
 				const platformBody = await readImageResponseBody(result, lifetime, 1024 * 1024);
@@ -670,7 +747,7 @@ function activate(context) {
 	};
 	const connect = async (diagnostic = false, automatic = false) => {
 		if (connectPromise) return connectPromise;
-		if (active) return;
+		if (active) return !automatic && !diagnostic && ['error', 'retrying', 'needs-login'].includes(keepaliveInfo.state) ? reconnectActive?.() : undefined;
 		if (automatic && ['credentials', 'clear', 'diagnose'].some(name => pendingActions.has(name))) throw new Error('GENAI configuration is changing; retry after it completes.');
 		const pending = automatic ? {} : undefined;
 		if (pending) { pendingActions.set('connect', pending); dashboard?.refresh(); }

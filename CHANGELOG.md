@@ -1,5 +1,25 @@
 # Change Log
 
+## [0.0.21]
+
+- Recover an existing connection after three consecutive unavailable session checks with one bounded browser recovery per outage. Do not use this fallback for forbidden responses, rate limits, or responses carrying Retry-After.
+- Retry temporary automatic-login failures after backoff, at most twice, instead of immediately requiring a manual disconnect. Preserve Retry-After on local HTTP 503 recovery responses and share the recovery across callers.
+- Stop automatic retries after credential submission, incomplete MFA, rejected credentials, unknown errors, or exhausted recovery attempts. Preserve the browser failure's retry safety and network code across the helper process.
+- Allow Connect to recover a failed existing connection without closing the listener, aborting active streams, or resetting usage. Show a reconnect action and distinguish scheduled login retries from health-check failures.
+- Ignore delayed HTTP 401 and health-check results from a previous session after successful reauthentication. Add recovery, cooldown, cancellation, browser-helper, MFA-safety and responsive dashboard regressions; never replay partially delivered responses.
+
+## [0.0.20]
+
+- Start browser authentication at the official GENAI home page and use the WebUI UMPASS button instead of navigating directly to the OIDC handler. Distinguish the sign-in page from an authenticated callback in login diagnostics and the dashboard.
+- Recover from temporary HTTP 502/503/504 entry-page failures with at most two retries before credential submission. Respect Retry-After and cancellation, reject persistent error pages promptly, and require a token before checking the callback session.
+- Retry temporary saved-session and callback-check failures at most twice within a bounded check. An explicit Connect may open the home page after repeated gateway or connection failures; automatic connection and keepalive failures do not use this fallback to trigger MFA.
+- Add real Edge regressions for home-page and OIDC recovery, English/Chinese sign-in, persistent errors, cancellation, rate limits and the existing MFA flow. Preserve error status and Retry-After across the authentication helper process.
+
+## [0.0.19]
+
+- Recognize the Open WebUI `/auth` login page, including redirect query parameters and a trailing slash, as a trusted login redirect during session checks. Stop before following the login page and request authentication instead of reporting a temporary session-service failure.
+- Preserve the existing OIDC login entry point and add regression coverage for both login paths.
+
 ## [0.0.18]
 
 - Further reduce standby work by delaying history/random-key initialization and streaming internals. Prefer tree-shakeable official ESM dependency exports, deduplicate the MCP validator runtime, share a fixed drawing-tool schema and compile its input validator only on actual tool calls.

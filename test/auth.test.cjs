@@ -111,7 +111,7 @@ test('session writes are coalesced and serialized across connection changes', as
 test('session check stops at a trusted login redirect without fetching MFA pages', async () => {
     const original = global.fetch;
     try {
-        for (const destination of ['https://login.um.edu.mo/auth/', '/oauth/oidc/login', 'https://websso.um.edu.mo/adfs/ls/']) {
+        for (const destination of ['https://login.um.edu.mo/auth/', '/oauth/oidc/login', '/auth?redirect=%2F', '/auth/', 'https://websso.um.edu.mo/adfs/ls/']) {
             let calls = 0;
             global.fetch = async () => {
                 calls++; assert.equal(calls, 1);

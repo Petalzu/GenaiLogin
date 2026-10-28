@@ -110,7 +110,7 @@ class Session {
             if (![301, 302, 303, 307, 308].includes(response.status) || !location) return response;
             const next = new URL(location, current);
             if (options.checkSession && next.protocol === 'https:' && HOSTS.has(next.hostname) &&
-                (next.origin !== ORIGIN || next.pathname === '/oauth/oidc/login')) return response;
+                (next.origin !== ORIGIN || /^\/(?:auth|oauth\/oidc\/login)\/?$/.test(next.pathname))) return response;
             await response.body?.cancel();
             if (response.status === 303 || ([301, 302].includes(response.status) && method === 'POST')) { method = 'GET'; body = undefined; }
             if (body && next.origin !== current.origin) throw new Error('Cross-origin POST redirect refused');
@@ -127,7 +127,7 @@ class Session {
         if ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
             const next = new URL(response.headers.get('location'), response.url || ORIGIN);
             if (next.protocol === 'https:' && HOSTS.has(next.hostname) &&
-                (next.origin !== ORIGIN || next.pathname === '/oauth/oidc/login')) return false;
+                (next.origin !== ORIGIN || /^\/(?:auth|oauth\/oidc\/login)\/?$/.test(next.pathname))) return false;
         }
         if (response.ok && contentType.includes('text/html') && response.url &&
             ['login.um.edu.mo', 'websso.um.edu.mo'].includes(new URL(response.url).hostname)) return false;

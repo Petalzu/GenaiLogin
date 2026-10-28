@@ -54,7 +54,9 @@ The image endpoint returns inline `data[].b64_json`, with at most six files and 
 
 The dashboard displays session health, the next scheduled check, and known expiry information. Successful request activity reduces redundant checks. During healthy operation, checks run after two idle minutes or at least once every five minutes. Temporary failures use backoff and respect server rate limits.
 
-Health checks cannot extend a fixed token lifetime. If authentication expires, one automatic login attempt may require MFA. When verification fails, disconnect and reconnect; the extension does not repeatedly initiate MFA. Already-started streams are not automatically replayed.
+Health checks cannot extend a fixed token lifetime. Expired authentication triggers one shared login that may require MFA. Temporary failures before credential submission allow at most two recovery retries with backoff and Retry-After; new requests receive HTTP 503 during the cooldown instead of starting more logins. Rejected credentials, incomplete MFA, failures after credential submission, and exhausted retries stop automatic login attempts. Select **重新连接** to retry without disconnecting active streams or resetting usage. Already-started streams are not automatically replayed.
+
+If three consecutive session checks fail because of gateway or connection errors, the extension may try the same browser entry used by manual reconnect once per outage. A successful health check or new authenticated request resets this allowance. Forbidden responses, rate limits and responses carrying Retry-After do not trigger this fallback; persistent platform outages still require the service to recover.
 
 Hiding the dashboard does not stop the bridge or session checks. Closing or reloading the owner window ends active requests; after a reload, the window returns to the idle-listener state. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version.
 
@@ -74,7 +76,9 @@ Check whether another VS Code window already owns the connection. Manage it ther
 
 Temporary service errors do not necessarily indicate expired credentials. Allow the scheduled health retry, or retry the client request after service recovers. If a response was partially delivered, review its content before retrying.
 
-A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed initial verification blocks automatic login retries; use **连接 GENAI** after checking credentials or MFA. Failed reauthentication of an existing session still requires disconnecting and reconnecting.
+Browser login starts at the GENAI home page and selects its UMPASS sign-in button. Temporary gateway failures are retried at most twice before credentials are submitted. An explicit **连接 GENAI** can also reopen the home page if the saved-session check repeatedly fails. An existing connection permits one bounded browser recovery after three consecutive unavailable checks, subject to the session-health limits above. A persistent `no healthy upstream` page is a platform gateway failure, not a password error or evidence of a new login URL.
+
+A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed initial verification blocks automatic login retries; use **连接 GENAI** after checking credentials or MFA. For a failed existing connection, select **重新连接** directly; disconnecting first is no longer required. The dashboard distinguishes a temporary health failure, a scheduled login retry and a verification failure requiring your attention.
 
 ### Remote Clients Cannot Connect
 

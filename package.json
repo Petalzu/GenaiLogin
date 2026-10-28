@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.18",
+  "version": "0.0.21",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",

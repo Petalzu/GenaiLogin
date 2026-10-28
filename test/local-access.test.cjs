@@ -114,7 +114,7 @@ function connectionHarness(options = {}) {
 function chatExchange(url = '/v1/chat/completions', body = '{"model":"test","stream":true}') {
     const chunks = [];
     const response = new Writable({ write(chunk, encoding, done) { chunks.push(Buffer.from(chunk)); done(); } });
-    response.writeHead = status => { response.status = status; response.headersSent = true; };
+    response.writeHead = (status, headers) => { response.status = status; response.headers = headers; response.headersSent = true; };
     const request = { method: 'POST', url, headers: { host: '127.0.0.1:58379', authorization: 'Bearer local-browser-session' },
         destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from(body); } };
     return { request, response, chunks };
@@ -230,6 +230,7 @@ test('first Copilot chat request connects automatically without the connect comm
         assert.equal(harness.loginCalls.length, 1);
         assert.equal(harness.loginCalls[0][5], false);
         assert.equal(harness.loginCalls[0][6], true);
+        assert.equal(harness.loginCalls[0][7].recoverSession, false);
         assert.equal(harness.snapshot().requests, 2);
         assert.equal(harness.snapshot().connection, 'connected');
         assert.equal(harness.servers.length, 1);
@@ -362,6 +363,7 @@ test('initial verification failure blocks repeated MFA until an explicit connect
             assert.equal(harness.snapshot().listening, true);
             await harness.action('connect');
             assert.equal(harness.loginCalls.length, 2);
+            assert.equal(harness.loginCalls[1][7].recoverSession, true);
             assert.equal(harness.snapshot().connection, 'connected');
         } finally { harness.dispose(); }
     }
@@ -882,6 +884,26 @@ test('existing stream completion cannot hide genuine authentication expiry', asy
     } finally { harness.dispose(); }
 });
 
+test('transient automatic reauthentication failure retries after cooldown without manual reconnect', async () => {
+    let logins = 0;
+    const harness = connectionHarness({ valid: async () => false, login: async () => {
+        if (++logins === 2) throw Object.assign(new Error('gateway unavailable'), {
+            code: 'SESSION_UNAVAILABLE', status: 503, retryAfterMs: 60000
+        });
+    } });
+    try {
+        await harness.action('connect');
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.snapshot().keepalive.state, 'retrying');
+        assert.ok(harness.timers.at(-1).milliseconds > 59000 && harness.timers.at(-1).milliseconds <= 60000);
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 3);
+        assert.equal(harness.snapshot().keepalive.state, 'healthy');
+        assert.equal(harness.snapshot().connection, 'connected');
+    } finally { harness.dispose(); }
+});
+
 test('failed automatic reauthentication does not create repeated MFA attempts', async () => {
     let logins = 0;
     const harness = connectionHarness({ valid: async () => false, login: async () => {
@@ -893,6 +915,7 @@ test('failed automatic reauthentication does not create repeated MFA attempts', 
         await timer.callback(); await timer.callback();
         assert.equal(harness.loginCalls.length, 2);
         assert.equal(harness.snapshot().keepalive.state, 'needs-login');
+        assert.equal(harness.snapshot().keepalive.nextCheckAt, null);
         assert.equal(harness.snapshot().active, true);
         const { request, response } = chatExchange();
         const finished = new Promise(resolve => response.once('finish', resolve));
@@ -900,6 +923,184 @@ test('failed automatic reauthentication does not create repeated MFA attempts', 
         assert.equal(response.status, 401);
         assert.equal(harness.loginCalls.length, 2);
     } finally { harness.dispose(); }
+});
+
+test('repeated unavailable health checks attempt one browser recovery per outage', async () => {
+    let available = false;
+    const harness = connectionHarness({ valid: async () => {
+        if (!available) throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } });
+        return true;
+    } });
+    try {
+        await harness.action('connect');
+        for (let attempt = 0; attempt < 2; attempt++) {
+            await harness.timers.at(-1).callback();
+            assert.equal(harness.loginCalls.length, 1);
+        }
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.loginCalls[1][7].force, true);
+        for (let attempt = 0; attempt < 4; attempt++) await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 2);
+        available = true;
+        await harness.timers.at(-1).callback();
+        available = false;
+        for (let attempt = 0; attempt < 3; attempt++) await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 3);
+    } finally { harness.dispose(); }
+});
+
+test('health recovery never bypasses rate limits or forbidden responses', async () => {
+    for (const failure of [{ status: 429 }, { status: 403 }, { status: 503, retryAfterMs: 180000 }]) {
+        const harness = connectionHarness({ valid: async () => {
+            throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', ...failure });
+        } });
+        try {
+            await harness.action('connect');
+            for (let attempt = 0; attempt < 4; attempt++) await harness.timers.at(-1).callback();
+            assert.equal(harness.loginCalls.length, 1);
+            assert.equal(harness.snapshot().keepalive.state, 'error');
+        } finally { harness.dispose(); }
+    }
+});
+
+test('request-triggered reauthentication failure returns 503 with cooldown and automatically recovers', async () => {
+    let logins = 0, requests = 0;
+    const harness = connectionHarness({ login: async () => {
+        if (++logins === 2) throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } });
+    }, request: async () => {
+        requests++;
+        return new Response(logins < 3 ? '{}' : 'data: [DONE]\n\n', {
+            status: logins < 3 ? 401 : 200, headers: { 'content-type': 'text/event-stream' }
+        });
+    } });
+    try {
+        await harness.action('connect');
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await finished;
+            assert.equal(exchange.response.status, 503);
+            assert.ok(Number(exchange.response.headers['retry-after']) >= 29);
+            assert.equal(harness.loginCalls.length, 2);
+            assert.equal(requests, 1);
+        }
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 3);
+        assert.equal(harness.snapshot().connection, 'connected');
+        const exchange = chatExchange();
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await finished;
+        assert.equal(exchange.response.status, 200);
+        assert.equal(requests, 2);
+    } finally { harness.dispose(); }
+});
+
+test('automatic reauthentication retries are bounded even for persistent temporary failures', async () => {
+    let logins = 0;
+    const harness = connectionHarness({ valid: async () => false, login: async () => {
+        if (++logins > 1) throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503 });
+    } });
+    try {
+        await harness.action('connect');
+        for (let attempt = 0; attempt < 3; attempt++) await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 4);
+        assert.equal(harness.snapshot().keepalive.state, 'needs-login');
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.loginCalls.length, 4);
+    } finally { harness.dispose(); }
+});
+
+test('post-submission transport failures do not automatically repeat MFA', async () => {
+    let logins = 0;
+    const harness = connectionHarness({ valid: async () => false, login: async () => {
+        if (++logins > 1) throw Object.assign(new Error('callback unavailable'), {
+            code: 'SESSION_UNAVAILABLE', status: 503, retryAuthentication: false
+        });
+    } });
+    try {
+        await harness.action('connect');
+        const timer = harness.timers.at(-1);
+        await timer.callback(); await timer.callback();
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(harness.snapshot().keepalive.state, 'needs-login');
+    } finally { harness.dispose(); }
+});
+
+test('Connect recovers a blocked session without disconnecting existing streams or resetting usage', async () => {
+    let logins = 0, finishStream;
+    const harness = connectionHarness({ valid: async () => false, login: async () => {
+        if (++logins === 2) throw Object.assign(new Error('MFA incomplete'), { name: 'TimeoutError' });
+    }, request: async () => new Response(new ReadableStream({ start(controller) {
+        finishStream = () => { controller.enqueue(Buffer.from('data: [DONE]\n\n')); controller.close(); };
+    } }), { headers: { 'content-type': 'text/event-stream' } }) });
+    try {
+        await harness.action('connect');
+        const exchange = chatExchange();
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response); await nextTurn();
+        await harness.timers.at(-1).callback();
+        assert.equal(harness.snapshot().keepalive.state, 'needs-login');
+        await harness.action('connect');
+        assert.equal(harness.loginCalls.length, 3);
+        assert.equal(harness.loginCalls[2][7].recoverSession, true);
+        assert.equal(harness.loginCalls[0][2].aborted, false);
+        assert.equal(harness.servers.length, 1);
+        assert.equal(harness.snapshot().requests, 1);
+        assert.equal(exchange.response.destroyed, false);
+        assert.equal(harness.snapshot().connection, 'connected');
+        finishStream(); await finished;
+    } finally { harness.dispose(); }
+});
+
+test('a stale parallel 401 uses the refreshed session without starting another login', async () => {
+    let requests = 0, releaseStale;
+    const harness = connectionHarness({ request: async () => {
+        requests++;
+        if (requests === 1) return new Promise(resolve => { releaseStale = () => resolve(new Response('{}', { status: 401 })); });
+        return new Response(requests === 2 ? '{}' : 'data: [DONE]\n\n', {
+            status: requests === 2 ? 401 : 200, headers: { 'content-type': 'text/event-stream' }
+        });
+    } });
+    try {
+        await harness.action('connect');
+        const first = chatExchange();
+        const firstFinished = new Promise(resolve => first.response.once('finish', resolve));
+        harness.servers[0].handle(first.request, first.response); await nextTurn();
+        const second = chatExchange();
+        const secondFinished = new Promise(resolve => second.response.once('finish', resolve));
+        harness.servers[0].handle(second.request, second.response); await secondFinished;
+        assert.equal(harness.loginCalls.length, 2);
+        releaseStale(); await firstFinished;
+        assert.equal(harness.loginCalls.length, 2);
+        assert.equal(first.response.status, 200);
+        assert.equal(second.response.status, 200);
+        assert.equal(requests, 4);
+    } finally { harness.dispose(); }
+});
+
+test('a stale health check cannot replace a newly authenticated session after an upstream 503', async () => {
+    for (const unavailable of [false, true]) {
+        let finishCheck, requests = 0;
+        const harness = connectionHarness({ valid: () => new Promise((resolve, reject) => {
+            finishCheck = () => unavailable ? reject(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } })) : resolve(false);
+        }), request: async () => new Response('{}', { status: ++requests === 1 ? 401 : 503 }) });
+        try {
+            await harness.action('connect');
+            const checking = harness.timers.at(-1).callback();
+            const exchange = chatExchange();
+            const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response); await finished;
+            assert.equal(exchange.response.status, 503);
+            assert.equal(harness.loginCalls.length, 2);
+            finishCheck(); await checking;
+            assert.equal(harness.loginCalls.length, 2);
+            assert.equal(harness.snapshot().keepalive.state, 'healthy');
+            assert.equal(harness.snapshot().connection, 'connected');
+        } finally { harness.dispose(); }
+    }
 });
 
 test('diagnostic reauthentication closes the previous retained browser first', async () => {

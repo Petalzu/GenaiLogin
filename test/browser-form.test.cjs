@@ -18,7 +18,72 @@ test('ADFS duplicate username fields only fill visible password form', async () 
         assert.equal(await page.locator('input[type="hidden"]').inputValue(), 'unchanged');
     } finally { await browser.close(); }
 });
-for (const mode of ['button', 'Enter', 'Duo device confirmation', 'Duo Chinese device confirmation', 'Duo Chinese link confirmation', 'Duo lookalike host', 'Duo incomplete confirmation']) test(`MFA callback is not bounded by the submit action timeout (${mode})`, async () => {
+test('browser login starts at the WebUI home and recovers a temporarily unavailable entry', { timeout: 20000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    const jar = new CookieJar();
+    const visits = [];
+    const traces = [];
+    let homeRequests = 0;
+    let loginRequests = 0;
+    let verified = 0;
+    try {
+        const context = await browser.newContext();
+        await context.route('**/*', route => {
+            const url = new URL(route.request().url());
+            visits.push(url.pathname);
+            if (url.origin !== ORIGIN) return route.fulfill({ status: 404 });
+            if (url.pathname === '/') {
+                homeRequests++;
+                if (homeRequests === 1) return route.fulfill({ status: 503, contentType: 'text/plain', body: 'no healthy upstream' });
+                return route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<script>location.href="/auth?redirect=%2F"</script>' });
+            }
+            if (url.pathname === '/auth') return route.fulfill({ contentType: 'text/html; charset=utf-8', headers: { 'set-cookie': 'routing=not-a-login; Path=/; Secure' },
+                body: '<button onclick="location.href=\'/oauth/oidc/login\'">Continue with UMPASS</button>' });
+            if (url.pathname === '/oauth/oidc/login') {
+                loginRequests++;
+                if (homeRequests < 2 || loginRequests === 1) return route.fulfill({ status: 503, contentType: 'text/plain', body: 'no healthy upstream' });
+                return route.fulfill({ contentType: 'text/html', headers: { 'set-cookie': 'token=fresh; Path=/; Secure; HttpOnly' },
+                    body: '<script>location.href="/"</script>' });
+            }
+            return route.fulfill({ status: 404 });
+        });
+        await browserLogin({ jar, valid: async () => {
+            verified++;
+            assert.equal((await jar.getCookies(ORIGIN)).some(cookie => cookie.key === 'token' && cookie.value === 'fresh'), true);
+            return true;
+        } }, {}, AbortSignal.timeout(15000), message => traces.push(message),
+        { launch: async () => ({ newContext: async () => context, close: () => browser.close() }) }, false, true, { force: true });
+        assert.equal(visits[0], '/');
+        assert.equal(loginRequests, 2);
+        assert.equal(verified, 1);
+        assert.ok(traces.includes('Browser session verified'));
+        assert.ok(!traces.some(message => message.includes('no healthy upstream')));
+    } finally { await browser.close(); }
+});
+test('unavailable home pages stop after bounded retries without validating a session or submitting credentials', { timeout: 20000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    try {
+        for (const scenario of [{ status: 503, attempts: 3 }, { status: 403, attempts: 1 }, { status: 429, attempts: 1 },
+            { status: 503, attempts: 1, retryAfter: '60' }, { status: 503, attempts: 1, cancel: true }]) {
+            const context = await browser.newContext();
+            const controller = new AbortController();
+            let requests = 0;
+            await context.route('**/*', route => {
+                assert.equal(new URL(route.request().url()).pathname, '/');
+                assert.equal(route.request().method(), 'GET');
+                requests++;
+                return route.fulfill({ status: scenario.status, contentType: 'text/plain', body: 'no healthy upstream',
+                    headers: scenario.retryAfter ? { 'retry-after': scenario.retryAfter } : {} });
+            });
+            await assert.rejects(browserLogin({ jar: new CookieJar(), valid: () => assert.fail('error pages are not authenticated callbacks') }, {},
+                AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]), message => { if (scenario.cancel && message.includes('retry')) controller.abort(); },
+                { launch: async () => ({ newContext: async () => context, close: () => context.close() }) }, false, true, { force: true }),
+            scenario.cancel ? { name: 'AbortError' } : { code: 'SESSION_UNAVAILABLE', status: scenario.status });
+            assert.equal(requests, scenario.attempts);
+        }
+    } finally { await browser.close(); }
+});
+for (const mode of ['button', 'Enter', 'callback unavailable', 'Duo device confirmation', 'Duo Chinese device confirmation', 'Duo Chinese link confirmation', 'Duo lookalike host', 'Duo incomplete confirmation']) test(`MFA callback is not bounded by the submit action timeout (${mode})`, async () => {
     const submitButton = mode !== 'Enter';
     const duo = mode.startsWith('Duo');
     const chinese = mode.startsWith('Duo Chinese');
@@ -35,6 +100,11 @@ for (const mode of ['button', 'Enter', 'Duo device confirmation', 'Duo Chinese d
         const context = await browser.newContext();
         await context.route('**/*', async route => {
             const url = new URL(route.request().url());
+            if (url.origin === ORIGIN && url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<script>location.href="/auth?redirect=%2F"</script>' });
+            if (url.origin === ORIGIN && url.pathname === '/auth') {
+                const label = chinese ? '\u4f7f\u7528 UMPASS \u7ee7\u7eed' : 'Continue with UMPASS';
+                return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<button onclick="location.href='/oauth/oidc/login'">${label}</button>` });
+            }
             if (url.origin === ORIGIN && url.pathname === '/oauth/oidc/login') {
                 return route.fulfill({ contentType: 'text/html', body: '<script>location.href="https://websso.um.edu.mo/adfs/ls/"</script>' });
             }
@@ -62,6 +132,7 @@ for (const mode of ['button', 'Enter', 'Duo device confirmation', 'Duo Chinese d
                 assert.fail('must not decline remembering the Duo device');
             }
             if (url.origin === ORIGIN && url.pathname === '/oauth/oidc/callback') {
+                if (mode === 'callback unavailable') return route.fulfill({ status: 503, contentType: 'text/plain', body: 'unavailable' });
                 return route.fulfill({ contentType: 'text/html', headers: { 'set-cookie': 'token=test; Path=/; Secure; HttpOnly; SameSite=Lax' }, body: '<p>Signed in</p>' });
             }
             return route.fulfill({ status: 404 });
@@ -76,12 +147,13 @@ for (const mode of ['button', 'Enter', 'Duo device confirmation', 'Duo Chinese d
             error.message += `; submissions=${submissions}; stages=${JSON.stringify(traces)}`;
             throw error;
         });
-        if (blocked) await assert.rejects(login, { name: 'AbortError' });
+        if (mode === 'callback unavailable') await assert.rejects(login, { code: 'SESSION_UNAVAILABLE', status: 503, retryAuthentication: false });
+        else if (blocked) await assert.rejects(login, { name: 'AbortError' });
         else await login;
         assert.equal(submissions, 1);
         assert.equal(remembered, duo && !blocked ? 1 : 0);
         assert.equal(traces.includes('Duo device confirmation detected; remembering this device'), duo && !blocked);
-        assert.equal(traces.includes('Browser session verified'), !blocked);
+        assert.equal(traces.includes('Browser session verified'), !blocked && mode !== 'callback unavailable');
     } finally { approve(); await browser.close(); }
 });
 
@@ -150,16 +222,32 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.equal(await page.locator('[data-command="connect"]').isEnabled(), false);
             assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
             assert.equal(await page.locator('#port-badge').textContent(), ':58379');
+            await render({ ...base, connection: 'authenticating', status: 'Authenticating', active: true,
+                listening: true, loginPhase: 'webui-entry', pendingActions: ['connect'] });
+            assert.equal(await page.locator('#keepalive-text').textContent(), '正在打开 GENAI 登录页');
             await render({ ...base, connection: 'connected', status: 'Connected :58379', active: true,
                 connectedAt: Date.now(), listening: true, sessionPersistence: 'error',
                 keepalive: { state: 'error', lastCheckAt: Date.now(), nextCheckAt: Date.now() + 120000 } });
             assert.match(await page.locator('#keepalive-text').textContent(), /保活暂时失败.*重试/);
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            assert.equal(await page.locator('#connect-label').textContent(), '重新连接');
             assert.equal(await page.locator('#session-warning').isVisible(), true);
             assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot warning');
             assert.equal(await page.evaluate(() => globalThis.dashboardTimers.size), 1);
             assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
+            await render({ ...base, connection: 'error', status: 'Connection interrupted; retrying', active: true, listening: true,
+                keepalive: { state: 'retrying', nextCheckAt: Date.now() + 60000 } });
+            assert.match(await page.locator('#keepalive-text').textContent(), /重登暂时失败.*自动重试/);
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            await render({ ...base, connection: 'error', status: 'Authentication required; reconnect', active: true, listening: true,
+                keepalive: { state: 'needs-login' } });
+            assert.equal(await page.locator('#keepalive-text').textContent(), '验证未完成，请重新连接');
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            await page.locator('[data-command="connect"]').click();
+            assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'connect');
             await render({ ...base, connection: 'connected', status: 'Connected :58379', active: true, listening: true,
                 connectedAt: Date.now(), keepalive: { state: 'healthy', expiresAt: Date.now() + 45000, nextCheckAt: Date.now() + 10000 } });
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), false);
             assert.match(await page.locator('#keepalive-text').textContent(), /会话即将或已经到期/);
             assert.match(await page.locator('#last-check').textContent(), /下次检查/);
             assert.match(await page.locator('#last-check').getAttribute('title'), /会话到期/);

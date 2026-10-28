@@ -259,7 +259,7 @@ function dashboardHtml(initialState = null) {
                 <span class="action-icon" aria-hidden="true">M</span><span class="action-copy"><strong>添加绘画 MCP</strong><small>Qwen Image 2.1</small></span>
             </button>
             <button class="action-tile primary" data-command="connect">
-                <span class="action-icon">+</span><span class="action-copy"><strong>连接 GENAI</strong><small>登录并启动桥接</small></span>
+                <span class="action-icon">+</span><span class="action-copy"><strong id="connect-label">连接 GENAI</strong><small>登录并启动桥接</small></span>
             </button>
             <button class="action-tile" data-command="credentials">
                 <span class="action-icon">K</span><span class="action-copy"><strong>账号设置</strong><small>更新安全凭据</small></span>
@@ -391,16 +391,19 @@ function dashboardHtml(initialState = null) {
             const shared = Boolean(data.shared || String(data.status).includes('(shared window)'));
             const busy = mode === 'authenticating' || mode === 'connecting';
             const active = data.active ?? (isConnected || busy || Boolean(data.connectedAt));
+            const recoverable = !busy && ['error', 'retrying', 'needs-login'].includes(data.keepalive?.state);
             const pending = Array.isArray(data.pendingActions) ? data.pendingActions : [];
             const exclusivePending = pending.some(command => ['connect', 'diagnose', 'credentials', 'clear'].includes(command));
             for (const button of document.querySelectorAll('[data-command]')) {
                 const command = button.dataset.command;
                 button.disabled = pending.includes(command) ||
-                    (['connect', 'diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
+                    (command === 'connect' && (active && !recoverable || busy || shared || exclusivePending)) ||
+                    (['diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
                     (command === 'clear' && (shared || exclusivePending)) ||
                     (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || shared));
             }
-            const warning = data.sessionPersistence === 'error' || ['error', 'needs-login'].includes(data.keepalive?.state) ||
+            byId('connect-label').textContent = active && recoverable ? '重新连接' : '连接 GENAI';
+            const warning = data.sessionPersistence === 'error' || ['error', 'retrying', 'needs-login'].includes(data.keepalive?.state) ||
                 (data.keepalive?.expiresAt && data.keepalive.expiresAt - Date.now() <= 60000);
             const dot = byId('status-dot');
             dot.className = 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : '');
@@ -439,10 +442,11 @@ function dashboardHtml(initialState = null) {
             }
             const keepalive = data.keepalive || {};
             const expiring = keepalive.expiresAt && keepalive.expiresAt - Date.now() <= 60000;
-            const phases = { 'checking-session': '正在验证保存的会话', 'opening-browser': '正在启动 Edge', credentials: '正在提交 UMPASS 登录',
+            const phases = { 'checking-session': '正在验证保存的会话', 'opening-browser': '正在启动 Edge', 'webui-entry': '正在打开 GENAI 登录页', credentials: '正在提交 UMPASS 登录',
                 mfa: '等待手机 MFA 确认', umpass: '等待 UMPASS 验证', redirect: '等待身份认证跳转', callback: '正在验证 GENAI 会话' };
             const health = mode === 'authenticating' ? phases[data.loginPhase] || '正在验证登录' :
-                keepalive.state === 'needs-login' ? '验证未完成，请断开后重新连接' :
+                keepalive.state === 'needs-login' ? '验证未完成，请重新连接' :
+                keepalive.state === 'retrying' ? '重登暂时失败' + (keepalive.nextCheckAt ? '，' + formatClock(keepalive.nextCheckAt) + ' 自动重试' : '，等待自动重试') :
                 keepalive.state === 'error' ? '保活暂时失败' + (keepalive.nextCheckAt ? '，' + formatClock(keepalive.nextCheckAt) + ' 重试' : '，等待重试') :
                 keepalive.state === 'checking' ? '正在检查会话' : keepalive.state === 'reauthenticating' ? '认证已失效，正在重认证' :
                 expiring ? '会话即将或已经到期，服务端可能要求重新登录' :

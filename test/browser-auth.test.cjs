@@ -29,6 +29,7 @@ function isolatedHarness(mode) {
                     const context = await newContext();
                     await context.route('**/*', route => {
                         if (mode === 'failure') return route.abort('failed');
+                        if (mode === 'unavailable') return route.fulfill({ status: 503, contentType: 'text/plain', headers: { 'retry-after': '60' }, body: 'unavailable' });
                         return route.fulfill({ contentType: 'text/html; charset=utf-8',
                             headers: { 'set-cookie': 'token=worker-token; Path=/; Secure; HttpOnly; SameSite=Lax' }, body: '<p>Verified</p>' });
                     });
@@ -131,6 +132,23 @@ test('isolated login cancellation and navigation failures terminate processes wi
     }
 });
 
+test('isolated authentication errors preserve recovery safety, status and Retry-After', { timeout: 20000 }, async () => {
+    const harness = isolatedHarness('unavailable');
+    const session = new Session();
+    session.valid = async () => false;
+    const traces = [];
+    try {
+        await assert.rejects(harness.login(session, {}, AbortSignal.timeout(15000), message => traces.push(message)), {
+            code: 'SESSION_UNAVAILABLE', status: 503, retryAfterMs: 60000, retryAuthentication: true
+        });
+        assert.equal(harness.children[0].exitCode, 0);
+        assert.equal(await session.jar.getCookieString(ORIGIN), '');
+    } catch (error) {
+        error.message += `; stages=${JSON.stringify(traces)}`;
+        throw error;
+    } finally { for (const child of harness.children) if (child.exitCode === null) child.kill(); }
+});
+
 test('diagnostic browser stays open until disconnect', async () => {
     let closed = false;
     const controller = new AbortController();
@@ -166,6 +184,71 @@ test('valid saved session does not even load Playwright', () => {
 test('transient session check failure does not start a new login', async () => {
     await assert.rejects(browserLogin({ valid: async () => { throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE' }); } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }), { code: 'SESSION_UNAVAILABLE' });
 });
+test('saved session check retries gateway and transport failures without opening a browser', async () => {
+    let checks = 0;
+    await browserLogin({ valid: async () => {
+        checks++;
+        if (checks === 1) throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503 });
+        if (checks === 2) throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+        return true;
+    } }, {}, AbortSignal.timeout(10000), () => {}, { launch: () => assert.fail('unexpected launch') });
+    assert.equal(checks, 3);
+});
+test('explicit reconnect can open the home page after bounded saved-session failures', async () => {
+    let checks = 0;
+    let closed = 0;
+    const visits = [];
+    const page = { on() {}, goto: async url => { visits.push(url); }, url: () => ORIGIN + '/', locator: () => ({}) };
+    const browser = { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+        cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    await browserLogin({ valid: async () => {
+        if (++checks <= 3) throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503 });
+        return true;
+    }, jar: { setCookie: async () => {} } }, {}, AbortSignal.timeout(10000), () => {}, { launch: async () => browser }, false, true, { recoverSession: true });
+    assert.equal(checks, 4);
+    assert.deepEqual(visits, [ORIGIN + '/']);
+    assert.equal(closed, 1);
+});
+test('automatic saved-session failure remains bounded without launching MFA', async () => {
+    let checks = 0;
+    await assert.rejects(browserLogin({ valid: async () => {
+        checks++;
+        throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503 });
+    } }, {}, AbortSignal.timeout(10000), () => {}, { launch: () => assert.fail('unexpected launch') }), { code: 'SESSION_UNAVAILABLE', status: 503 });
+    assert.equal(checks, 3);
+});
+test('saved-session recovery respects rate limits, forbidden responses and cancellation', async () => {
+    for (const failure of [{ status: 403 }, { status: 429 }, { status: 503, retryAfterMs: 60000 }]) {
+        let checks = 0;
+        await assert.rejects(browserLogin({ valid: async () => {
+            checks++;
+            throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', ...failure });
+        } }, {}, undefined, () => {}, { launch: () => assert.fail('unexpected launch') }, false, true, { recoverSession: true }), { code: 'SESSION_UNAVAILABLE', ...failure });
+        assert.equal(checks, 1);
+    }
+    const controller = new AbortController();
+    let checks = 0;
+    await assert.rejects(browserLogin({ valid: async () => {
+        checks++;
+        throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503 });
+    } }, {}, controller.signal, message => { if (message.includes('retry')) controller.abort(); },
+    { launch: () => assert.fail('unexpected launch') }, false, true, { recoverSession: true }), { name: 'AbortError' });
+    assert.equal(checks, 1);
+});
+test('explicit reconnect observes the final Retry-After before opening the home page', async () => {
+    const controller = new AbortController();
+    let checks = 0;
+    let cancellation;
+    try {
+        await assert.rejects(browserLogin({ valid: async () => {
+            checks++;
+            throw Object.assign(new Error('unavailable'), { code: 'SESSION_UNAVAILABLE', status: 503, retryAfterMs: 100 });
+        } }, {}, AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]), message => {
+            if (message.startsWith('Saved session check unavailable')) cancellation = setTimeout(() => controller.abort(), 10);
+        }, { launch: () => assert.fail('browser opened before Retry-After') }, false, true, { recoverSession: true }), { name: 'AbortError' });
+        assert.equal(checks, 3);
+    } finally { clearTimeout(cancellation); controller.abort(); }
+});
 test('forced ordinary login closes Edge after verification', async () => {
     let closed = 0;
     let checks = 0;
@@ -192,7 +275,7 @@ test('browser closes on navigation failure', async () => {
     const browser = { close: async () => { closed = true; }, newContext: async () => ({ newPage: async () => ({ on: () => {}, goto: async () => { throw new Error('navigation failed'); } }) }) };
     await assert.rejects(browserLogin({ valid: async () => false }, {}, undefined, message => traces.push(message), { launch: async () => browser }), /navigation failed/);
     assert.ok(closed);
-    assert.ok(traces.includes('Browser login failed: phase=identity-redirect code=Error'));
+    assert.ok(traces.includes('Browser login failed: phase=webui-entry code=Error'));
     assert.ok(!traces.some(message => message.includes('navigation failed')));
 });
 test('verified cookies survive browser closure', async () => {
@@ -201,6 +284,21 @@ test('verified cookies survive browser closure', async () => {
     const browser = { close: async () => { closed = true; }, newContext: async () => ({ newPage: async () => page, cookies: async () => [{ name: 'token', value: 'test', domain: 'chat.genai.um.edu.mo', path: '/', secure: true, httpOnly: true, sameSite: 'Lax', expires: -1 }] }) };
     await browserLogin({ valid: async () => ++checks > 1, jar: { setCookie: async cookie => { imported = cookie; } } }, {}, undefined, () => {}, { launch: async () => browser });
     assert.equal(imported.value, 'test'); assert.ok(closed);
+});
+test('callback verification recovers a connection reset without restarting browser authentication', async () => {
+    let checks = 0;
+    let navigations = 0;
+    let closed = 0;
+    const page = { on() {}, goto: async () => { navigations++; }, url: () => ORIGIN + '/', locator: () => ({}) };
+    const browser = { close: async () => { closed++; }, newContext: async () => ({ newPage: async () => page,
+        cookies: async () => [{ name: 'token', value: 'fresh', domain: 'chat.genai.um.edu.mo', path: '/', sameSite: 'Lax', expires: -1 }] }) };
+    await browserLogin({ jar: { setCookie: async () => {} }, valid: async () => {
+        if (++checks === 1) throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+        return true;
+    } }, {}, AbortSignal.timeout(5000), () => {}, { launch: async () => browser }, false, true, { force: true });
+    assert.equal(checks, 2);
+    assert.equal(navigations, 1);
+    assert.equal(closed, 1);
 });
 test('identity diagnostics log route categories without authentication parameters', async () => {
     const traces = [];
