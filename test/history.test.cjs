@@ -50,6 +50,59 @@ test('pricing uses request start UTC boundaries, weekdays and no holiday excepti
 	}
 });
 
+test('large chat requests retain their model and pricing', () => {
+	const stats = createStats(58379);
+	const body = Buffer.from(JSON.stringify({ model: 'DeepSeek-V4.1-Flash', messages: [{ role: 'user', content: 'x'.repeat(2 * 1024 * 1024) }] }));
+	const request = recordRequest(stats, body, Date.parse('2026-10-08T00:00:00Z'));
+	assert.equal(request.model, 'DeepSeek-V4.1-Flash');
+	applyUsage(request, { prompt_tokens: 1000000, completion_tokens: 1000000, prompt_cache_hit_tokens: 900000 });
+	commitRequest(stats, request);
+	assert.equal(stats.models.has('unknown'), false);
+	assert.equal(stats.modelUsage.get(request.model).pricedReports, 1);
+});
+
+test('DeepSeek 1017 uses the original model rates and peak schedule', () => {
+	for (const [time, expected] of [['2026-10-08T00:00:00Z', 0.6177], ['2026-10-08T02:00:00Z', 1.2354]]) {
+		const stats = createStats(58379);
+		for (const model of ['DeepSeek-V4.1-Flash', 'DeepSeek-V4.1-Flash-1017']) {
+			const request = recordRequest(stats, Buffer.from(JSON.stringify({ model })), Date.parse(time));
+			applyUsage(request, { prompt_tokens: 1000000, completion_tokens: 1000000, prompt_cache_hit_tokens: 900000 });
+			commitRequest(stats, request);
+			const usage = stats.modelUsage.get(model);
+			assert.equal(usage.pricedReports, 1, model);
+			assert.ok(Math.abs(usage.costMin - expected) < 1e-12, model);
+			assert.equal(usage.costMax, usage.costMin, model);
+		}
+	}
+});
+
+test('missing request timestamps use off-peak pricing without a range', () => {
+	const stats = createStats(58379);
+	const request = recordRequest(stats, Buffer.from('{"model":"DeepSeek-V4.1-Flash-1017"}'));
+	delete request.startedAt;
+	applyUsage(request, { prompt_tokens: 1000000, completion_tokens: 1000000, prompt_cache_hit_tokens: 900000 });
+	commitRequest(stats, request);
+	const usage = stats.modelUsage.get(request.model);
+	assert.ok(Math.abs(usage.costMin - 0.6177) < 1e-12);
+	assert.equal(usage.costMax, usage.costMin);
+	assert.equal(usage.timedReports, 0);
+	assert.equal(usage.offPeakCost, usage.costMin);
+});
+
+test('requests with missing or invalid models remain unknown without throwing', () => {
+	const stats = createStats(58379);
+	for (const body of ['{}', 'null', '[]', '{', '{"model":false}', '{"model":""}', '{"model":" "}', '{"model":"unknown"}']) {
+		const request = recordRequest(stats, Buffer.from(body));
+		assert.equal(request.model, 'unknown', body);
+		applyUsage(request, { prompt_tokens: 100, completion_tokens: 10 });
+		commitRequest(stats, request);
+	}
+	assert.equal(stats.requests, 8);
+	assert.equal(stats.models.get('unknown'), 8);
+	assert.equal(stats.modelUsage.get('unknown').tokensIn, 800);
+	assert.equal(stats.modelUsage.get('unknown').tokensOut, 80);
+});
+
 test('saved historical peak price is read unchanged without activation writes', async () => {
 	const saved = { modelUsage: [{ name: 'DeepSeek-V4.1-Flash', tokensIn: 1000000, tokensOut: 1000000, cachedTokens: 900000, inputUsageReports: 1, outputUsageReports: 1, pricedReports: 1, timedReports: 1, costMin: 16.964512, costMax: 16.964512, peakCost: 16.964512 }] };
 	let writes = 0;

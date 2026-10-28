@@ -40,7 +40,7 @@ function recordModelUsage(models, request) {
 	}
 	const cacheKnown = request.hasInput && Number.isSafeInteger(request.cachedTokens) &&
 		request.cachedTokens >= 0 && request.cachedTokens <= request.tokensIn;
-	const pricing = request.model === DEEPSEEK_PRICING.model ? DEEPSEEK_PRICING :
+	const pricing = request.model === DEEPSEEK_PRICING.model || request.model === 'DeepSeek-V4.1-Flash-1017' ? DEEPSEEK_PRICING :
 		Object.hasOwn(modelPricing.models, request.model) ? modelPricing.models[request.model] : undefined;
 	const priced = Boolean(pricing && cacheKnown && request.hasOutput);
 	const currencyDivisor = pricing?.currency === 'CNY' ? modelPricing.exchangeRate.CNYPerUSD : 1;
@@ -55,8 +55,8 @@ function recordModelUsage(models, request) {
 		inputUsageReports: request.hasInput ? 1 : 0, outputUsageReports: request.hasOutput ? 1 : 0,
 		cachedTokens: cacheKnown ? request.cachedTokens : 0, cacheInputTokens: cacheKnown ? request.tokensIn : 0,
 		cacheReports: cacheKnown ? 1 : 0, pricedReports: priced ? 1 : 0,
-		costMin: timed ? timedCost : cost, costMax: timed ? timedCost : cost * multiplier,
-		timedReports: timed ? 1 : 0, peakCost: peak ? timedCost : 0, offPeakCost: timed && !peak ? timedCost : 0 }]);
+		costMin: timedCost, costMax: timedCost,
+		timedReports: timed ? 1 : 0, peakCost: peak ? timedCost : 0, offPeakCost: !peak ? timedCost : 0 }]);
 }
 
 const historyStores = new WeakMap();
@@ -155,6 +155,7 @@ function createHistory(storage, onError = () => {}, recordStore) {
 const MAX_TRACKED_MODELS = 64;
 const MAX_SSE_LINE_LENGTH = 64 * 1024;
 const MAX_JSON_STATS_BODY = 2 * 1024 * 1024;
+const MAX_JSON_REQUEST_BODY = 20 * 1024 * 1024;
 
 function createStats(port) {
 	return {
@@ -177,10 +178,10 @@ function recordRequest(stats, body, startedAt = Date.now()) {
 	if (body === undefined) return undefined;
 	stats.requests++;
 	let model = 'unknown';
-	if (body.length <= MAX_JSON_STATS_BODY) {
+	if (body.length <= MAX_JSON_REQUEST_BODY) {
 		try {
 			const parsed = JSON.parse(body.toString('utf8'));
-			if (typeof parsed.model === 'string' && parsed.model.length <= 256 && parsed.model) model = parsed.model;
+			if (typeof parsed?.model === 'string' && parsed.model.length <= 256 && parsed.model.trim()) model = parsed.model;
 		} catch { model = 'unknown'; }
 	}
 	const current = stats.models.get(model);
@@ -329,6 +330,7 @@ module.exports = {
 	MAX_TRACKED_MODELS,
 	MAX_SSE_LINE_LENGTH,
 	MAX_JSON_STATS_BODY,
+	MAX_JSON_REQUEST_BODY,
 	createStats,
 	recordRequest,
 	applyUsage,

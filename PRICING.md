@@ -24,9 +24,15 @@ https://open.er-api.com/v6/latest/USD (ExchangeRate-API).
 
 DeepSeek-V4.1-Flash retains its existing official reference rates:
 off-peak 0.15 / 0.003 / 0.6; peak rates are twice those values.
+DeepSeek-V4.1-Flash-1017 uses the same rates and peak schedule.
 Source: https://api-docs.deepseek.com/quick_start/pricing
 The existing estimator uses weekday UTC 01:00-04:00 and 06:00-10:00 peaks.
 It does not implement the official Chinese public holiday exception.
+Requests without a usable start time use off-peak rates, not a price range.
+
+Dashboard token totals and model input/output usage are displayed in millions
+(M); stored token counts remain unchanged. Historical estimated USD totals sum
+the priced model entries; unpriced usage is excluded, not assumed to be free.
 
 Missing or invalid cached token counts retain the user-selected 90% fallback.
 Models without an exact pricing entry are not priced. Missing token usage is

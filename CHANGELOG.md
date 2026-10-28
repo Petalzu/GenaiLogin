@@ -1,5 +1,12 @@
 # Change Log
 
+## [0.0.24-beta] - Local Testing Only (Unpublished)
+
+- Match request-model statistics parsing to the bridge's 20 MiB request limit so large valid conversations retain their model name. Missing or invalid model names still record as unknown without rejecting requests.
+- Price DeepSeek-V4.1-Flash-1017 using the existing DeepSeek-V4.1-Flash rates and peak schedule. Use off-peak pricing when the request start time is unavailable and display a single estimate instead of a range.
+- Display total and per-model input/output token usage in millions (M), preserving exact stored counts. Add a historical estimated USD total with an explicit note for unpriced usage.
+- Keep historical data corrections outside the extension; no automatic migration, model reassignment or historical repricing is included. This beta is for local installation only, not a Marketplace or GitHub release.
+
 ## [0.0.23]
 
 - Use the same headless Edge connection flow for the first automatic request and ordinary manual Connect. Start the browser before any Node session check, import saved cookies, and reuse valid sessions without repeating UMPASS/MFA. Visible diagnostics remain the only visible-browser entry.

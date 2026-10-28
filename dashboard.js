@@ -115,6 +115,7 @@ function dashboardHtml(initialState = null) {
         .history-bar {
             position: relative;
             display: flex;
+            flex-wrap: wrap;
             align-items: center;
             gap: 7px;
             min-width: 0;
@@ -128,7 +129,8 @@ function dashboardHtml(initialState = null) {
             white-space: nowrap;
         }
         .history-bar strong { flex: 0 0 auto; color: var(--amber); font-size: 11px; }
-        .history-bar .history-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .history-bar .history-meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .history-cost { flex: 0 0 100%; color: var(--text); white-space: normal; overflow-wrap: anywhere; }
         .hover-card {
             display: none;
             white-space: normal;
@@ -277,6 +279,7 @@ function dashboardHtml(initialState = null) {
         <div class="history-bar usage-hover" tabindex="0">
             <strong id="history-tokens">--</strong>
             <span id="history-detail" class="history-meta">正在读取历史统计</span>
+            <span id="history-cost" class="history-cost">估算 USD --</span>
             <div class="hover-card" tabindex="0" role="region" aria-label="历史用量明细">
                 <div id="history-breakdown" class="usage-breakdown"></div>
             </div>
@@ -291,7 +294,8 @@ function dashboardHtml(initialState = null) {
         const numberFormatter = new Intl.NumberFormat('zh-CN');
         const clockFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const formatNumber = value => numberFormatter.format(number(value));
-        const formatTokens = value => value === null || value === undefined ? '--' : formatNumber(value);
+        const formatTokens = value => value === null || value === undefined ? '--' :
+            (number(value) / 1e6).toFixed(number(value) > 0 && number(value) < 10000 ? 6 : 2) + ' M';
         const formatDuration = milliseconds => {
             const seconds = Math.max(0, Math.floor(milliseconds / 1000));
             const hours = Math.floor(seconds / 3600);
@@ -300,13 +304,6 @@ function dashboardHtml(initialState = null) {
             return hours ? hours + 'h ' + minutes + 'm' : minutes ? minutes + 'm ' + rest + 's' : rest + 's';
         };
         const formatClock = timestamp => timestamp ? clockFormatter.format(timestamp) : '--';
-        const formatShort = value => {
-            if (!Number.isFinite(Number(value)) || Number(value) <= 0) return null;
-            const tokens = Number(value);
-            if (tokens >= 1e8) return (tokens / 1e8).toFixed(2) + ' 亿';
-            if (tokens >= 1e4) return (tokens / 1e4).toFixed(1) + ' 万';
-            return formatNumber(tokens);
-        };
         const connectionState = data => data.connection || (String(data.status).startsWith('Connected') ? 'connected' :
             String(data.status).startsWith('Authenticating') ? 'authenticating' : String(data.status).startsWith('Connecting') ? 'connecting' :
             String(data.status).startsWith('Disconnected') ? 'disconnected' : 'error');
@@ -331,8 +328,7 @@ function dashboardHtml(initialState = null) {
             return true;
         };
         const money = value => Number(value).toFixed(6);
-        const costText = usage => number(usage.timedReports) === number(usage.pricedReports)
-            ? money(usage.costMin) : money(usage.costMin) + ' ~ ' + money(usage.costMax);
+        const costText = usage => money(usage.costMin);
         const cacheRate = usage => usage.cacheInputTokens > 0 ? (100 * usage.cachedTokens / usage.cacheInputTokens).toFixed(1) + '%' : '--';
         function renderUsage(id, rows) {
             if (!listChanged(id, rows)) return;
@@ -343,9 +339,9 @@ function dashboardHtml(initialState = null) {
                 row.className = 'usage-row';
                 const title = document.createElement('strong');
                 const tokens = number(usage.tokensIn) + number(usage.tokensOut);
-                title.textContent = usage.name + ' · ' + formatNumber(tokens) + ' tok';
+                title.textContent = usage.name + ' · ' + formatTokens(tokens) + ' tok';
                 const detail = document.createElement('small');
-                detail.textContent = 'IN ' + (usage.inputUsageReports ? formatNumber(usage.tokensIn) : '--') + ' / OUT ' + (usage.outputUsageReports ? formatNumber(usage.tokensOut) : '--') +
+                detail.textContent = 'IN ' + (usage.inputUsageReports ? formatTokens(usage.tokensIn) : '--') + ' / OUT ' + (usage.outputUsageReports ? formatTokens(usage.tokensOut) : '--') +
                     ' · 缓存命中 ' + cacheRate(usage);
                 const cost = document.createElement('small');
                 cost.textContent = usage.pricedReports ? '估算 USD ' + costText(usage) : '未定价';
@@ -460,10 +456,14 @@ function dashboardHtml(initialState = null) {
             byId('uptime-value').textContent = isConnected ? formatDuration(Date.now() - data.connectedAt) : '--';
             renderModels(Array.isArray(data.models) ? data.models : []);
             const history = data.history;
-            renderUsage('history-breakdown', Array.isArray(history?.modelUsage) ? history.modelUsage : [], number(history?.tokensIn) + number(history?.tokensOut));
+            const historyRows = Array.isArray(history?.modelUsage) ? history.modelUsage : [];
+            renderUsage('history-breakdown', historyRows, number(history?.tokensIn) + number(history?.tokensOut));
+            const historyCost = historyRows.reduce((total, usage) => total + (usage.pricedReports ? number(usage.costMin) : 0), 0);
+            byId('history-cost').textContent = '估算 USD ' + (historyRows.some(usage => usage.pricedReports) ? money(historyCost) : '--');
+            byId('history-cost').title = historyRows.some(usage => !usage.pricedReports) ? '含未计价模型，未计价部分未计入合计' : '所有模型估算合计';
             byId('history-tokens').textContent = history && (history.inputUsageReports || history.outputUsageReports) ? formatTokens(number(history.tokensIn) + number(history.tokensOut)) + ' tok' : '--';
             byId('history-detail').textContent = history ? history.inputUsageReports + history.outputUsageReports
-                ? '调用 ' + formatNumber(history.requests) + ' 次 · IN ' + (formatShort(history.tokensIn) ?? '--') + ' · OUT ' + (formatShort(history.tokensOut) ?? '--')
+                ? '调用 ' + formatNumber(history.requests) + ' 次 · IN ' + (history.inputUsageReports ? formatTokens(history.tokensIn) : '--') + ' · OUT ' + (history.outputUsageReports ? formatTokens(history.tokensOut) : '--')
                 : '调用 ' + formatNumber(history.requests) + ' 次 · 等待 usage' : '未连接，无历史统计';
             syncUptimeTimer();
         }

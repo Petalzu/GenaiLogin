@@ -223,6 +223,7 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
         const render = state => page.evaluate(data => globalThis.dispatchEvent(new MessageEvent('message', { data: { type: 'state', data } })), state);
         const base = { port: 58379, models: [], keepalive: { state: 'idle' } };
         assert.equal(await page.locator('#status-dot').getAttribute('class'), 'status-dot ');
+        assert.equal(await page.locator('#history-cost').textContent(), '估算 USD --');
         assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
         assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), false);
         assert.equal(await page.evaluate(() => globalThis.dashboardTimers.size), 0);
@@ -238,9 +239,30 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             history: { requests: 2, tokensIn: 10, inputUsageReports: 1, modelUsage: [{ name: 'changed-model', tokensIn: 10, inputUsageReports: 1 }] } });
         assert.match(await page.locator('#model-list').textContent(), /changed-model/);
         for (const id of ['token-breakdown', 'cost-breakdown', 'history-breakdown']) assert.match(await page.locator('#' + id).textContent(), /changed-model/);
+        assert.match(await page.locator('#history-breakdown').textContent(), /0\.000010 M tok/);
+        const history = { requests: 5, tokensIn: 3000000000, tokensOut: 10000000, inputUsageReports: 4, outputUsageReports: 4, modelUsage: [
+            { name: 'DeepSeek-V4.1-Flash', requests: 2, tokensIn: 1000000000, tokensOut: 1000000, inputUsageReports: 2, outputUsageReports: 2,
+                pricedReports: 2, timedReports: 1, costMin: 10.25, costMax: 10.25 },
+            { name: 'DeepSeek-V4.1-Flash-1017', requests: 1, pricedReports: 1, timedReports: 0, costMin: 2.5, costMax: 2.5 },
+            { name: 'GLM-5.3-Flash', requests: 1, pricedReports: 1, timedReports: 1, costMin: 3.125, costMax: 3.125 },
+            { name: 'qwen-image-2.1', requests: 1, pricedReports: 0 }
+        ] };
         for (const width of [240, 360, 1200]) {
             await page.setViewportSize({ width, height: 900 });
-            await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, listening: true });
+            await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, listening: true, history });
+            assert.equal(await page.locator('#history-cost').textContent(), '估算 USD 15.875000');
+            assert.equal(await page.locator('#history-tokens').textContent(), '3010.00 M tok');
+            assert.match(await page.locator('#history-detail').textContent(), /IN 3000\.00 M · OUT 10\.00 M/);
+            assert.match(await page.locator('#history-breakdown').textContent(), /IN 1000\.00 M \/ OUT 1\.00 M/);
+            assert.match(await page.locator('#history-cost').getAttribute('title'), /未计价/);
+            assert.doesNotMatch(await page.locator('#history-breakdown').textContent(), /~/);
+            assert.equal(await page.locator('#history-cost').evaluate(element => element.scrollWidth <= element.clientWidth), true);
+            assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
+            if (process.env.GENAI_DASHBOARD_SCREENSHOTS) {
+                const { join } = require('node:path');
+                const { tmpdir } = require('node:os');
+                await page.screenshot({ path: join(tmpdir(), `genai-history-${width}.png`), fullPage: true });
+            }
             assert.equal(await page.locator('#status-text').textContent(), '待命');
             assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
             assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
