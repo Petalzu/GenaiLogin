@@ -1,7 +1,7 @@
 const vscode = require('vscode');
 const http = require('node:http');
-const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('./bridge-stream');
-const { createStats, createHistory, createHistoryFiles, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
+const { createRequestLifetime, waitForSignal, forwardBody, createBridgeAdmission, proxyResponseHeaders, transportCode } = require('./bridge-stream');
+const { MAX_JSON_REQUEST_BODY, createStats, createHistory, createHistoryFiles, parseRequestBody, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
 
 let stopActive;
 
@@ -164,6 +164,21 @@ function activate(context) {
 	let sessionPersistence, sessionPersistenceInfo = 'idle';
 	const configuredPort = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
 	const stats = createStats(Number.isInteger(configuredPort) && configuredPort >= 1024 && configuredPort <= 65535 ? configuredPort : 58379);
+	let admission;
+	const getAdmission = () => {
+		if (!admission) {
+			const configuration = vscode.workspace.getConfiguration('genai-login');
+			const bounded = (name, fallback, minimum, maximum) => {
+				const value = configuration.get(name, fallback);
+				return Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
+			};
+			admission = createBridgeAdmission({ maxActive: bounded('maxConcurrentRequests', 32, 1, 256),
+				maxQueued: bounded('maxQueuedRequests', 64, 0, 1024),
+				maxBytes: bounded('maxBufferedRequestMiB', 128, 40, 2048) * 1024 * 1024,
+				queueTimeoutMs: bounded('queueTimeoutSeconds', 60, 1, 600) * 1000 });
+		}
+		return admission;
+	};
 	const imageMcpEnabled = () => vscode.workspace.getConfiguration('genai-login').get('imageMcp.enabled', false);
 	const mcpChanges = vscode.lm?.registerMcpServerDefinitionProvider ? new vscode.EventEmitter() : undefined;
 	if (mcpChanges) {
@@ -188,7 +203,9 @@ function activate(context) {
 		status: state,
 		connection, loginPhase, active: Boolean(active), listening: listenerReady, shared: false,
 		pendingActions: [...pendingActions.keys()],
-		history: getHistory().snapshot(),
+		bridge: admission?.snapshot(),
+		history: context.globalStorageUri && (!history || history.state() !== 'ready') ? undefined : getHistory().snapshot(),
+		historyState: history?.state() || (context.globalStorageUri ? 'loading' : 'ready'),
 		port: stats.port,
 		connectedAt: stats.connectedAt,
 		requests: stats.requests,
@@ -204,7 +221,17 @@ function activate(context) {
 		keepalive: { ...keepaliveInfo },
 		sessionPersistence: sessionPersistenceInfo
 	});
-	const stateSnapshot = () => !active && sharedState ? { ...sharedState, shared: true, pendingActions: [...pendingActions.keys()], status: `${sharedState.status} (shared window)` } : localSnapshot();
+	const stateSnapshot = () => {
+		const local = localSnapshot();
+		if (active || !sharedState) return local;
+		const remoteHistory = sharedState.history;
+		const useRemoteHistory = remoteHistory && sharedState.historyState !== 'loading' && sharedState.historyState !== 'error' &&
+			(!local.history || ['requests', 'tokensIn', 'tokensOut'].every(field => Number(remoteHistory[field] || 0) >= Number(local.history[field] || 0)) &&
+				['requests', 'tokensIn', 'tokensOut'].some(field => Number(remoteHistory[field] || 0) > Number(local.history[field] || 0)));
+		return { ...sharedState, shared: true, pendingActions: [...pendingActions.keys()], status: `${sharedState.status} (shared window)`,
+			history: useRemoteHistory ? remoteHistory : local.history,
+			historyState: useRemoteHistory ? 'ready' : local.historyState };
+	};
 	const syncSharedState = () => {
 		if (syncDisposed || active || listenerReady) return Promise.resolve();
 		if (syncInFlight) return syncInFlight;
@@ -238,7 +265,8 @@ function activate(context) {
 			syncInFlight = undefined;
 			return;
 		}
-		void getHistory().reload().then(() => { if (!syncDisposed) dashboard?.refresh(); });
+		const refreshHistory = () => { if (!syncDisposed) dashboard?.refresh(); };
+		void getHistory().reload(refreshHistory).then(refreshHistory);
 		if (active || listenerReady) return;
 		void syncSharedState();
 		syncTimer = setInterval(() => { void syncSharedState(); }, 2000);
@@ -290,33 +318,54 @@ function activate(context) {
 					if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
 					if (!requestHandler && automaticRetryAt > Date.now()) return sendError(response, 503,
 						'GENAI automatic connection is cooling down after a temporary network or service failure; retry later or reconnect explicitly.', automaticRetryHeaders());
-					if (!requestHandler) {
-						const waiting = createRequestLifetime(response, owner.signal);
-						const cancelRequest = () => request.destroy();
-						waiting.signal.addEventListener('abort', cancelRequest, { once: true });
-						try {
-							waiting.signal.throwIfAborted();
-							await waitForSignal(connect(false, true), waiting.signal);
-							waiting.signal.throwIfAborted();
-						} catch (error) {
-							if (waiting.signal.aborted) return;
-							if (!response.destroyed && !response.headersSent) sendError(response, 503, error.code === 'SESSION_CHECK_TIMEOUT' && !automaticLoginBlocked ?
-								'GENAI session check timed out; retry the request. Automatic connection remains enabled.' :
-								`GENAI automatic connection failed (${transportCode(error)}); retry after the cooldown or reconnect explicitly.`, automaticRetryHeaders());
-							return;
-						} finally {
-							waiting.signal.removeEventListener('abort', cancelRequest);
-							waiting.dispose();
-						}
-					}
-					if (!requestHandler) return sendError(response, 503, 'GENAI is not connected; retry after saving credentials.');
+					const contentLength = request.headers['content-length'];
+					const declaredBytes = typeof contentLength === 'string' && /^\d+$/.test(contentLength) ? Number(contentLength) : undefined;
+					if (declaredBytes > MAX_JSON_REQUEST_BODY) return sendError(response, 413, 'Request too large');
+					const bodyBudget = Number.isSafeInteger(declaredBytes) ? declaredBytes : request.method === 'GET' && !request.headers['transfer-encoding'] ? 0 : MAX_JSON_REQUEST_BODY;
+					const queuedLifetime = createRequestLifetime(response, owner.signal);
+					const cancelQueued = () => request.destroy();
+					queuedLifetime.signal.addEventListener('abort', cancelQueued, { once: true });
+					let permit;
 					try {
-						await requestHandler(request, response);
+						permit = await getAdmission().acquire(bodyBudget * 2, queuedLifetime.signal);
+						queuedLifetime.signal.throwIfAborted();
+						if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
+						if (!requestHandler && automaticRetryAt > Date.now()) return sendError(response, 503,
+							'GENAI automatic connection is cooling down after a temporary network or service failure; retry later or reconnect explicitly.', automaticRetryHeaders());
+						if (!requestHandler) {
+							try {
+								await waitForSignal(connect(false, true), queuedLifetime.signal);
+								queuedLifetime.signal.throwIfAborted();
+							} catch (error) {
+								if (queuedLifetime.signal.aborted) return;
+								if (!response.destroyed && !response.headersSent) sendError(response, 503, error.code === 'SESSION_CHECK_TIMEOUT' && !automaticLoginBlocked ?
+									'GENAI session check timed out; retry the request. Automatic connection remains enabled.' :
+									`GENAI automatic connection failed (${transportCode(error)}); retry after the cooldown or reconnect explicitly.`, automaticRetryHeaders());
+								return;
+							}
+						}
+						if (!requestHandler) return sendError(response, 503, 'GENAI is not connected; retry after saving credentials.');
+						queuedLifetime.signal.removeEventListener('abort', cancelQueued);
+						queuedLifetime.dispose();
+						try {
+							await requestHandler(request, response, permit);
+						} catch (error) {
+							trace(`Proxy failed: code=${transportCode(error)}`);
+							if (response.destroyed) return;
+							if (!response.headersSent) sendError(response, 502, 'Upstream request failed. Retry when network is available.');
+							else response.destroy();
+						}
 					} catch (error) {
-						trace(`Proxy failed: code=${transportCode(error)}`);
-						if (response.destroyed) return;
-						if (!response.headersSent) sendError(response, 502, 'Upstream request failed. Retry when network is available.');
-						else response.destroy();
+						if (queuedLifetime.signal.aborted || response.destroyed) return;
+						if (['BRIDGE_BUSY', 'BRIDGE_QUEUE_TIMEOUT'].includes(error.code)) {
+							trace(`Local bridge admission rejected: code=${error.code}`);
+							return sendError(response, 503, error.message, { 'retry-after': '1' });
+						}
+						throw error;
+					} finally {
+						permit?.release();
+						queuedLifetime.signal.removeEventListener('abort', cancelQueued);
+						queuedLifetime.dispose();
 					}
 				})().catch(error => {
 					trace(`Local request failed: code=${transportCode(error)}`);
@@ -592,7 +641,7 @@ function activate(context) {
 			if (active !== controller || controller.signal.aborted) return;
 			if (commitRequest(stats, requestStats)) dashboard?.refresh();
 		};
-		const handle = async (request, response) => {
+		const handle = async (request, response, permit) => {
 			const route = request.method === 'POST' && request.url === '/v1/chat/completions' ? '/api/v1/chat/completions'
 				: request.method === 'POST' && request.url === '/v1/images/generations' ? '/api/v1/images/generations'
 					: request.method === 'GET' && request.url === '/v1/models' ? '/api/v1/models' : null;
@@ -601,6 +650,7 @@ function activate(context) {
 			const cancelRequest = () => request.destroy();
 			lifetime.signal.addEventListener('abort', cancelRequest, { once: true });
 			const startedAt = Date.now();
+			const bodyBudget = permit ? permit.bytes / 2 : MAX_JSON_REQUEST_BODY;
 			let bytes = 0;
 			let requestStats, usageParser;
 			try {
@@ -614,14 +664,21 @@ function activate(context) {
 			lifetime.signal.throwIfAborted();
 			if (authenticationRetryAt > Date.now()) return sendError(response, 503, 'GENAI authentication is recovering; retry after the cooldown.', retryHeaders());
 			const chunks = []; let size = 0;
-			for await (const chunk of request) { lifetime.signal.throwIfAborted(); size += chunk.length; if (size > 20 * 1024 * 1024) return sendError(response, 413, 'Request too large'); chunks.push(chunk); }
+			for await (const chunk of request) {
+				lifetime.signal.throwIfAborted(); size += chunk.length;
+				if (size > MAX_JSON_REQUEST_BODY || request.method === 'POST' && size > bodyBudget) return sendError(response, 413, 'Request too large');
+				if (request.method === 'POST') chunks.push(chunk);
+			}
 			lifetime.signal.throwIfAborted();
 			const idleSeconds = vscode.workspace.getConfiguration('genai-login').get('idleTimeoutSeconds', 0);
 			const idleMs = Number.isInteger(idleSeconds) && idleSeconds >= 0 && idleSeconds <= 86400 ? idleSeconds * 1000 : 0;
 			lifetime.setIdleTimeout(idleMs);
-			const options = { method: request.method, body: request.method === 'POST' ? Buffer.concat(chunks) : undefined, headers: { 'content-type': 'application/json', Accept: 'application/json' }, signal: lifetime.signal, fetch: upstreamFetch, dispatcher };
+			const options = { method: request.method, body: request.method === 'POST' ? chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size) : undefined, headers: { 'content-type': 'application/json', Accept: 'application/json' }, signal: lifetime.signal, fetch: upstreamFetch, dispatcher };
+			chunks.length = 0;
+			permit?.shrink(options.body?.length || 0);
+			let requestPayload = request.method === 'POST' ? parseRequestBody(options.body) : undefined;
 			if (request.method === 'POST') {
-				requestStats = recordRequest(stats, options.body);
+				requestStats = recordRequest(stats, options.body, startedAt, requestPayload);
 				getHistory().start();
 				dashboard?.refresh();
 			}
@@ -647,8 +704,6 @@ function activate(context) {
 				return session.request(ORIGIN + routePath, requestOptions);
 			};
 			if (route === '/api/v1/chat/completions') {
-				let requestPayload;
-				try { requestPayload = JSON.parse(options.body.toString('utf8')); } catch { requestPayload = undefined; }
 				if (requestPayload && isImageChatModel(requestPayload.model)) {
 					const prompt = extractImagePrompt(requestPayload.messages);
 					if (!prompt) return sendError(response, 400, 'The image model requires a text prompt in the last user message');
@@ -659,7 +714,7 @@ function activate(context) {
 					lifetime.touch();
 					void persist();
 					if (!imageResult.ok) {
-						response.writeHead(imageResult.status, { 'content-type': imageResult.headers.get('content-type') || 'application/json' });
+						response.writeHead(imageResult.status, proxyResponseHeaders(imageResult.headers));
 						if (!imageResult.body) return response.end();
 						await forwardBody(imageResult.body, response, lifetime, chunk => { bytes += chunk.length; });
 						trace(`Proxy completed: status=${imageResult.status} elapsedMs=${Date.now() - startedAt} bytes=${bytes} image=chat`);
@@ -677,7 +732,7 @@ function activate(context) {
 					const usage = null;
 					if (requestPayload.stream) {
 						const { Readable } = require('node:stream');
-						response.writeHead(200, { 'content-type': 'text/event-stream' });
+						response.writeHead(200, proxyResponseHeaders(imageResult.headers, 'text/event-stream'));
 						const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: requestPayload.model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 						function* events() {
 							yield Buffer.from(chunk({ role: 'assistant', content: '' }));
@@ -691,11 +746,12 @@ function activate(context) {
 						return;
 					}
 					const body = Buffer.from(JSON.stringify({ id, object: 'chat.completion', created, model: requestPayload.model, choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage }));
-					response.writeHead(200, { 'content-type': 'application/json' });
+					response.writeHead(200, proxyResponseHeaders(imageResult.headers, 'application/json'));
 					trace(`Proxy completed: status=200 elapsedMs=${Date.now() - startedAt} bytes=${body.length} image=chat`);
 					return response.end(body);
 				}
 			}
+			requestPayload = undefined;
 			const result = await forwardUpstream(route, options);
 			if (!result) return;
 			lifetime.touch();
@@ -711,18 +767,19 @@ function activate(context) {
 				const data = await convertImageResponse(payload, (url, limit) => downloadPlatformImage(url, lifetime, limit));
 				if (!data.length) return sendError(response, 502, 'Image generation did not return a downloadable image');
 				const body = Buffer.from(JSON.stringify({ created: Math.floor(Date.now() / 1000), data }));
-				response.writeHead(200, { 'content-type': 'application/json' });
+				response.writeHead(200, proxyResponseHeaders(result.headers, 'application/json'));
 				trace(`Proxy completed: status=200 elapsedMs=${Date.now() - startedAt} bytes=${body.length} images=${data.length}`);
 				return response.end(body);
 			}
-			response.writeHead(result.status, { 'content-type': contentType });
+			response.writeHead(result.status, proxyResponseHeaders(result.headers, contentType));
 			if (!result.body) { settleRequest(requestStats); return response.end(); }
 			usageParser = createUsageParser(contentType, requestStats);
+			const normalizeStream = result.status === 200 && contentType.toLowerCase().includes('text/event-stream');
 			await forwardBody(result.body, response, lifetime, chunk => {
 				bytes += chunk.length;
-				usageParser.consume(chunk);
-				if (sessionAccepted && Date.now() - keepaliveSchedule.snapshot().lastActivityAt >= 15000) noteActivity(false);
-			}, result.status === 200 && contentType.toLowerCase().includes('text/event-stream'));
+				if (!normalizeStream) usageParser.consume(chunk);
+				if (sessionAccepted && Date.now() - keepaliveSchedule.lastActivityAt() >= 15000) noteActivity(false);
+			}, normalizeStream, usageParser.consumeEvent);
 			if (sessionAccepted) noteActivity(false);
 			trace(`Proxy completed: status=${result.status} elapsedMs=${Date.now() - startedAt} bytes=${bytes}`);
 			} catch (error) {

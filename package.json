@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.24-beta",
+  "version": "0.0.24",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",
@@ -56,6 +56,38 @@
           "maximum": 86400,
           "scope": "application",
           "description": "Upstream idle timeout in seconds; 0 disables it. Applies to new requests."
+        },
+        "genai-login.maxConcurrentRequests": {
+          "type": "integer",
+          "default": 32,
+          "minimum": 1,
+          "maximum": 256,
+          "scope": "application",
+          "description": "Maximum active bridge requests, including authentication wait and streaming. Reload participating windows after changing this limit."
+        },
+        "genai-login.maxQueuedRequests": {
+          "type": "integer",
+          "default": 64,
+          "minimum": 0,
+          "maximum": 1024,
+          "scope": "application",
+          "description": "Maximum bridge requests waiting for admission without buffering their full bodies. Excess requests receive HTTP 503 with Retry-After. Reload after changing."
+        },
+        "genai-login.maxBufferedRequestMiB": {
+          "type": "integer",
+          "default": 128,
+          "minimum": 40,
+          "maximum": 2048,
+          "scope": "application",
+          "description": "Reserved request-body budget in MiB, including temporary concatenation copies. Unknown-length bodies reserve twice the 20 MiB request limit. Not a total process memory limit. Reload after changing."
+        },
+        "genai-login.queueTimeoutSeconds": {
+          "type": "integer",
+          "default": 60,
+          "minimum": 1,
+          "maximum": 600,
+          "scope": "application",
+          "description": "Maximum admission queue wait, separate from authentication and upstream idle timeouts. Reload after changing."
         },
         "genai-login.imageMcp.enabled": {
           "type": "boolean",
@@ -152,7 +184,7 @@
     "jsonc-parser": "^3.3.1",
     "playwright-core": "^1.63.0",
     "tough-cookie": "^6.0.2",
-    "undici": "^7.30.0",
+    "undici": "^7.30.1",
     "zod": "^4.6.7"
   }
 }

@@ -82,6 +82,12 @@ Browser login starts at the GENAI home page and selects its UMPASS sign-in butto
 
 A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed initial verification blocks automatic login retries; use **连接 GENAI** after checking credentials or MFA. For a failed existing connection, select **重新连接** directly; disconnecting first is no longer required. The dashboard distinguishes a temporary health failure, a scheduled login retry and a verification failure requiring your attention.
 
+### Busy Bridge or Queue Timeout
+
+The bridge defaults to 32 active requests, 64 waiting requests and a 128 MiB request-body reservation budget. Waiting requests do not read their full bodies until admitted. When the queue is full or its 60-second deadline expires, the client receives HTTP `503` with `Retry-After`; this is local overload, not proof that your login expired. Cancelling a request removes it from the queue without cancelling shared MFA or other streams.
+
+The settings `genai-login.maxConcurrentRequests`, `genai-login.maxQueuedRequests`, `genai-login.maxBufferedRequestMiB` and `genai-login.queueTimeoutSeconds` control these limits. Reload participating windows after changing them. The body budget is not a total memory cap, and larger limits cannot bypass the platform's quotas. Upstream retry hints are forwarded so clients can respect server-requested delays; partially delivered responses and image requests are not automatically replayed.
+
 ### Remote Clients Cannot Connect
 
 The bridge listens on the VS Code client machine. A process running on a Remote-SSH host cannot reach it through that host's `127.0.0.1`. Use a client on the local machine; do not expose the bridge to untrusted networks.

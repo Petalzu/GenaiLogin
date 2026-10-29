@@ -56,7 +56,8 @@ function removableModels(config, endpoint) {
 	config.forEach((provider, providerIndex) => {
 		if (!Array.isArray(provider?.models)) return;
 		provider.models.forEach((model, modelIndex) => {
-			if (model && sameEndpoint(model.url, endpoint) && catalog.models.some(known => known.id === model.id || known.name === model.name || known.id === model.name)) {
+			if (model && sameEndpoint(model.url, endpoint) && (catalog.models.some(known => known.id === model.id || known.name === model.name || known.id === model.name) ||
+				model.id === 'DeepSeek-V4.1-Flash' || ['DeepSeek-V4.1-Flash', 'GENAI / DeepSeek-V4.1-Flash'].includes(model.name))) {
 				entries.push({ providerIndex, modelIndex, id: model.id, name: model.name || model.id });
 			}
 		});

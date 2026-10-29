@@ -18,6 +18,34 @@ suite('Extension Test Suite', () => {
 		assert.equal(payload.state.listening, true);
 		assert.equal(payload.state.port, port);
 	});
+	test('Production bridge admission, retry headers and shared SSE parsing work inside VS Code', async () => {
+		const { createBridgeAdmission, proxyResponseHeaders, forwardBody } = require('../dist/bridge-stream');
+		const { createUsageParser } = require('../dist/stats');
+		const { Writable } = require('node:stream');
+		const gate = createBridgeAdmission({ maxActive: 1, maxBytes: 10 });
+		const first = await gate.acquire(10, new AbortController().signal);
+		const controller = new AbortController();
+		const waiting = gate.acquire(1, controller.signal);
+		controller.abort();
+		await assert.rejects(waiting, { name: 'AbortError' });
+		first.release();
+		assert.equal(gate.snapshot().active, 0);
+		assert.equal(gate.snapshot().reservedBytes, 0);
+		assert.deepEqual(proxyResponseHeaders(new Headers({ 'retry-after': '7', 'set-cookie': 'private=fixture' })),
+			{ 'content-type': 'application/json', 'retry-after': '7' });
+		const state = { committed: false };
+		const parser = createUsageParser('text/event-stream', state);
+		const bytes = Buffer.from('data: {"choices":[{"delta":{"reasoning":"plan","content":"answer"}}],"usage":{"prompt_tokens":9,"completion_tokens":2}}\n\ndata: [DONE]\n\n');
+		const output = [];
+		const sink = new Writable({ write(chunk, encoding, done) { output.push(chunk); done(); } });
+		const body = new ReadableStream({ start(source) { source.enqueue(bytes); source.close(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true, parser.consumeEvent);
+		parser.finish();
+		assert.equal(state.tokensIn, 9);
+		assert.equal(state.tokensOut, 2);
+		assert.equal(parser.formatting.parsedEvents, 1);
+		assert.equal(Buffer.concat(output).toString().split('data: ').length - 1, 3);
+	});
 	test('One-click drawing MCP enables a native server and discovers its tool inside VS Code', async function () {
 		this.timeout(15000);
 		const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
@@ -96,12 +124,12 @@ suite('Extension Test Suite', () => {
 		const { mkdtemp } = require('node:fs/promises');
 		const { tmpdir } = require('node:os');
 		const { join } = require('node:path');
-		const { createHistory, createHistoryFiles } = require('../stats');
+		const { createHistory, createHistoryFiles } = require('../dist/stats');
 		const directory = vscode.Uri.file(await mkdtemp(join(tmpdir(), 'genai-history-vscode-')));
 		const storage = () => ({ get() {}, keys: () => [], update: () => assert.fail('history must not write a shared Memento') });
 		const errors = [];
 		const create = () => createHistory(storage(), () => errors.push('history error'),
-			createHistoryFiles(vscode.workspace.fs, directory, vscode.Uri.joinPath));
+			createHistoryFiles(vscode.workspace.fs, directory, vscode.Uri.joinPath, error => errors.push(error?.code || 'file error')));
 		try {
 			const first = create(); const second = create();
 			first.start(); second.start(); await Promise.all([first.flush(), second.flush()]);
@@ -109,7 +137,11 @@ suite('Extension Test Suite', () => {
 			const restored = create(); await restored.reload();
 			assert.equal(restored.snapshot().requests, 3);
 			assert.deepEqual(errors, []);
-			assert.equal((await vscode.workspace.fs.readDirectory(directory)).length, 2);
+			const entries = await vscode.workspace.fs.readDirectory(directory);
+			assert.equal(entries.filter(([name]) => name.startsWith('usageHistory.window.') && name.endsWith('.json')).length, 2);
+			assert.equal(entries.filter(([name]) => name.endsWith('.tmp')).length, 0);
+			const cached = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(directory, 'usageHistory.total.v1.json'))));
+			assert.equal(cached.total.requests, 3);
 		} finally { await vscode.workspace.fs.delete(directory, { recursive: true }); }
 	});
 });

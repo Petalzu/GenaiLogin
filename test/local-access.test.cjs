@@ -25,7 +25,7 @@ function connectionHarness(options = {}) {
     const fakeVscode = {
         workspace: {
             getConfiguration: () => ({
-                get: (key, fallback) => key === 'idleTimeoutSeconds' ? options.idleSeconds || 0 : key === 'port' ? options.port || fallback : key === 'imageMcp.enabled' ? mcpEnabled : fallback,
+                get: (key, fallback) => key === 'idleTimeoutSeconds' ? options.idleSeconds || 0 : key === 'port' ? options.port || fallback : key === 'imageMcp.enabled' ? mcpEnabled : options.limits?.[key] ?? fallback,
                 update: async (...args) => {
                     updates.push(args); mcpEnabled = args[1];
                     configurationChanged?.({ affectsConfiguration: name => name === 'genai-login.imageMcp.enabled' });
@@ -60,9 +60,10 @@ function connectionHarness(options = {}) {
         const { promises } = fs;
         const uri = path => ({ path, fsPath: path });
         fakeVscode.Uri = { ...fakeVscode.Uri, joinPath: (base, ...parts) => uri(require('node:path').join(base.fsPath, ...parts)) };
-        fakeVscode.workspace.fs = {
+        fakeVscode.workspace.fs = options.fileSystem || {
             createDirectory: target => promises.mkdir(target.fsPath, { recursive: true }),
             readDirectory: async target => (await promises.readdir(target.fsPath)).map(name => [name, 1]),
+            stat: async target => { const info = await promises.stat(target.fsPath); return { mtime: info.mtimeMs, ctime: info.ctimeMs, size: info.size }; },
             readFile: target => promises.readFile(target.fsPath),
             writeFile: (target, bytes) => promises.writeFile(target.fsPath, bytes),
             rename: (source, destination) => promises.rename(source.fsPath, destination.fsPath)
@@ -106,6 +107,7 @@ function connectionHarness(options = {}) {
     if (!options.deferDashboard) provider.resolveWebviewView({ visible: false, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => disposable },
         onDidChangeVisibility: () => disposable, onDidDispose: () => disposable });
     return { loginCalls, timers, servers, messages, secrets, loaded, ready, commands, mcpProvider, updates, notices, traces,
+        showDashboard: view => provider.resolveWebviewView(view),
         action: name => commands.get(`genai-login.${name}`)(),
         snapshot: () => provider.getState(),
         dispose: () => { for (const item of subscriptions) item.dispose(); }
@@ -120,6 +122,181 @@ function chatExchange(url = '/v1/chat/completions', body = '{"model":"test","str
         destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from(body); } };
     return { request, response, chunks };
 }
+
+test('bridge preserves upstream retry hints without forwarding private or hop-by-hop headers', async () => {
+    for (const route of ['/v1/chat/completions', '/v1/images/generations']) {
+        const bodies = [];
+        const harness = connectionHarness({ request: async (url, options) => {
+            bodies.push(options.body);
+            return new Response('{"error":{"message":"limited"}}', { status: 429, headers: {
+                'content-type': 'application/json', 'retry-after': '7', 'retry-after-ms': '7000', 'x-request-id': 'fixture-request',
+                'set-cookie': 'private=fixture', authorization: 'private', connection: 'close', 'content-length': '31'
+            } });
+        } });
+        try {
+            await harness.ready;
+            await harness.action('connect');
+            const body = '{ "model": "DeepSeek-V4.1-Flash-1017", "stream": false, "tools": [], "messages": [] }';
+            const exchange = chatExchange(route, body);
+            const completed = new Promise(resolve => exchange.response.once('finish', resolve));
+            harness.servers[0].handle(exchange.request, exchange.response);
+            await completed; await nextTurn();
+            assert.equal(exchange.response.status, 429);
+            assert.equal(exchange.response.headers['retry-after'], '7');
+            assert.equal(exchange.response.headers['retry-after-ms'], '7000');
+            assert.equal(exchange.response.headers['x-request-id'], 'fixture-request');
+            for (const header of ['set-cookie', 'authorization', 'connection', 'content-length']) assert.equal(exchange.response.headers[header], undefined);
+            assert.equal(bodies.length, 1);
+            assert.deepEqual(bodies[0], Buffer.from(body));
+            assert.equal(harness.snapshot().requests, 1);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('bridge admission queues before reading bodies, rejects overflow and skips cancelled requests', async () => {
+    const releases = [];
+    let forwarded = 0;
+    const reads = [];
+    const harness = connectionHarness({ limits: { maxConcurrentRequests: 1, maxQueuedRequests: 2 }, request: async () => {
+        forwarded++;
+        return new Response(new ReadableStream({ start(controller) {
+            releases.push(() => { controller.enqueue(Buffer.from('data: {"usage":{"prompt_tokens":11,"completion_tokens":2}}\n\ndata: [DONE]\n\n')); controller.close(); });
+        } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const exchange = name => {
+        const value = chatExchange();
+        const original = value.request[Symbol.asyncIterator].bind(value.request);
+        value.request[Symbol.asyncIterator] = async function* () { reads.push(name); yield* original(); };
+        return value;
+    };
+    try {
+        await harness.ready; await harness.action('connect');
+        const first = exchange('first');
+        harness.servers[0].handle(first.request, first.response);
+        await nextTurn();
+        const cancelled = exchange('cancelled'), second = exchange('second'), rejected = exchange('rejected');
+        for (const value of [cancelled, second, rejected]) harness.servers[0].handle(value.request, value.response);
+        await nextTurn();
+        assert.deepEqual(reads, ['first']);
+        assert.equal(forwarded, 1);
+        assert.equal(harness.snapshot().bridge.queued, 2);
+        assert.equal(rejected.response.status, 503);
+        assert.equal(rejected.response.headers['retry-after'], '1');
+        cancelled.response.destroy(); await nextTurn();
+        assert.equal(cancelled.request.destroyed, true);
+        assert.equal(harness.snapshot().bridge.queued, 1);
+        releases.shift()(); await nextTurn(); await nextTurn();
+        assert.deepEqual(reads, ['first', 'second']);
+        assert.equal(forwarded, 2);
+        releases.shift()(); await nextTurn(); await nextTurn();
+        const state = harness.snapshot();
+        assert.equal(state.bridge.active, 0);
+        assert.equal(state.bridge.queued, 0);
+        assert.equal(state.bridge.reservedBytes, 0);
+        assert.equal(state.requests, 2);
+        assert.equal(state.tokensIn, 22);
+        assert.equal(state.tokensOut, 4);
+    } finally { for (const release of releases) release(); harness.dispose(); }
+});
+
+test('queued requests respect authentication failure and cooldown changes before admission', async () => {
+    for (const blocked of [true, false]) {
+        let fail;
+        let reads = 0;
+        const harness = connectionHarness({ limits: { maxConcurrentRequests: 1 },
+            login: () => new Promise((resolve, reject) => { fail = reject; }) });
+        try {
+            await harness.ready;
+            const requests = Array.from({ length: 3 }, () => {
+                const value = chatExchange();
+                value.request[Symbol.asyncIterator] = async function* () { reads++; yield Buffer.from('{}'); };
+                harness.servers[0].handle(value.request, value.response);
+                return value;
+            });
+            await nextTurn();
+            assert.equal(harness.loginCalls.length, 1);
+            fail(blocked ? Object.assign(new Error('MFA incomplete'), { name: 'TimeoutError' }) :
+                Object.assign(new Error('temporary outage'), { code: 'SESSION_UNAVAILABLE', status: 503 }));
+            await nextTurn(); await nextTurn();
+            assert.equal(harness.loginCalls.length, 1);
+            assert.equal(reads, 0);
+            assert.equal(requests[1].response.status, blocked ? 401 : 503);
+            assert.equal(requests[2].response.status, blocked ? 401 : 503);
+            if (!blocked) assert.ok(Number(requests[1].response.headers['retry-after']) >= 1);
+            assert.equal(harness.snapshot().bridge.active, 0);
+            assert.equal(harness.snapshot().bridge.queued, 0);
+        } finally { harness.dispose(); }
+    }
+});
+
+test('bridge byte reservations bound unknown-length uploads independently of active count and release on disconnect', async () => {
+    let reads = 0;
+    let releaseUpload;
+    const upload = new Promise(resolve => { releaseUpload = resolve; });
+    const harness = connectionHarness({ limits: { maxConcurrentRequests: 8, maxBufferedRequestMiB: 40 },
+        request: () => assert.fail('incomplete upload must not reach the upstream') });
+    try {
+        await harness.ready; await harness.action('connect');
+        const requests = Array.from({ length: 3 }, () => {
+            const value = chatExchange();
+            value.request[Symbol.asyncIterator] = async function* () { reads++; yield Buffer.from('{'); await upload; yield Buffer.from('}'); };
+            value.response.on('error', () => {});
+            harness.servers[0].handle(value.request, value.response);
+            return value;
+        });
+        await nextTurn();
+        assert.equal(reads, 1);
+        assert.equal(harness.snapshot().bridge.active, 1);
+        assert.equal(harness.snapshot().bridge.queued, 2);
+        assert.equal(harness.snapshot().bridge.reservedBytes, 40 * 1024 * 1024);
+        await harness.action('disconnect'); releaseUpload(); await nextTurn(); await nextTurn();
+        assert.equal(harness.snapshot().bridge.active, 0);
+        assert.equal(harness.snapshot().bridge.queued, 0);
+        assert.equal(harness.snapshot().bridge.reservedBytes, 0);
+        assert.equal(reads, 1);
+        assert.ok(requests.every(value => value.request.destroyed));
+    } finally { releaseUpload(); harness.dispose(); }
+});
+
+test('oversized declared bodies are refused before authentication or body reads', async () => {
+    const harness = connectionHarness({ get: () => assert.fail('oversized requests must not read secrets') });
+    try {
+        await harness.ready;
+        const exchange = chatExchange();
+        exchange.request.headers['content-length'] = String(20 * 1024 * 1024 + 1);
+        exchange.request[Symbol.asyncIterator] = () => assert.fail('oversized request body must not be read');
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await nextTurn();
+        assert.equal(exchange.response.status, 413);
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.snapshot().bridge, undefined);
+    } finally { harness.dispose(); }
+});
+
+test('bridge queue timeout returns retryable overload without reading the queued body', { timeout: 4000 }, async () => {
+    let release;
+    let reads = 0;
+    const harness = connectionHarness({ limits: { maxConcurrentRequests: 1, queueTimeoutSeconds: 1 },
+        request: async () => new Response(new ReadableStream({ start(controller) { release = () => controller.close(); } }),
+            { headers: { 'content-type': 'text/event-stream' } }) });
+    try {
+        await harness.ready; await harness.action('connect');
+        const first = chatExchange();
+        harness.servers[0].handle(first.request, first.response); await nextTurn();
+        const waiting = chatExchange();
+        waiting.request[Symbol.asyncIterator] = async function* () { reads++; yield Buffer.from('{}'); };
+        const finished = new Promise(resolve => waiting.response.once('finish', resolve));
+        harness.servers[0].handle(waiting.request, waiting.response);
+        await finished;
+        assert.equal(waiting.response.status, 503);
+        assert.equal(waiting.response.headers['retry-after'], '1');
+        assert.equal(reads, 0);
+        assert.equal(harness.snapshot().bridge.queued, 0);
+        assert.equal(harness.snapshot().bridge.active, 1);
+        release(); release = undefined; await nextTurn(); await nextTurn();
+        assert.equal(harness.snapshot().bridge.active, 0);
+    } finally { release?.(); harness.dispose(); }
+});
 
 test('activation listens only on loopback without reading credentials or loading authentication', async () => {
     const harness = connectionHarness({ get: () => assert.fail('startup must not read secrets') });
@@ -148,6 +325,68 @@ test('activation without a dashboard does not initialize or read usage history',
         assert.equal(harness.servers[0].listening, true);
         assert.equal(harness.loaded.includes('node:crypto'), false);
     } finally { harness.dispose(); }
+});
+
+test('dashboard HTML is assigned immediately while all history IO remains blocked', async () => {
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const reads = [];
+    const view = { visible: true, webview: { postMessage() {}, onDidReceiveMessage: () => ({ dispose() {} }) },
+        onDidChangeVisibility: () => ({ dispose() {} }), onDidDispose: () => ({ dispose() {} }) };
+    const harness = connectionHarness({ deferDashboard: true, directory: '/history',
+        get: () => assert.fail('opening the dashboard must not read credentials'),
+        globalState: { get: key => key === 'usageHistory.summary.v2' ? { requests: 10, tokensIn: 100 } : undefined, keys: () => [] },
+        fileSystem: {
+            createDirectory: async () => {}, readDirectory: async () => [],
+            readFile: async target => { reads.push(target.fsPath); await blocked; throw new Error('no cache'); }
+        } });
+    try {
+        await harness.ready;
+        assert.equal(reads.length, 0);
+        const result = harness.showDashboard(view);
+        assert.equal(result, undefined);
+        assert.match(view.webview.html, /data-command="connect"/);
+        const initial = JSON.parse(view.webview.html.match(/const initialState = ([^\n]+);/)[1]);
+        assert.equal(initial.listening, true);
+        assert.equal(initial.historyState, 'loading');
+        assert.equal(initial.history, undefined);
+        assert.equal(harness.snapshot().history, undefined);
+        assert.equal(harness.loginCalls.length, 0);
+        release(); await nextTurn();
+        assert.equal(harness.snapshot().history.requests, 10);
+        assert.equal(harness.snapshot().historyState, 'ready');
+    } finally { release(); harness.dispose(); }
+});
+
+test('dashboard shows a cached full total before history directory validation completes', async () => {
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const total = { requests: 30, tokensIn: 300, tokensOut: 3, inputUsageReports: 30, outputUsageReports: 30 };
+    const cached = Buffer.from(JSON.stringify({ version: 1, total, windowTotal: total, records: [], legacy: 'null' }));
+    const messages = [];
+    const view = { visible: true, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => ({ dispose() {} }) },
+        onDidChangeVisibility: () => ({ dispose() {} }), onDidDispose: () => ({ dispose() {} }) };
+    const harness = connectionHarness({ deferDashboard: true, directory: '/history',
+        get: () => assert.fail('cached history must not read credentials'),
+        fileSystem: {
+            createDirectory: async () => {}, readFile: async () => cached,
+            readDirectory: async () => { await blocked; return []; },
+            stat: () => assert.fail('there are no window files to stat')
+        } });
+    try {
+        await harness.ready;
+        harness.showDashboard(view);
+        assert.match(view.webview.html, /data-command="connect"/);
+        await nextTurn();
+        assert.equal(messages.at(-1).history.requests, 30);
+        assert.equal(messages.at(-1).history.tokensIn, 300);
+        assert.equal(messages.at(-1).historyState, 'ready');
+        assert.equal(harness.loginCalls.length, 0);
+        harness.showDashboard(view);
+        const initial = JSON.parse(view.webview.html.match(/const initialState = ([^\n]+);/)[1]);
+        assert.equal(initial.history.requests, 30);
+        release(); await nextTurn();
+    } finally { release(); harness.dispose(); }
 });
 
 test('drawing MCP setup is available from the dashboard and command palette', async () => {
@@ -624,6 +863,49 @@ test('real loopback HTTP requests initialize once and forward both chat and imag
         assert.deepEqual(Buffer.from((await image.json()).data[0].b64_json, 'base64'), pngImage);
         assert.equal(harness.loginCalls.length, 1);
     } finally { harness.dispose(); }
+});
+
+test('real HTTP bridge handles 64 queued streams within configured admission limits', { timeout: 10000 }, async () => {
+    const { Agent, fetch: request } = require('undici');
+    const probe = require('node:http').createServer();
+    await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise(resolve => probe.close(resolve));
+    const agent = new Agent({ connections: 64 });
+    let active = 0, peak = 0;
+    const harness = connectionHarness({ realHttp: true, port, deferDashboard: true,
+        limits: { maxConcurrentRequests: 4, maxQueuedRequests: 64 }, request: async () => {
+            active++; peak = Math.max(peak, active);
+            return new Response(new ReadableStream({ start(controller) {
+                setTimeout(() => {
+                    active--;
+                    controller.enqueue(Buffer.from('data: {"choices":[{"delta":{"content":"fixture"}}]}\n\ndata: {"usage":{"prompt_tokens":100,"completion_tokens":2}}\n\ndata: [DONE]\n\n'));
+                    controller.close();
+                }, 5);
+            } }), { headers: { 'content-type': 'text/event-stream', 'x-request-id': 'load-fixture' } });
+        } });
+    try {
+        await harness.ready;
+        await Promise.all(Array.from({ length: 64 }, async () => {
+            const response = await request(`http://127.0.0.1:${port}/v1/chat/completions`, { dispatcher: agent, method: 'POST',
+                headers: { Authorization: 'Bearer local-browser-session', 'content-type': 'application/json' },
+                body: '{"model":"DeepSeek-V4.1-Flash-1017","stream":true,"messages":[]}' });
+            assert.equal(response.status, 200);
+            assert.equal(response.headers.get('x-request-id'), 'load-fixture');
+            assert.ok((await response.text()).endsWith('data: [DONE]\n\n'));
+        }));
+        await nextTurn();
+        assert.ok(peak <= 4);
+        assert.ok(peak > 1);
+        assert.equal(harness.loginCalls.length, 1);
+        const state = harness.snapshot();
+        assert.equal(state.requests, 64);
+        assert.equal(state.tokensIn, 6400);
+        assert.equal(state.tokensOut, 128);
+        assert.equal(state.bridge.active, 0);
+        assert.equal(state.bridge.queued, 0);
+        assert.equal(state.bridge.reservedBytes, 0);
+    } finally { harness.dispose(); await agent.destroy(); }
 });
 
 test('native MCP discovery stays idle and the first drawing tool call logs in through the real bridge', { timeout: 10000 }, async () => {
@@ -1474,7 +1756,7 @@ test('port action validates, cancels, resets and saves only user settings', asyn
 });
 
 test('observer yields the occupied port and synchronizes without loading authentication or changing credentials', async () => {
-    const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
+    const source = fs.readFileSync(process.env.GENAI_EXTENSION_MODULE || require.resolve('../extension.js'), 'utf8');
     const commands = new Map();
     const messages = [];
     const subscriptions = [];
@@ -1528,7 +1810,10 @@ test('observer yields the occupied port and synchronizes without loading authent
         }
     };
     vm.runInNewContext(source, sandbox);
-    sandbox.module.exports.activate({ subscriptions, globalState: { keys: () => [], get() {}, update: async () => {} }, secrets: {
+    const localHistory = { requests: 30, tokensIn: 340, tokensOut: 560 };
+    sandbox.module.exports.activate({ subscriptions, globalState: {
+        keys: () => [], get: key => key === 'usageHistory.summary.v2' ? localHistory : undefined, update: async () => {}
+    }, secrets: {
         get: () => assert.fail('observer must not read credentials'),
         store: () => assert.fail('observer must not write credentials'),
         delete: () => assert.fail('observer must not delete credentials')
@@ -1550,6 +1835,17 @@ test('observer yields the occupied port and synchronizes without loading authent
         assert.match(messages.at(-1).status, /shared window/);
         assert.equal(messages.at(-1).tokensOut, 56);
         assert.equal(messages.at(-1).models[0].name, 'test-model');
+        assert.equal(messages.at(-1).history.requests, 30);
+        snapshot.history = { requests: 2, tokensIn: 3, tokensOut: 4 };
+        poll(); await nextTurn();
+        assert.equal(messages.at(-1).history.requests, 30);
+        snapshot.history = { requests: 31, tokensIn: 350, tokensOut: 570 };
+        poll(); await nextTurn();
+        assert.equal(messages.at(-1).history.requests, 31);
+        snapshot.historyState = 'loading';
+        poll(); await nextTurn();
+        assert.equal(messages.at(-1).history.requests, 30);
+        delete snapshot.historyState;
         for (const action of ['connect', 'diagnose', 'disconnect', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
         assert.equal(notices, 4);
         snapshot.requests = 23;

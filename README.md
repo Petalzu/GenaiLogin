@@ -77,7 +77,7 @@ After VS Code finishes starting, the extension opens a loopback listener without
 
 Production builds keep the dashboard, Cookie session, network client and model configuration in separate on-demand bundles. History initialization waits for a status/dashboard request or an API connection, and streaming dependencies load when a response needs them. When browser authentication is necessary, a short-lived helper process owns Playwright and Edge; it exits after normal verification so those dependencies do not remain in the extension host. Credentials and Cookie updates travel through local IPC, not command-line arguments or temporary files. A diagnostic helper stays open only while its browser is retained.
 
-The drawing MCP bundle uses the official SDK's ESM distribution with a fixed tool schema and one shared, lazily compiled input validator. Image decoding and file saving proceed one image at a time rather than retaining every decoded image. The dashboard reuses unchanged lists and runs its uptime timer only while connected and visible.
+The drawing MCP bundle uses the official SDK's ESM distribution with a fixed tool schema and one shared, lazily compiled input validator. Image decoding and file saving proceed one image at a time rather than retaining every decoded image. The dashboard caches its static elements, skips unchanged DOM writes, reuses unchanged lists and runs its uptime timer only while connected and visible. Request updates reuse the loaded history base instead of repeatedly aggregating older records; streaming diagnostics avoid per-event temporary arrays where possible.
 
 Concurrent requests share one login. Cancelling a waiting client releases that request without cancelling the shared login or forwarding the cancelled request later. The first request can wait for MFA, so the client's own request timeout must allow enough time for verification. The extension must be enabled and a desktop VS Code window must remain open; an HTTP request cannot launch a closed VS Code application.
 
@@ -89,7 +89,15 @@ Open VS Code Settings and search for **GENAI Login**.
 
 - **`genai-login.port`**: local bridge port. Default: `58379`; range: `1024-65535`. Changing it requires reloading participating windows and updating client URLs.
 - **`genai-login.idleTimeoutSeconds`**: maximum time without upstream response data. Default: `0` (disabled); range: `0-86400`. Applies to new requests and pauses during authentication. This is not a total generation deadline.
+- **`genai-login.maxConcurrentRequests`**: maximum active bridge requests, including authentication wait and response streaming. Default: `32`; range: `1-256`.
+- **`genai-login.maxQueuedRequests`**: maximum requests waiting for admission. Default: `64`; range: `0-1024`. A full queue returns HTTP `503` with `Retry-After` instead of starting another upstream request.
+- **`genai-login.maxBufferedRequestMiB`**: reserved request-body budget, including the temporary concatenation copy. Default: `128` MiB; range: `40-2048`. Unknown-length uploads initially reserve twice the 20 MiB request limit; reservations shrink to the retained body size after upload. This is not a total process memory limit.
+- **`genai-login.queueTimeoutSeconds`**: maximum admission queue wait. Default: `60`; range: `1-600`. This deadline is separate from authentication and upstream idle timeouts.
 - **`genai-login.imageMcp.enabled`**: enable the built-in Qwen Image 2.1 MCP provider. Default: `false`; the one-click command sets it to `true`. Disable it in user settings to remove the provider's server from discovery. Generated files are retained until you delete them.
+
+Reload participating windows after changing admission limits. The owner window enforces one FIFO queue across chat, image and model requests; queued requests do not buffer their complete bodies, and cancellation removes them immediately. Internal status and MCP discovery remain outside generation admission; MCP image calls use the same image-request queue. Raising concurrency does not raise upstream account limits.
+
+Chat request metadata is parsed once without rewriting the forwarded body. Streaming usage and mixed-reasoning normalization share decoded events, preserving ordinary SSE bytes, tool calls and final usage. Response activity reads a lightweight timestamp; Cookie expiry still follows the original health-check schedule. Upstream `Retry-After`, `retry-after-ms` and request identifiers are forwarded through an explicit header allowlist, without cookies or hop-by-hop headers.
 
 ### Session Health
 
@@ -104,6 +112,8 @@ One VS Code window owns each bridge port, including while waiting for the first 
 ## Usage Statistics
 
 The dashboard records request attempts and token usage reported by GENAI. Missing token usage is not estimated. History is local to the extension storage and survives disconnects and credential clearing; unfinished responses or pending writes may be lost if VS Code exits unexpectedly.
+
+The dashboard opens without waiting for history IO. A single `usageHistory.total.v1.json` cache supplies the last saved total while independent window records are checked in the background; only changed records are reread. Updates are coalesced in the background. Per-window records remain authoritative, so concurrent or stale cache writes cannot erase another window's usage. A missing or damaged cache is rebuilt without changing historical model assignments or prices.
 
 Cost estimates use reference model rates and documented assumptions. They are not GENAI billing records. See [PRICING.md](PRICING.md) for rates and estimation details.
 

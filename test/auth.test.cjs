@@ -144,6 +144,18 @@ test('token expiry metadata respects both Cookie and JWT deadlines without grant
     assert.equal(session.expiresAt(), (exp - 300) * 1000);
 });
 
+test('stream activity timestamps do not read cookies or token expiry', () => {
+    let now = 0, checks = 0;
+    const schedule = createKeepaliveSchedule({ expiresAt: () => { checks++; return 180000; } }, () => now);
+    for (let index = 0; index < 1000; index++) assert.equal(schedule.lastActivityAt(), 0);
+    assert.equal(checks, 0);
+    now = 123; schedule.activity(false);
+    assert.equal(schedule.lastActivityAt(), 123);
+    assert.equal(checks, 0);
+    assert.equal(schedule.snapshot().expiresAt, 180000);
+    assert.equal(checks, 1);
+});
+
 test('activity suppresses redundant checks but never exceeds a five-minute health gap', () => {
     let now = 0;
     const schedule = createKeepaliveSchedule({}, () => now);

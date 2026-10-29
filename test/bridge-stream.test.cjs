@@ -3,7 +3,63 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { setTimeout: delay } = require('node:timers/promises');
-const { createRequestLifetime, waitForSignal, forwardBody, transportCode } = require('../bridge-stream');
+const { createRequestLifetime, waitForSignal, forwardBody, createBridgeAdmission, transportCode } = require('../bridge-stream');
+
+test('admission bounds active requests and bytes, preserves FIFO and removes cancelled waiters', async () => {
+	const gate = createBridgeAdmission({ maxActive: 2, maxQueued: 2, maxBytes: 10 });
+	const signal = new AbortController().signal;
+	const first = await gate.acquire(6, signal);
+	const cancelled = new AbortController();
+	const waiting = gate.acquire(5, cancelled.signal);
+	const behind = gate.acquire(1, signal);
+	assert.equal(gate.snapshot().active, 1);
+	assert.equal(gate.snapshot().queued, 2);
+	await assert.rejects(gate.acquire(1, signal), { code: 'BRIDGE_BUSY' });
+	cancelled.abort();
+	await assert.rejects(waiting, { name: 'AbortError' });
+	const second = await behind;
+	assert.equal(gate.snapshot().active, 2);
+	assert.equal(gate.snapshot().reservedBytes, 7);
+	first.release(); first.release(); second.release();
+	assert.equal(gate.snapshot().active, 0);
+	assert.equal(gate.snapshot().reservedBytes, 0);
+	const blocked = new AbortController(); blocked.abort();
+	assert.throws(() => gate.acquire(1, blocked.signal), { name: 'AbortError' });
+	await assert.rejects(gate.acquire(11, signal), { code: 'BRIDGE_BUSY' });
+});
+
+test('admission shrinking releases only unused bytes and wakes queued requests in order', async () => {
+	const gate = createBridgeAdmission({ maxActive: 3, maxBytes: 10 });
+	const signal = new AbortController().signal;
+	const first = await gate.acquire(10, signal);
+	const waiting = gate.acquire(8, signal);
+	first.shrink(2);
+	const second = await waiting;
+	assert.equal(gate.snapshot().active, 2);
+	assert.equal(gate.snapshot().reservedBytes, 10);
+	first.shrink(8); first.shrink(-1);
+	assert.equal(gate.snapshot().reservedBytes, 10);
+	first.release(); second.shrink(0);
+	assert.equal(gate.snapshot().active, 1);
+	assert.equal(gate.snapshot().reservedBytes, 0);
+	second.release(); second.shrink(1);
+	assert.equal(gate.snapshot().active, 0);
+});
+
+test('admission queue deadlines release waiters without cancelling active requests', async context => {
+	context.mock.timers.enable({ apis: ['setTimeout'] });
+	const gate = createBridgeAdmission({ maxActive: 1, maxQueued: 1, maxBytes: 10, queueTimeoutMs: 100 });
+	const first = await gate.acquire(1, new AbortController().signal);
+	const waiting = gate.acquire(1, new AbortController().signal);
+	context.mock.timers.tick(101);
+	await assert.rejects(waiting, { code: 'BRIDGE_QUEUE_TIMEOUT' });
+	assert.equal(gate.snapshot().queued, 0);
+	assert.equal(gate.snapshot().active, 1);
+	first.release();
+	const next = await gate.acquire(1, new AbortController().signal);
+	next.release();
+	assert.equal(gate.snapshot().reservedBytes, 0);
+});
 
 test('production network bundle preserves streaming, cookies and request cancellation', { timeout: 5000 }, async () => {
 	const http = require('node:http');
@@ -313,6 +369,101 @@ test('SSE metadata and metadata-only thinking cannot bypass separation', async (
 		assert.equal(parsed[0].usage, undefined);
 		assert.equal(parsed[1].choices[0].finish_reason, 'stop');
 	}
+});
+
+test('shared SSE decoding parses each event once and preserves usage and mixed reasoning diagnostics', async () => {
+	const fs = require('node:fs');
+	const vm = require('node:vm');
+	const { createUsageParser } = require('../stats');
+	let parses = 0;
+	const sandbox = { module: { exports: {} }, require, Buffer, AbortController, AbortSignal, DOMException, setTimeout, clearTimeout,
+		JSON: { parse: text => { parses++; return JSON.parse(text); }, stringify: JSON.stringify } };
+	vm.runInNewContext(fs.readFileSync(require.resolve('../bridge-stream'), 'utf8'), sandbox);
+	const event = { choices: [{ index: 0, delta: { content: 'answer\n', reasoning: 'plan', tool_calls: [{ index: 0 }] } }],
+		usage: { prompt_tokens: 10, completion_tokens: 2 } };
+	const text = ': heartbeat\r\n\r\ndata: ' + JSON.stringify(event) + '\r\n\r\ndata: {"usage":{"completion_tokens":3}}\n\ndata: [DONE]\n\n';
+	const bytes = Buffer.from(text);
+	const state = { committed: false };
+	const parser = createUsageParser('text/event-stream', state);
+	const expectedState = { committed: false };
+	const expected = createUsageParser('text/event-stream', expectedState);
+	expected.consume(bytes); expected.finish();
+	let offset = 0, observed = 0;
+	const output = [];
+	const body = new ReadableStream({ pull(controller) {
+		if (offset === bytes.length) controller.close();
+		else controller.enqueue(bytes.subarray(offset, ++offset));
+	} });
+	const sink = new Writable({ write(chunk, encoding, done) { output.push(chunk); done(); } });
+	await sandbox.module.exports.forwardBody(body, sink, { signal: new AbortController().signal, touch() {} },
+		chunk => { observed += chunk.length; }, true, parser.consumeEvent);
+	parser.finish(); parser.finish();
+	assert.equal(parses, 2);
+	assert.equal(observed, bytes.length);
+	assert.deepEqual(state, expectedState);
+	assert.deepEqual(parser.formatting, expected.formatting);
+	assert.equal(state.tokensOut, 3);
+	assert.ok(Buffer.concat(output).toString().endsWith('data: [DONE]\n\n'));
+});
+
+test('shared SSE decoding handles CR-only and multiline data across UTF-8 byte boundaries', async () => {
+	const { createUsageParser } = require('../stats');
+	for (const newline of ['\r', '\r\n', '\n']) {
+		const input = Buffer.from('event: message' + newline + 'data: {"choices":[{"delta":{"content":"\u4e2d\u6587"}}],' + newline +
+			'data: "usage":{"prompt_tokens":13,"completion_tokens":7}}' + newline + newline + 'data: [DONE]' + newline + newline);
+		let offset = 0;
+		const state = { committed: false };
+		const parser = createUsageParser('text/event-stream', state);
+		const output = [];
+		const body = new ReadableStream({ pull(controller) { if (offset === input.length) controller.close(); else controller.enqueue(input.subarray(offset, ++offset)); } });
+		const sink = new Writable({ write(chunk, encoding, done) { output.push(chunk); done(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true, parser.consumeEvent);
+		parser.finish();
+		assert.deepEqual(Buffer.concat(output), input);
+		assert.equal(state.tokensIn, 13);
+		assert.equal(state.tokensOut, 7);
+		assert.equal(parser.formatting.parsedEvents, 1);
+	}
+});
+
+test('shared SSE decoding retains a received usage event on upstream failure without completing the response', async () => {
+	const { createUsageParser } = require('../stats');
+	const state = { committed: false };
+	const parser = createUsageParser('text/event-stream', state);
+	let broken;
+	const body = new ReadableStream({ start(controller) {
+		controller.enqueue(Buffer.from('data: {"usage":{"prompt_tokens":7,"completion_tokens":2}}'));
+		broken = () => controller.error(new Error('fixture disconnect'));
+	} });
+	let observed;
+	const consumed = new Promise(resolve => { observed = resolve; });
+	const sink = new Writable({ write(chunk, encoding, done) { done(); } });
+	const forwarding = forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, observed, true, parser.consumeEvent);
+	await consumed; broken();
+	await assert.rejects(forwarding, /fixture disconnect/);
+	parser.finish();
+	assert.equal(state.tokensIn, 7);
+	assert.equal(state.tokensOut, 2);
+	assert.equal(parser.formatting.parsedEvents, 1);
+	assert.equal(sink.destroyed, true);
+});
+
+test('shared SSE decoding keeps usage size limits and preserves malformed or oversized bytes', async () => {
+	const { createUsageParser, MAX_SSE_LINE_LENGTH } = require('../stats');
+	const oversized = 'data: ' + JSON.stringify({ padding: 'x'.repeat(MAX_SSE_LINE_LENGTH), usage: { prompt_tokens: 9999 } }) + '\n\n';
+	const input = Buffer.from(': heartbeat\n\n' + oversized + 'data: invalid\n\ndata: {"usage":{"prompt_tokens":7}}\n\ndata: [DONE]\n\n');
+	const state = { committed: false };
+	const parser = createUsageParser('text/event-stream', state);
+	const chunks = [];
+	const sink = new Writable({ write(chunk, encoding, done) { chunks.push(chunk); done(); } });
+	const body = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+	await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true, parser.consumeEvent);
+	parser.finish();
+	assert.deepEqual(Buffer.concat(chunks), input);
+	assert.equal(state.tokensIn, 7);
+	assert.equal(parser.formatting.parsedEvents, 1);
+	assert.equal(parser.formatting.invalidEvents, 1);
+	assert.equal(parser.formatting.droppedEvents, 1);
 });
 
 test('normalization preserves ordinary, oversized, malformed and incomplete events byte for byte', async () => {

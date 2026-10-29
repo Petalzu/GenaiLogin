@@ -234,6 +234,15 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             return ids.every((id, index) => document.getElementById(id).firstChild === nodes[index]);
         }, { ...base, connection: 'disconnected', status: 'Disconnected', active: false });
         assert.equal(unchanged, true);
+        const redundantWrites = await page.evaluate(data => {
+            const observer = new MutationObserver(() => {});
+            observer.observe(document.querySelector('main'), { subtree: true, childList: true, attributes: true, characterData: true });
+            globalThis.dispatchEvent(new MessageEvent('message', { data: { type: 'state', data } }));
+            const changes = observer.takeRecords().filter(change => change.target.id !== 'sync-text');
+            observer.disconnect();
+            return changes.map(change => change.target.id || change.target.nodeName);
+        }, { ...base, connection: 'disconnected', status: 'Disconnected', active: false });
+        assert.deepEqual(redundantWrites, []);
         await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false,
             models: [{ name: 'changed-model', requests: 2 }], modelUsage: [{ name: 'changed-model', tokensIn: 10, inputUsageReports: 1 }],
             history: { requests: 2, tokensIn: 10, inputUsageReports: 1, modelUsage: [{ name: 'changed-model', tokensIn: 10, inputUsageReports: 1 }] } });
@@ -249,6 +258,12 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
         ] };
         for (const width of [240, 360, 1200]) {
             await page.setViewportSize({ width, height: 900 });
+            await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, listening: true, historyState: 'loading' });
+            assert.equal(await page.locator('#history-detail').textContent(), '正在读取历史');
+            assert.equal(await page.locator('#history-tokens').textContent(), '--');
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="credentials"]').isEnabled(), true);
+            assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
             await render({ ...base, connection: 'disconnected', status: 'Disconnected', active: false, listening: true, history });
             assert.equal(await page.locator('#history-cost').textContent(), '估算 USD 15.875000');
             assert.equal(await page.locator('#history-tokens').textContent(), '3010.00 M tok');

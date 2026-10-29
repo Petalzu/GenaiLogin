@@ -289,7 +289,11 @@ function dashboardHtml(initialState = null) {
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         let snapshot;
-        const byId = id => document.getElementById(id);
+        const elements = new Map([...document.querySelectorAll('[id]')].map(element => [element.id, element]));
+        const buttons = [...document.querySelectorAll('[data-command]')];
+        const byId = id => elements.get(id);
+        const setProperty = (element, property, value) => { if (element[property] !== value) element[property] = value; };
+        const setText = (id, value) => setProperty(byId(id), 'textContent', value);
         const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
         const numberFormatter = new Intl.NumberFormat('zh-CN');
         const clockFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -315,8 +319,7 @@ function dashboardHtml(initialState = null) {
                 uptimeTimer = undefined;
             } else if (uptimeTimer === undefined) {
                 uptimeTimer = setInterval(() => {
-                    const value = formatDuration(Date.now() - snapshot.connectedAt);
-                    if (byId('uptime-value').textContent !== value) byId('uptime-value').textContent = value;
+                    setText('uptime-value', formatDuration(Date.now() - snapshot.connectedAt));
                 }, 1000);
             }
         };
@@ -359,7 +362,7 @@ function dashboardHtml(initialState = null) {
             if (!listChanged('model-list', models)) return;
             const list = byId('model-list');
             list.replaceChildren();
-            byId('model-count').textContent = String(models.length);
+            setText('model-count', String(models.length));
             if (!models.length) {
                 const empty = document.createElement('div');
                 empty.className = 'empty-models';
@@ -390,37 +393,38 @@ function dashboardHtml(initialState = null) {
             const recoverable = !busy && ['error', 'retrying', 'needs-login'].includes(data.keepalive?.state);
             const pending = Array.isArray(data.pendingActions) ? data.pendingActions : [];
             const exclusivePending = pending.some(command => ['connect', 'diagnose', 'credentials', 'clear'].includes(command));
-            for (const button of document.querySelectorAll('[data-command]')) {
+            for (const button of buttons) {
                 const command = button.dataset.command;
-                button.disabled = pending.includes(command) ||
+                const disabled = pending.includes(command) ||
                     (command === 'connect' && (active && !recoverable || busy || shared || exclusivePending)) ||
                     (['diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
                     (command === 'clear' && (shared || exclusivePending)) ||
                     (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || shared));
+                setProperty(button, 'disabled', Boolean(disabled));
             }
-            byId('connect-label').textContent = active && recoverable ? '重新连接' : '连接 GENAI';
+            setText('connect-label', active && recoverable ? '重新连接' : '连接 GENAI');
             const warning = data.sessionPersistence === 'error' || ['error', 'retrying', 'needs-login'].includes(data.keepalive?.state) ||
                 (data.keepalive?.expiresAt && data.keepalive.expiresAt - Date.now() <= 60000);
             const dot = byId('status-dot');
-            dot.className = 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : '');
+            setProperty(dot, 'className', 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : ''));
             const label = mode === 'disconnected' && data.listening ? '待命' : { connected: '已连接', disconnected: '未连接', connecting: '正在连接', authenticating: '正在登录', error: '请求暂时失败' }[mode] || '未连接';
-            byId('status-text').textContent = label + (shared ? ' · 其他窗口' : '');
-            byId('port-badge').textContent = (data.listening ?? isConnected) ? ':' + data.port : '未监听';
-            byId('session-warning').hidden = data.sessionPersistence !== 'error';
-            byId('session-warning').textContent = data.sessionPersistence === 'error' ? 'Cookie 保存失败，当前连接可继续；重载后可能需要重新登录。' : '';
+            setText('status-text', label + (shared ? ' · 其他窗口' : ''));
+            setText('port-badge', (data.listening ?? isConnected) ? ':' + data.port : '未监听');
+            setProperty(byId('session-warning'), 'hidden', data.sessionPersistence !== 'error');
+            setText('session-warning', data.sessionPersistence === 'error' ? 'Cookie 保存失败，当前连接可继续；重载后可能需要重新登录。' : '');
             const hasUsage = number(data.usageReports) > 0;
-            byId('token-value').textContent = hasUsage ? formatTokens(number(data.tokensIn) + number(data.tokensOut)) : '--';
+            setText('token-value', hasUsage ? formatTokens(number(data.tokensIn) + number(data.tokensOut)) : '--');
             const inputKnown = number(data.inputUsageReports ?? data.usageReports) > 0;
             const outputKnown = number(data.outputUsageReports ?? data.usageReports) > 0;
-            byId('token-detail').textContent = 'IN 输入：' + (inputKnown ? formatTokens(data.tokensIn) : '--') + '\\nOUT 输出：' + (outputKnown ? formatTokens(data.tokensOut) : '--');
+            setText('token-detail', 'IN 输入：' + (inputKnown ? formatTokens(data.tokensIn) : '--') + '\\nOUT 输出：' + (outputKnown ? formatTokens(data.tokensOut) : '--'));
             const usageRows = Array.isArray(data.modelUsage) ? data.modelUsage : [];
             renderUsage('token-breakdown', usageRows, number(data.tokensIn) + number(data.tokensOut));
             const cache = usageRows.reduce((total, usage) => ({ cachedTokens: total.cachedTokens + number(usage.cachedTokens), cacheInputTokens: total.cacheInputTokens + number(usage.cacheInputTokens), cacheReports: total.cacheReports + number(usage.cacheReports) }), { cachedTokens: 0, cacheInputTokens: 0, cacheReports: 0 });
-            byId('cache-value').textContent = cacheRate(cache);
-            byId('cache-detail').textContent = '缓存报告 ' + cache.cacheReports + '/' + number(data.requests) + ' 次';
+            setText('cache-value', cacheRate(cache));
+            setText('cache-detail', '缓存报告 ' + cache.cacheReports + '/' + number(data.requests) + ' 次');
             const costs = usageRows.reduce((total, usage) => ({ costMin: total.costMin + number(usage.costMin), costMax: total.costMax + number(usage.costMax), pricedReports: total.pricedReports + number(usage.pricedReports), timedReports: total.timedReports + number(usage.timedReports) }), { costMin: 0, costMax: 0, pricedReports: 0, timedReports: 0 });
-            byId('cost-value').textContent = costs.pricedReports ? costText(costs) : '--';
-            byId('cost-detail').textContent = usageRows.some(usage => !usage.pricedReports) ? '已计价模型合计' : '所有模型合计';
+            setText('cost-value', costs.pricedReports ? costText(costs) : '--');
+            setText('cost-detail', usageRows.some(usage => !usage.pricedReports) ? '已计价模型合计' : '所有模型合计');
             const costList = byId('cost-breakdown');
             if (listChanged('cost-breakdown', usageRows)) {
                 costList.replaceChildren();
@@ -448,26 +452,27 @@ function dashboardHtml(initialState = null) {
                 keepalive.state === 'checking' ? '正在检查会话' : keepalive.state === 'reauthenticating' ? '认证已失效，正在重认证' :
                 expiring ? '会话即将或已经到期，服务端可能要求重新登录' :
                 keepalive.state === 'healthy' ? '会话有效' : isConnected ? '等待首次检查' : '等待连接';
-            byId('keepalive-text').textContent = (shared ? '只读 · ' : '') + health;
-            byId('last-check').textContent = keepalive.nextCheckAt ? '下次检查 ' + formatClock(keepalive.nextCheckAt) : '保活：尚未安排';
-            byId('last-check').title = '上次检查 ' + formatClock(keepalive.lastCheckAt) +
-                (keepalive.expiresAt ? ' · 会话到期 ' + formatClock(keepalive.expiresAt) : ' · 会话到期时间未知');
-            byId('sync-text').textContent = '同步 ' + formatClock(Date.now());
-            byId('uptime-value').textContent = isConnected ? formatDuration(Date.now() - data.connectedAt) : '--';
+            setText('keepalive-text', (shared ? '只读 · ' : '') + health);
+            setText('last-check', keepalive.nextCheckAt ? '下次检查 ' + formatClock(keepalive.nextCheckAt) : '保活：尚未安排');
+            setProperty(byId('last-check'), 'title', '上次检查 ' + formatClock(keepalive.lastCheckAt) +
+                (keepalive.expiresAt ? ' · 会话到期 ' + formatClock(keepalive.expiresAt) : ' · 会话到期时间未知'));
+            setText('sync-text', '同步 ' + formatClock(Date.now()));
+            setText('uptime-value', isConnected ? formatDuration(Date.now() - data.connectedAt) : '--');
             renderModels(Array.isArray(data.models) ? data.models : []);
             const history = data.history;
+            const historyPending = !history && data.historyState === 'loading';
             const historyRows = Array.isArray(history?.modelUsage) ? history.modelUsage : [];
             renderUsage('history-breakdown', historyRows, number(history?.tokensIn) + number(history?.tokensOut));
             const historyCost = historyRows.reduce((total, usage) => total + (usage.pricedReports ? number(usage.costMin) : 0), 0);
-            byId('history-cost').textContent = '估算 USD ' + (historyRows.some(usage => usage.pricedReports) ? money(historyCost) : '--');
-            byId('history-cost').title = historyRows.some(usage => !usage.pricedReports) ? '含未计价模型，未计价部分未计入合计' : '所有模型估算合计';
-            byId('history-tokens').textContent = history && (history.inputUsageReports || history.outputUsageReports) ? formatTokens(number(history.tokensIn) + number(history.tokensOut)) + ' tok' : '--';
-            byId('history-detail').textContent = history ? history.inputUsageReports + history.outputUsageReports
+            setText('history-cost', '估算 USD ' + (historyRows.some(usage => usage.pricedReports) ? money(historyCost) : '--'));
+            setProperty(byId('history-cost'), 'title', historyRows.some(usage => !usage.pricedReports) ? '含未计价模型，未计价部分未计入合计' : '所有模型估算合计');
+            setText('history-tokens', history && (history.inputUsageReports || history.outputUsageReports) ? formatTokens(number(history.tokensIn) + number(history.tokensOut)) + ' tok' : '--');
+            setText('history-detail', history ? history.inputUsageReports + history.outputUsageReports
                 ? '调用 ' + formatNumber(history.requests) + ' 次 · IN ' + (history.inputUsageReports ? formatTokens(history.tokensIn) : '--') + ' · OUT ' + (history.outputUsageReports ? formatTokens(history.tokensOut) : '--')
-                : '调用 ' + formatNumber(history.requests) + ' 次 · 等待 usage' : '未连接，无历史统计';
+                : '调用 ' + formatNumber(history.requests) + ' 次 · 等待 usage' : historyPending ? '正在读取历史' : data.historyState === 'error' ? '历史暂不可用' : '未连接，无历史统计');
             syncUptimeTimer();
         }
-        document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => {
+        buttons.forEach(button => button.addEventListener('click', () => {
             if (!button.disabled) vscode.postMessage({ command: button.dataset.command });
         }));
         window.addEventListener('message', event => { if (event.data && event.data.type === 'state') render(event.data.data); });

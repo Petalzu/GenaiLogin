@@ -3,6 +3,26 @@ const assert = require('node:assert/strict');
 const { createHistory, createHistoryFiles } = require('../stats');
 const { createStats, recordRequest, applyUsage, commitRequest, createUsageParser } = require('../stats');
 
+function historyFileHarness() {
+	const files = new Map();
+	const versions = new Map();
+	const reads = [];
+	const set = (name, value) => {
+		files.set(name, Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value)));
+		versions.set(name, (versions.get(name) || 0) + 1);
+	};
+	const adapter = {
+		createDirectory: async () => {},
+		readDirectory: async () => [...files.keys()].map(name => [name, 1]),
+		stat: async name => ({ mtime: versions.get(name), ctime: 1, size: files.get(name).length }),
+		readFile: async name => { reads.push(name); return files.get(name); },
+		writeFile: async (name, bytes) => set(name, bytes),
+		rename: async (source, target) => { set(target, files.get(source)); files.delete(source); }
+	};
+	return { files, reads, adapter, set,
+		store: () => createHistoryFiles(adapter, '', (directory, name) => name, () => assert.fail('unexpected storage error')) };
+}
+
 test('final stream cache usage settles once and persists model costs', async () => {
 	const stats = createStats(58379);
 	const request = recordRequest(stats, Buffer.from('{"model":"DeepSeek-V4.1-Flash"}'), Date.parse('2026-10-08T00:00:00Z'));
@@ -27,6 +47,24 @@ test('final stream cache usage settles once and persists model costs', async () 
 	history.start(); history.finish(request); history.finish(request);
 	await history.flush();
 	assert.deepEqual(createHistory(storage).snapshot().modelUsage, [{ name: request.model, ...usage }]);
+});
+
+test('stream diagnostics preserve reasoning variants, metadata and newline counts across chunk boundaries', () => {
+	const request = recordRequest(createStats(58379), Buffer.from('{"model":"sample"}'));
+	const parser = createUsageParser('text/event-stream', request);
+	const deltas = [{ content: 'first\nsecond\n' }, { reasoning: 'analysis' },
+		{ cot_summary: 'summary', content: 'third\n' }, { reasoning_text: 'analysis' },
+		{ reasoning_content: 'analysis' }, { thinking: 'analysis', cot_id: 'id' },
+		{ reasoning: 123, content: '', tool_calls: [{}] }];
+	const bytes = Buffer.from(deltas.map(delta => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta }] }) + '\n\n').join('') +
+		'data: {"usage":{"prompt_tokens":100,"completion_tokens":10}}\n\ndata: [DONE]\n\n');
+	for (let offset = 0; offset < bytes.length; offset += 11) parser.consume(bytes.subarray(offset, offset + 11));
+	parser.finish(); parser.finish();
+	assert.deepEqual(parser.formatting, { contentChunks: 2, contentNewlines: 3, reasoningAfterContent: 5,
+		mixedReasoningContent: 1, reasoningChunks: 5, toolCallChunks: 1, reasoningIdChunks: 1,
+		parsedEvents: 8, invalidEvents: 0, droppedEvents: 0, eventStream: true });
+	assert.equal(request.tokensIn, 100);
+	assert.equal(request.tokensOut, 10);
 });
 
 test('pricing uses request start UTC boundaries, weekdays and no holiday exceptions', () => {
@@ -87,6 +125,19 @@ test('missing request timestamps use off-peak pricing without a range', () => {
 	assert.equal(usage.costMax, usage.costMin);
 	assert.equal(usage.timedReports, 0);
 	assert.equal(usage.offPeakCost, usage.costMin);
+});
+
+test('preparsed request metadata avoids decoding the body twice including invalid JSON', () => {
+	const { parseRequestBody } = require('../stats');
+	for (const text of ['{"model":"DeepSeek-V4.1-Flash-1017"}', '{}', 'null', '{']) {
+		const body = Buffer.from(text);
+		let decodes = 0;
+		body.toString = (...args) => { decodes++; return Buffer.prototype.toString.apply(body, args); };
+		const parsed = parseRequestBody(body);
+		const request = recordRequest(createStats(58379), body, 0, parsed);
+		assert.equal(decodes, 1);
+		assert.equal(request.model, parsed?.model || 'unknown');
+	}
 });
 
 test('requests with missing or invalid models remain unknown without throwing', () => {
@@ -282,7 +333,9 @@ test('history files persist atomically across fresh stores on disk', async () =>
 	const directory = await fileSystem.mkdtemp(join(tmpdir(), 'genai-history-'));
 	const adapter = { createDirectory: path => fileSystem.mkdir(path, { recursive: true }),
 		readDirectory: async path => (await fileSystem.readdir(path)).map(name => [name, 1]),
+		stat: async path => { const info = await fileSystem.stat(path); return { mtime: info.mtimeMs, ctime: info.ctimeMs, size: info.size }; },
 		readFile: path => fileSystem.readFile(path), writeFile: (path, bytes) => fileSystem.writeFile(path, bytes),
+		delete: path => fileSystem.rm(path, { force: true }),
 		rename: (source, target) => fileSystem.rename(source, target) };
 	const storage = () => ({ get() {}, keys: () => [], update: () => assert.fail('Memento must remain unchanged') });
 	try {
@@ -294,8 +347,148 @@ test('history files persist atomically across fresh stores on disk', async () =>
 		const restored = createHistory(storage(), () => assert.fail('read failed'), createHistoryFiles(adapter, directory, join));
 		await restored.reload();
 		assert.equal(restored.snapshot().requests, 3);
+		assert.equal(JSON.parse(await fileSystem.readFile(join(directory, 'usageHistory.total.v1.json'))).total.requests, 3);
 		assert.equal((await fileSystem.readdir(directory)).filter(name => name.endsWith('.tmp')).length, 0);
 	} finally { await fileSystem.rm(directory, { recursive: true, force: true }); }
+});
+
+test('history totals persist in one validated cache without rereading unchanged window files', async () => {
+	const files = new Map([
+		['/history/usageHistory.window.v3.1111.json', Buffer.from('{"requests":3,"tokensIn":20}')],
+		['/history/usageHistory.window.v3.2222.json', Buffer.from('{"requests":4,"tokensOut":9}')]
+	]);
+	const reads = [];
+	const adapter = {
+		createDirectory: async () => {},
+		readDirectory: async () => [...files.keys()].map(name => [name.slice('/history/'.length), 1]),
+		stat: async name => ({ mtime: 1, ctime: 1, size: files.get(name).length }),
+		readFile: async name => { reads.push(name); return files.get(name); },
+		writeFile: async (name, bytes) => { files.set(name, bytes); },
+		rename: async (source, target) => { files.set(target, files.get(source)); files.delete(source); }
+	};
+	const storage = () => ({ get() {}, keys: () => [] });
+	const store = () => createHistoryFiles(adapter, '/history', (directory, name) => directory + '/' + name,
+		() => assert.fail('healthy history must remain readable'));
+	const first = createHistory(storage(), () => assert.fail('reload failed'), store());
+	await first.reload();
+	assert.equal(first.snapshot().requests, 7);
+	const cached = JSON.parse(files.get('/history/usageHistory.total.v1.json'));
+	assert.equal(cached.total.requests, 7);
+	assert.equal(cached.total.tokensIn, 20);
+	assert.equal(cached.total.tokensOut, 9);
+	reads.length = 0;
+	const restored = createHistory(storage(), () => assert.fail('reload failed'), store());
+	await restored.reload();
+	assert.deepEqual(restored.snapshot(), first.snapshot());
+	assert.equal(reads.filter(name => /usageHistory\.window\./.test(name)).length, 0);
+	assert.equal(files.size, 3);
+});
+
+test('cached total appears before slow directory validation and only changed windows are reread', async () => {
+	const harness = historyFileHarness();
+	const legacy = { requests: 10, tokensIn: 100, tokensOut: 1 };
+	const storage = () => ({ get: key => key === 'usageHistory.summary.v2' ? legacy : undefined, keys: () => [] });
+	harness.set('usageHistory.window.v3.1111.json', { requests: 3, tokensIn: 20 });
+	await createHistory(storage(), () => assert.fail('reload failed'), harness.store()).reload();
+	assert.equal(JSON.parse(harness.files.get('usageHistory.total.v1.json')).total.requests, 13);
+	harness.set('usageHistory.window.v3.1111.json', { requests: 4, tokensIn: 30 });
+	harness.set('usageHistory.window.v3.2222.json', { requests: 2, tokensOut: 9 });
+	const list = harness.adapter.readDirectory;
+	let release;
+	harness.adapter.readDirectory = async () => { await new Promise(resolve => { release = resolve; }); return list(); };
+	const history = createHistory(storage(), () => assert.fail('reload failed'), harness.store());
+	assert.equal(history.state(), 'loading');
+	let cached;
+	const loading = history.reload(() => { cached = history.snapshot(); });
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(cached.requests, 13);
+	assert.equal(cached.tokensIn, 120);
+	assert.equal(history.state(), 'ready');
+	release(); await loading;
+	assert.equal(history.snapshot().requests, 16);
+	assert.equal(history.snapshot().tokensIn, 130);
+	assert.equal(history.snapshot().tokensOut, 10);
+	harness.adapter.readDirectory = list;
+	harness.reads.length = 0;
+	harness.set('usageHistory.window.v3.2222.json', { requests: 3, tokensOut: 8 });
+	await harness.store().read();
+	assert.deepEqual(harness.reads.filter(name => name.startsWith('usageHistory.window.')), ['usageHistory.window.v3.2222.json']);
+});
+
+test('stale concurrent total writes never overwrite window usage and recover without duplicate accumulation', async () => {
+	const harness = historyFileHarness();
+	const storage = () => ({ get() {}, keys: () => [] });
+	const first = createHistory(storage(), () => assert.fail('first window failed'), harness.store());
+	const second = createHistory(storage(), () => assert.fail('second window failed'), harness.store());
+	first.start();
+	first.finish({ model: 'DeepSeek-V4.1-Flash', hasInput: true, tokensIn: 1000, hasOutput: true, tokensOut: 10, cachedTokens: 900 });
+	await first.flush();
+	const rename = harness.adapter.rename;
+	let release, reached;
+	const paused = new Promise(resolve => { reached = resolve; });
+	let hold = true;
+	harness.adapter.rename = async (source, target) => {
+		if (target === 'usageHistory.total.v1.json' && hold) {
+			hold = false; reached();
+			await new Promise(resolve => { release = resolve; });
+		}
+		return rename(source, target);
+	};
+	harness.files.delete('usageHistory.total.v1.json');
+	const pending = first.reload();
+	await paused;
+	second.start();
+	second.finish({ model: 'DeepSeek-V4.1-Flash', hasInput: true, tokensIn: 2000, hasOutput: true, tokensOut: 20, cachedTokens: 1800 });
+	await second.flush();
+	await second.reload();
+	assert.equal(second.snapshot().requests, 2);
+	release(); await pending;
+	assert.equal(JSON.parse(harness.files.get('usageHistory.total.v1.json')).total.requests, 1);
+	const restored = createHistory(storage(), () => assert.fail('recovery failed'), harness.store());
+	await restored.reload();
+	await Promise.all([first.reload(), second.reload()]);
+	for (const history of [first, second, restored]) {
+		const total = history.snapshot();
+		assert.equal(total.requests, 2);
+		assert.equal(total.tokensIn, 3000);
+		assert.equal(total.tokensOut, 30);
+		assert.equal(total.modelUsage[0].cachedTokens, 2700);
+		assert.equal(total.modelUsage[0].requests, 2);
+		assert.ok(Math.abs(total.modelUsage[0].costMin - 0.0000711) < 1e-12);
+	}
+	assert.equal([...harness.files.keys()].filter(name => name.endsWith('.tmp')).length, 0);
+});
+
+test('history decoding respects Uint8Array offsets without copying unrelated bytes', async () => {
+	const harness = historyFileHarness();
+	harness.set('usageHistory.window.v3.1111.json', { requests: 3, tokensIn: 50 });
+	const read = harness.adapter.readFile;
+	harness.adapter.readFile = async name => {
+		const bytes = await read(name);
+		if (!bytes) throw new Error('missing cache');
+		const padded = Buffer.concat([Buffer.from('prefix'), bytes, Buffer.from('suffix')]);
+		return new Uint8Array(padded.buffer, padded.byteOffset + 6, bytes.byteLength);
+	};
+	const history = createHistory({ get() {}, keys: () => [] }, () => assert.fail('reload failed'), harness.store());
+	await history.reload();
+	assert.equal(history.snapshot().requests, 3);
+	assert.equal(history.snapshot().tokensIn, 50);
+});
+
+test('invalid total caches rebuild without rewriting historical records or prices', async () => {
+	for (const cache of [Buffer.from('damaged'), { version: 99 }, { version: 1, records: [], windowTotal: null, total: {} }]) {
+		const harness = historyFileHarness();
+		const value = { requests: 3, tokensIn: 50, modelUsage: [{ name: 'DeepSeek-V4.1-Flash', costMin: 12, costMax: 12, pricedReports: 1 }] };
+		harness.set('usageHistory.window.v3.1111.json', value);
+		const original = harness.files.get('usageHistory.window.v3.1111.json');
+		harness.set('usageHistory.total.v1.json', cache);
+		const history = createHistory({ get() {}, keys: () => [] }, () => assert.fail('reload failed'), harness.store());
+		await history.reload();
+		assert.equal(history.snapshot().requests, 3);
+		assert.equal(history.snapshot().modelUsage[0].costMin, 12);
+		assert.equal(harness.files.get('usageHistory.window.v3.1111.json'), original);
+		assert.equal(JSON.parse(harness.files.get('usageHistory.total.v1.json')).total.requests, 3);
+	}
 });
 
 test('one corrupt history file does not hide healthy records or delete original data', async () => {
@@ -312,6 +505,43 @@ test('one corrupt history file does not hide healthy records or delete original 
 	assert.equal(history.snapshot().requests, 3);
 	assert.equal(errors, 2);
 	assert.equal(data.size, 3);
+});
+
+test('history base cache observes replaced legacy summaries and live legacy peer keys', async () => {
+	let legacy = { requests: 10, tokensIn: 100 };
+	const peers = new Map();
+	const peerKey = 'usageHistory.window.v3.peer';
+	const history = createHistory({ get: key => key === 'usageHistory.summary.v2' ? legacy : peers.get(key), keys: () => [...peers.keys()] },
+		() => assert.fail('storage failed'), { read: async () => [['usageHistory.window.v3.file', { requests: 3, tokensIn: 30 }]], update: async () => {} });
+	await history.reload();
+	assert.equal(history.snapshot().requests, 13);
+	legacy = { requests: 20, tokensIn: 200 };
+	history.start();
+	assert.equal(history.snapshot().requests, 24);
+	peers.set(peerKey, { requests: 4, tokensIn: 40 });
+	assert.equal(history.snapshot().requests, 28);
+	peers.get(peerKey).requests = 5;
+	assert.equal(history.snapshot().requests, 29);
+	peers.delete(peerKey);
+	assert.equal(history.snapshot().requests, 24);
+	assert.equal(history.snapshot().tokensIn, 230);
+	await history.flush();
+});
+
+test('history base caching preserves model-cap ordering for current-window usage', async () => {
+	const records = Array.from({ length: 65 }, (_, index) => ['usageHistory.window.v3.' + index,
+		{ requests: 1, modelUsage: [{ name: 'model-' + index, tokensIn: index + 1 }] }]);
+	const history = createHistory({ get() {}, keys: () => [] }, () => assert.fail('reload failed'),
+		{ read: async () => records, update: async () => {} });
+	await history.reload();
+	history.snapshot();
+	history.start();
+	history.finish({ model: 'model-64', hasInput: true, tokensIn: 3 });
+	const snapshot = history.snapshot();
+	assert.equal(snapshot.requests, 66);
+	assert.equal(snapshot.modelUsage.find(row => row.name === 'model-64').tokensIn, 68);
+	assert.equal(snapshot.modelUsage.find(row => row.name === '其他模型').tokensIn, 64);
+	await history.flush();
 });
 
 test('file history snapshots reuse aggregation without exposing mutable cached data', async () => {
@@ -331,13 +561,13 @@ test('file history snapshots reuse aggregation without exposing mutable cached d
 	assert.equal(reads, 1);
 	history.start();
 	assert.equal(history.snapshot().requests, 3);
-	assert.equal(reads, 2);
+	assert.equal(reads, 1);
 	history.finish({ model: 'local', hasInput: true, tokensIn: 5 });
 	assert.equal(history.snapshot().modelUsage.find(model => model.name === 'local').tokensIn, 5);
-	assert.equal(reads, 3);
+	assert.equal(reads, 1);
 	row.tokensIn = 30;
 	await history.reload();
 	assert.equal(history.snapshot().modelUsage.find(model => model.name === 'peer').tokensIn, 30);
-	assert.equal(reads, 4);
+	assert.equal(reads, 2);
 	await history.flush();
 });

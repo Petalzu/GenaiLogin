@@ -29,6 +29,7 @@ function createKeepaliveSchedule(session, now = Date.now) {
             cooldownAt = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? now() + retryAfterMs : 0;
             retryAt = now() + Math.max(delay, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
         },
+        lastActivityAt: () => lastActivityAt,
         snapshot
     };
 }

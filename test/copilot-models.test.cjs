@@ -37,7 +37,7 @@ test('external change during backup refuses edit even with unchanged editor vers
 });
 test('deleting the only model and setting supports JSONC trailing commas', () => {
 		const { removableModels, removeModels } = modelApi;
-	const text = '[{"models":[' + JSON.stringify(preset('DeepSeek-V4.1-Flash', endpoint)) + ',],"settings":{"DeepSeek-V4.1-Flash":{"reasoningEffort":"max"},},"untouched":42},]';
+	const text = '[{"models":[' + JSON.stringify(preset('DeepSeek-V4.1-Flash-1017', endpoint)) + ',],"settings":{"DeepSeek-V4.1-Flash-1017":{"reasoningEffort":"max"},},"untouched":42},]';
 	const result = removeModels(text, removableModels(readConfig(text), endpoint), endpoint);
 	assert.deepEqual(readConfig(result), [{ models: [], settings: {}, untouched: 42 }]);
 });
@@ -90,7 +90,7 @@ test('configuration cancelled at confirmation never writes or backs up files', a
 });
 test('removal preserves other endpoints, shared settings and unrelated providers', () => {
 		const { removableModels, removeModels } = modelApi;
-	const id = 'DeepSeek-V4.1-Flash';
+	const id = 'DeepSeek-V4.1-Flash-1017';
 	const text = JSON.stringify([{ models: [preset(id, endpoint), preset(id, 'https://example.com/v1/chat/completions'), preset('GLM-5.3-Flash', endpoint)], settings: { [id]: { reasoningEffort: 'low' }, 'GLM-5.3-Flash': { reasoningEffort: 'max' }, other: {} } }, { name: 'unrelated' }]);
 	const entries = removableModels(readConfig(text), endpoint);
 	assert.equal(entries.length, 2);
@@ -104,7 +104,7 @@ test('removal preserves other endpoints, shared settings and unrelated providers
 
 test('append preserves comments, other providers and settings and is idempotent', () => {
 	const original = '[\n// Keep this comment\n{"name":"Other","models":[],"apiKey":"untouched"}\n]';
-	const models = [preset('DeepSeek-V4.1-Flash', endpoint), preset('GLM-5.3-Flash', endpoint)];
+	const models = [preset('DeepSeek-V4.1-Flash-1017', endpoint), preset('GLM-5.3-Flash', endpoint)];
 	const updated = appendModels(original, models, endpoint);
 	assert.ok(updated.includes('// Keep this comment'));
 	assert.deepEqual(readConfig(updated)[0], readConfig(original)[0]);
@@ -141,7 +141,7 @@ test('presets preserve reviewed parameters and isolate port overrides', () => {
 test('all seven chat models append once with valid context budgets', () => {
 	const catalog = require('../genai-models.json');
 	const limits = { 'gemma-4-31B-it': 180000, 'gpt-oss-120b': 131072, 'GLM-OCR': 131072,
-		'Qwen3.8-27B': 262144, 'Qwen3.5-397B-A17B': 262144, 'DeepSeek-V4.1-Flash': 1048576, 'GLM-5.3-Flash': 1048576 };
+		'Qwen3.8-27B': 262144, 'Qwen3.5-397B-A17B': 262144, 'DeepSeek-V4.1-Flash-1017': 1048576, 'GLM-5.3-Flash': 1048576 };
 	assert.deepEqual(catalog.models.map(model => model.id).sort(), Object.keys(limits).sort());
 	for (const model of catalog.models) assert.ok(model.maxInputTokens + model.maxOutputTokens <= limits[model.id]);
 	const models = catalog.models.map(model => preset(model.id, endpoint));
@@ -150,8 +150,29 @@ test('all seven chat models append once with valid context budgets', () => {
 	assert.equal(appendModels(result, models, endpoint), result);
 });
 
+test('DeepSeek preset uses the replacement model and matching reasoning settings', () => {
+	const catalog = require('../genai-models.json');
+	const id = 'DeepSeek-V4.1-Flash-1017';
+	assert.equal(preset(id, endpoint).name, `GENAI / ${id}`);
+	assert.equal(catalog.settings[id].reasoningEffort, 'max');
+	assert.equal(catalog.settings['DeepSeek-V4.1-Flash'], undefined);
+	assert.throws(() => preset('DeepSeek-V4.1-Flash', endpoint), /not in the reviewed catalog/);
+});
+
 test('image models are not available as Copilot presets', () => {
 	assert.throws(() => preset('qwen-image-2.1', endpoint), /not in the reviewed catalog/);
+});
+
+test('retired DeepSeek local configurations remain removable without changing other endpoints', () => {
+	const { removableModels, removeModels } = modelApi;
+	const id = 'DeepSeek-V4.1-Flash';
+	const text = JSON.stringify([{ models: [{ id, name: `GENAI / ${id}`, url: endpoint },
+		{ id, url: 'https://example.com/v1/chat/completions' }], settings: { [id]: { reasoningEffort: 'low' } } }]);
+	const selected = removableModels(readConfig(text), endpoint);
+	assert.equal(selected.length, 1);
+	const remaining = readConfig(removeModels(text, selected, endpoint));
+	assert.deepEqual(remaining[0].models, [{ id, url: 'https://example.com/v1/chat/completions' }]);
+	assert.equal(remaining[0].settings[id].reasoningEffort, 'low');
 });
 
 test('production model bundle preserves JSONC edits without external parser files', () => {
@@ -177,8 +198,8 @@ test('configure command offers chat models only, backs up additions and skips du
 		const existing = [
 			{ name: 'Other', vendor: 'customendpoint', apiKey: '${input:unchanged}', apiType: 'messages', models: [{ id: 'other', url: 'https://example.com/v1/messages' }], settings: { other: { reasoningEffort: 'high' } } },
 			{ name: 'GENAI Chat', vendor: 'customendpoint', apiKey: 'local-browser-session', apiType: 'chat-completions',
-				models: [preset('DeepSeek-V4.1-Flash', localEndpoint), preset('GLM-5.3-Flash', localEndpoint)],
-				settings: { 'DeepSeek-V4.1-Flash': { reasoningEffort: 'low' }, 'GLM-5.3-Flash': { reasoningEffort: 'max' } } }
+				models: [preset('DeepSeek-V4.1-Flash-1017', localEndpoint), preset('GLM-5.3-Flash', localEndpoint)],
+				settings: { 'DeepSeek-V4.1-Flash-1017': { reasoningEffort: 'low' }, 'GLM-5.3-Flash': { reasoningEffort: 'max' } } }
 		];
 		const original = JSON.stringify(existing, null, '\t').replace('[', '[\n// keep profile comment');
 		let text = original, disk = original, staged, backups = 0, writes = 0, saves = 0, picks = 0;

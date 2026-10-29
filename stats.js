@@ -60,31 +60,115 @@ function recordModelUsage(models, request) {
 }
 
 const historyStores = new WeakMap();
+const HISTORY_FIELDS = ['requests', 'tokensIn', 'tokensOut', 'inputUsageReports', 'outputUsageReports'];
+
+function summarizeHistory(records) {
+	const total = Object.fromEntries(HISTORY_FIELDS.map(field => [field, 0]));
+	const models = new Map();
+	for (const record of records) {
+		for (const field of HISTORY_FIELDS) {
+			if (Number.isSafeInteger(record?.[field]) && record[field] >= 0) total[field] += record[field];
+		}
+		mergeModelUsage(models, record?.modelUsage);
+	}
+	return { ...total, ...(models.size ? { modelUsage: modelUsageRows(models) } : {}) };
+}
 
 function createHistoryFiles(fileSystem, directory, joinPath, onError = () => {}) {
 	let ready;
+	let cacheTimer, cacheLegacy;
+	let cachePending = Promise.resolve();
+	const cacheName = 'usageHistory.total.v1.json';
+	const validRecord = record => record && typeof record === 'object' && !Array.isArray(record) &&
+		(record.modelUsage === undefined || Array.isArray(record.modelUsage));
+	const signature = async name => {
+		const info = await fileSystem.stat(joinPath(directory, name));
+		return JSON.stringify([info.mtime, info.ctime, info.size]);
+	};
+	const readRecord = async name => {
+		const bytes = await fileSystem.readFile(joinPath(directory, name));
+		const record = JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8'));
+		if (!validRecord(record)) throw new Error('Invalid usage record');
+		return record;
+	};
+	const summarizedRecords = (records, windowTotal, excludedKey) => [['usageHistory.total.v1',
+		records.some(record => record.name === excludedKey + '.json') ?
+			summarizeHistory(records.filter(record => record.name !== excludedKey + '.json').map(record => record.value)) : windowTotal]];
 	const ensureDirectory = () => ready ??= fileSystem.createDirectory(directory).catch(error => { ready = undefined; throw error; });
-	return {
-		async read() {
+	const flushCache = () => {
+		if (cacheTimer) {
+			clearTimeout(cacheTimer);
+			cacheTimer = undefined;
+			cachePending = cachePending.then(() => store.read(undefined, cacheLegacy)).then(() => {}, onError);
+		}
+		return cachePending;
+	};
+	const store = {
+		async read(excludedKey, legacy, onCached = () => {}) {
+			let cached;
+			try {
+				const candidate = await readRecord(cacheName);
+				if (candidate.version === 1 && Array.isArray(candidate.records) && validRecord(candidate.windowTotal) && validRecord(candidate.total) &&
+					candidate.records.every(record => typeof record.name === 'string' && /^usageHistory\.window\.v3\.[0-9a-f-]+\.json$/.test(record.name) &&
+						typeof record.signature === 'string' && validRecord(record.value)) &&
+					new Set(candidate.records.map(record => record.name)).size === candidate.records.length) cached = candidate;
+			} catch {}
+			if (cached) onCached(summarizedRecords(cached.records, cached.windowTotal, excludedKey));
 			await ensureDirectory();
 			const entries = await fileSystem.readDirectory(directory);
-			const records = await Promise.all(entries.filter(([name]) => /^usageHistory\.window\.v3\.[0-9a-f-]+\.json$/.test(name)).map(async ([name]) => {
+			const names = entries.map(([name]) => name).filter(name => /^usageHistory\.window\.v3\.[0-9a-f-]+\.json$/.test(name)).sort();
+			if (!fileSystem.stat) {
+				return (await Promise.all(names.map(async name => {
+					try { return [name.slice(0, -5), await readRecord(name)]; }
+					catch { onError(); return undefined; }
+				}))).filter(Boolean);
+			}
+			const previous = new Map(cached?.records.map(record => [record.name, record]));
+			let cacheable = true;
+			const records = (await Promise.all(names.map(async name => {
 				try {
-					const record = JSON.parse(Buffer.from(await fileSystem.readFile(joinPath(directory, name))).toString('utf8'));
-					if (!record || typeof record !== 'object' || (record.modelUsage !== undefined && !Array.isArray(record.modelUsage))) throw new Error('Invalid usage record');
-					return [name.slice(0, -5), record];
-				} catch { onError(); return undefined; }
-			}));
-			return records.filter(Boolean);
+					const current = await signature(name);
+					const saved = previous.get(name);
+					if (saved?.signature === current) return saved;
+					const value = await readRecord(name);
+					if (await signature(name) !== current) cacheable = false;
+					return { name, signature: current, value };
+				} catch { cacheable = false; onError(); return undefined; }
+			}))).filter(Boolean);
+			const unchanged = cacheable && cached && records.length === previous.size && records.every(record => previous.get(record.name) === record);
+			const windowTotal = unchanged ? cached.windowTotal : summarizeHistory(records.map(record => record.value));
+			if (!cached) onCached(summarizedRecords(records, windowTotal, excludedKey));
+			const legacyJson = JSON.stringify(legacy ?? null);
+			if (cacheable && (!unchanged || cached.legacy !== legacyJson)) {
+				const temporary = joinPath(directory, cacheName + '.' + require('node:crypto').randomUUID() + '.tmp');
+				try {
+					await fileSystem.writeFile(temporary, Buffer.from(JSON.stringify({ version: 1, legacy: legacyJson,
+						total: summarizeHistory([legacy, windowTotal]), windowTotal, records })));
+					for (let attempt = 0; ; attempt++) {
+						try { await fileSystem.rename(temporary, joinPath(directory, cacheName), { overwrite: true }); break; }
+						catch (error) {
+							if (attempt >= 2 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+							await require('node:timers/promises').setTimeout(10 * (attempt + 1));
+						}
+					}
+				} catch (error) { await fileSystem.delete?.(temporary, { useTrash: false }).catch(() => {}); onError(error); }
+			}
+			return summarizedRecords(records, windowTotal, excludedKey);
 		},
-		async update(key, value) {
+		async update(key, value, legacy) {
 			await ensureDirectory();
 			const temporary = joinPath(directory, key + '.tmp');
 			const destination = joinPath(directory, key + '.json');
 			await fileSystem.writeFile(temporary, Buffer.from(JSON.stringify(value)));
 			await fileSystem.rename(temporary, destination, { overwrite: true });
-		}
+			if (fileSystem.stat) {
+				cacheLegacy = legacy;
+				if (!cacheTimer) { cacheTimer = setTimeout(flushCache, 1000); cacheTimer.unref?.(); }
+			}
+		},
+		flush: flushCache
 	};
+	return store;
 }
 
 function createHistory(storage, onError = () => {}, recordStore) {
@@ -104,17 +188,14 @@ function createHistory(storage, onError = () => {}, recordStore) {
 		const legacy = storage.get(legacyKey);
 		const stored = (storage.keys?.() || []).filter(key => key.startsWith(prefix) && key !== shared.key).map(key => storage.get(key));
 		if (shared.recordStore && shared.snapshotCache && shared.legacy === legacy && !stored.length) return copySnapshot(shared.snapshotCache);
-		const result = { ...total };
-		const combined = new Map();
-		mergeModelUsage(combined, modelUsageRows(models));
-		const records = [legacy, ...[...shared.records].filter(([key]) => key !== shared.key).map(([, value]) => value), ...stored];
-		for (const record of records) {
-			for (const field of Object.keys(total)) {
-				if (Number.isSafeInteger(record?.[field]) && record[field] >= 0) result[field] += record[field];
-			}
-			mergeModelUsage(combined, record?.modelUsage);
+		let base = shared.baseCache;
+		if (!shared.recordStore || !base || shared.legacy !== legacy || stored.length) {
+			base = summarizeHistory([legacy, ...[...shared.records].filter(([key]) => key !== shared.key).map(([, value]) => value), ...stored]);
+			if (shared.recordStore && !stored.length) shared.baseCache = base;
 		}
-		const value = { ...result, ...(combined.size ? { modelUsage: modelUsageRows(combined) } : {}) };
+		const value = (base.modelUsage?.length || 0) + models.size > MAX_TRACKED_MODELS ?
+			summarizeHistory([deltaSnapshot(), legacy, ...[...shared.records].filter(([key]) => key !== shared.key).map(([, record]) => record), ...stored]) :
+			summarizeHistory([deltaSnapshot(), base]);
 		if (shared.recordStore && !stored.length) { shared.snapshotCache = value; shared.legacy = legacy; }
 		return copySnapshot(value);
 	};
@@ -125,7 +206,7 @@ function createHistory(storage, onError = () => {}, recordStore) {
 		shared.pending = shared.pending.then(async () => {
 			while (shared.requested) {
 				const value = shared.requested; shared.requested = undefined;
-				try { await (shared.recordStore || storage).update(shared.key, value); } catch { onError(); }
+				try { await (shared.recordStore || storage).update(shared.key, value, storage.get(legacyKey)); } catch { onError(); }
 			}
 		}).finally(() => { shared.saving = false; });
 	};
@@ -141,15 +222,24 @@ function createHistory(storage, onError = () => {}, recordStore) {
 			save();
 		},
 		snapshot,
-		reload() {
+		state: () => !shared.recordStore || shared.loaded ? 'ready' : shared.failed ? 'error' : 'loading',
+		reload(onCached = () => {}) {
 			if (!shared.recordStore) return Promise.resolve();
-			if (!shared.loading) shared.loading = shared.recordStore.read().then(records => {
-				shared.records = new Map(records);
-				shared.snapshotCache = undefined;
-			}).catch(onError).finally(() => { shared.loading = undefined; });
+			if (!shared.loading) {
+				const applyRecords = records => {
+					shared.records = new Map(records);
+					shared.baseCache = undefined;
+					shared.snapshotCache = undefined;
+					shared.loaded = true;
+					shared.failed = false;
+				};
+				shared.loading = shared.recordStore.read(shared.key, storage.get(legacyKey), records => {
+					if (!shared.loaded) { applyRecords(records); onCached(); }
+				}).then(applyRecords).catch(error => { shared.failed = true; onError(error); }).finally(() => { shared.loading = undefined; });
+			}
 			return shared.loading;
 		},
-		flush: () => shared.pending
+		async flush() { await shared.pending; await shared.recordStore?.flush?.(); }
 	};
 }
 const MAX_TRACKED_MODELS = 64;
@@ -174,15 +264,18 @@ function createStats(port) {
 	};
 }
 
-function recordRequest(stats, body, startedAt = Date.now()) {
+function parseRequestBody(body) {
+	if (!body || body.length > MAX_JSON_REQUEST_BODY) return undefined;
+	try { return JSON.parse(body.toString('utf8')); } catch { return undefined; }
+}
+
+function recordRequest(stats, body, startedAt = Date.now(), parsedBody) {
 	if (body === undefined) return undefined;
 	stats.requests++;
 	let model = 'unknown';
 	if (body.length <= MAX_JSON_REQUEST_BODY) {
-		try {
-			const parsed = JSON.parse(body.toString('utf8'));
-			if (typeof parsed?.model === 'string' && parsed.model.length <= 256 && parsed.model.trim()) model = parsed.model;
-		} catch { model = 'unknown'; }
+		const parsed = arguments.length >= 4 ? parsedBody : parseRequestBody(body);
+		if (typeof parsed?.model === 'string' && parsed.model.length <= 256 && parsed.model.trim()) model = parsed.model;
 	}
 	const current = stats.models.get(model);
 	if (current !== undefined) stats.models.set(model, current + 1);
@@ -230,30 +323,40 @@ function createUsageParser(contentType, requestStats) {
 	let droppingLine = false;
 	let eventData = '';
 	let droppingEvent = false;
-	const flushEvent = () => {
-		if (droppingEvent) formatting.droppedEvents++;
-		if (!droppingEvent && eventData.trim() && eventData.trim() !== '[DONE]') {
-			try {
-				const event = JSON.parse(eventData);
-				formatting.parsedEvents++;
-				applyUsage(requestStats, event.usage);
-				for (const choice of Array.isArray(event.choices) ? event.choices : []) {
-					const delta = choice?.delta;
-					if (!delta) continue;
-					const index = choice.index ?? 0;
-					const hasReasoning = [delta.cot_summary, delta.reasoning_text, delta.reasoning_content, delta.reasoning, delta.thinking].some(value => typeof value === 'string' && value.length > 0);
-					if (hasReasoning) formatting.reasoningChunks++;
-					if (contentChoices.has(index) && hasReasoning) formatting.reasoningAfterContent++;
-					if (delta.cot_id || delta.reasoning_opaque || delta.signature) formatting.reasoningIdChunks++;
-					if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) formatting.toolCallChunks++;
-					if (typeof delta.content === 'string' && delta.content.length > 0) {
-						if (hasReasoning) formatting.mixedReasoningContent++;
-						formatting.contentChunks++;
-						formatting.contentNewlines += (delta.content.match(/\n/g) || []).length;
-						if (contentChoices.size < 128) contentChoices.add(index);
-					}
+	const consumeEvent = (event, { dropped = false, invalid = false, dataLength = 0, lineLength = 0 } = {}) => {
+		if (finished || !requestStats) return;
+		if (dropped || dataLength + 1 > MAX_SSE_LINE_LENGTH || lineLength > MAX_SSE_LINE_LENGTH) { formatting.droppedEvents++; return; }
+		if (invalid) { formatting.invalidEvents++; return; }
+		try {
+			formatting.parsedEvents++;
+			applyUsage(requestStats, event.usage);
+			for (const choice of Array.isArray(event.choices) ? event.choices : []) {
+				const delta = choice?.delta;
+				if (!delta) continue;
+				const index = choice.index ?? 0;
+				const hasReasoning = typeof delta.cot_summary === 'string' && delta.cot_summary.length > 0 ||
+					typeof delta.reasoning_text === 'string' && delta.reasoning_text.length > 0 ||
+					typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0 ||
+					typeof delta.reasoning === 'string' && delta.reasoning.length > 0 ||
+					typeof delta.thinking === 'string' && delta.thinking.length > 0;
+				if (hasReasoning) formatting.reasoningChunks++;
+				if (contentChoices.has(index) && hasReasoning) formatting.reasoningAfterContent++;
+				if (delta.cot_id || delta.reasoning_opaque || delta.signature) formatting.reasoningIdChunks++;
+				if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) formatting.toolCallChunks++;
+				if (typeof delta.content === 'string' && delta.content.length > 0) {
+					if (hasReasoning) formatting.mixedReasoningContent++;
+					formatting.contentChunks++;
+					for (let newline = delta.content.indexOf('\n'); newline >= 0; newline = delta.content.indexOf('\n', newline + 1)) formatting.contentNewlines++;
+					if (contentChoices.size < 128) contentChoices.add(index);
 				}
-			} catch { formatting.invalidEvents++; }
+			}
+		} catch { formatting.invalidEvents++; }
+	};
+	const flushEvent = () => {
+		if (droppingEvent) consumeEvent(undefined, { dropped: true });
+		const data = eventData.trim();
+		if (!droppingEvent && data && data !== '[DONE]') {
+			try { consumeEvent(JSON.parse(eventData)); } catch { consumeEvent(undefined, { invalid: true }); }
 		}
 		eventData = '';
 		droppingEvent = false;
@@ -292,6 +395,7 @@ function createUsageParser(contentType, requestStats) {
 
 	return {
 		formatting,
+		consumeEvent,
 		consume(chunk) {
 			if (finished || !requestStats) return;
 			const text = decoder.write(chunk);
@@ -305,12 +409,12 @@ function createUsageParser(contentType, requestStats) {
 		},
 		finish() {
 			if (finished || !requestStats) return;
-			finished = true;
 			if (isEventStream) {
 				consumeEventStream(decoder.end());
 				if (lineBuffer && !droppingLine) processLine(lineBuffer);
 				flushEvent();
 				lineBuffer = '';
+				finished = true;
 				return;
 			}
 			if (jsonBuffer !== null) {
@@ -318,6 +422,7 @@ function createUsageParser(contentType, requestStats) {
 				try { applyUsage(requestStats, JSON.parse(jsonBuffer).usage); } catch {}
 			}
 			jsonBuffer = '';
+			finished = true;
 		}
 	};
 }
@@ -332,6 +437,7 @@ module.exports = {
 	MAX_JSON_STATS_BODY,
 	MAX_JSON_REQUEST_BODY,
 	createStats,
+	parseRequestBody,
 	recordRequest,
 	applyUsage,
 	commitRequest,

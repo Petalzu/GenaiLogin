@@ -1,11 +1,17 @@
 # Change Log
 
-## [0.0.24-beta] - Local Testing Only (Unpublished)
+## [0.0.24] - 2026-10-29
 
 - Match request-model statistics parsing to the bridge's 20 MiB request limit so large valid conversations retain their model name. Missing or invalid model names still record as unknown without rejecting requests.
 - Price DeepSeek-V4.1-Flash-1017 using the existing DeepSeek-V4.1-Flash rates and peak schedule. Use off-peak pricing when the request start time is unavailable and display a single estimate instead of a range.
 - Display total and per-model input/output token usage in millions (M), preserving exact stored counts. Add a historical estimated USD total with an explicit note for unpriced usage.
-- Keep historical data corrections outside the extension; no automatic migration, model reassignment or historical repricing is included. This beta is for local installation only, not a Marketplace or GitHub release.
+- Keep the dashboard first render independent of history IO. Read a persisted total cache before background window-file validation, reuse unchanged records, and coalesce cache updates while retaining independent per-window accounting and recovery from stale or damaged caches.
+- Reuse the loaded history base across request updates, avoid an extra history-buffer copy, reduce temporary allocations in streaming diagnostics, and skip unchanged dashboard DOM writes. Preserve model-cap ordering, live legacy-storage updates, token counts and diagnostic fields.
+- Forward upstream retry hints and request IDs through a header allowlist; parse request metadata once, reuse single body chunks and release concatenation inputs. Share SSE JSON decoding between usage diagnostics and mixed-reasoning normalization, retain received tail usage on failed streams, and keep Cookie-expiry checks off the per-chunk activity path.
+- Add configurable FIFO admission for active requests, waiting requests and reserved request-body bytes before authentication or body buffering. Shrink upload reservations after assembly, remove cancelled or expired waiters, return retryable local overload responses, and recheck authentication cooldowns after admission. Preserve original request bytes for the existing bounded HTTP 401 recovery without replaying partially delivered responses.
+- Replace the DeepSeek chat preset with DeepSeek-V4.1-Flash-1017, including its display name and default reasoning setting. Retain old-model history, pricing and configuration removal support.
+- Update Undici to 7.30.1 and the MCP SDK dependency tree to body-parser 2.4.0, fast-uri 3.1.9 and qs 6.17.1 to resolve the reported production-dependency security advisories; the production dependency audit reports no known vulnerabilities.
+- Keep historical data corrections outside the extension; no automatic migration, model reassignment or historical repricing is included.
 
 ## [0.0.23]
 
