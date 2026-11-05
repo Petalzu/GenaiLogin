@@ -3,7 +3,7 @@ const { mkdir, copyFile, rm, readFile, readdir, writeFile } = require('node:fs/p
 const { resolve, dirname } = require('node:path');
 
 async function main() {
-    const modules = ['extension', 'auth', 'auth-forms', 'browser-auth', 'dashboard', 'stats', 'bridge-stream', 'copilot-config', 'copilot-models', 'upstream', 'image-mcp'];
+    const modules = ['extension', 'auth', 'auth-forms', 'browser-auth', 'dashboard', 'stats', 'bridge-stream', 'shared-control', 'copilot-config', 'copilot-models', 'upstream', 'image-mcp'];
     const dependencies = new Set();
     await rm(resolve(__dirname, 'dist'), { recursive: true, force: true });
     await mkdir(resolve(__dirname, 'dist'), { recursive: true });

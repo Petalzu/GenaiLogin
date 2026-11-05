@@ -330,10 +330,24 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.match(await page.locator('#last-check').getAttribute('title'), /会话到期/);
             assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
             await render({ ...base, connection: 'connected', status: 'Connected :58379 (shared window)', shared: true,
+                sharedControl: 1, active: true, listening: true, connectedAt: Date.now() });
+            assert.equal(await page.locator('#status-text').textContent(), '已连接');
+            assert.ok(!(await page.locator('#keepalive-text').textContent()).includes('只读'));
+            for (const command of ['connect', 'diagnose', 'credentials', 'clear']) assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), false);
+            assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
+            await page.locator('[data-command="disconnect"]').click();
+            assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'disconnect');
+            await render({ ...base, connection: 'disconnected', status: 'Disconnected', shared: true,
+                sharedControl: 1, active: false, listening: true });
+            assert.equal(await page.locator('#status-text').textContent(), '待命');
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
+            await render({ ...base, connection: 'error', status: 'Authentication required; reconnect', shared: true,
+                sharedControl: 1, active: true, listening: true, keepalive: { state: 'needs-login' } });
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), true);
+            await render({ ...base, connection: 'connected', status: 'Connected :58379', shared: true,
                 active: true, listening: true, connectedAt: Date.now() });
-            assert.equal(await page.locator('#status-text').textContent(), '已连接 · 其他窗口');
-            assert.match(await page.locator('#keepalive-text').textContent(), /^只读/);
-            for (const command of ['connect', 'diagnose', 'credentials', 'clear', 'disconnect']) assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), false);
+            assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), false);
             assert.equal(await page.locator('[data-command="models"]').isEnabled(), true);
             assert.equal(await page.locator('[data-command="mcp"]').isEnabled(), true);
             if (process.env.GENAI_DASHBOARD_SCREENSHOTS) {

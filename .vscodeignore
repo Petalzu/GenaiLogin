@@ -11,3 +11,4 @@
 !CHANGELOG.md
 !media/**
 !node_modules/playwright-core/**
+release/**

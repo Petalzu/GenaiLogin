@@ -1,7 +1,5 @@
 const vscode = require('vscode');
-const http = require('node:http');
-const { createRequestLifetime, waitForSignal, forwardBody, createBridgeAdmission, proxyResponseHeaders, transportCode } = require('./bridge-stream');
-const { MAX_JSON_REQUEST_BODY, createStats, createHistory, createHistoryFiles, parseRequestBody, recordRequest, commitRequest, createUsageParser, modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
+const transportCode = error => require('./bridge-stream').transportCode(error);
 
 let stopActive;
 
@@ -82,6 +80,7 @@ async function convertImageResponse(payload, downloadImage) {
 }
 
 async function readImageResponseBody(response, lifetime, limit) {
+	const { waitForSignal } = require('./bridge-stream');
 	lifetime.signal.throwIfAborted();
 	if (!response.body) throw new Error('Empty image response');
 	const reader = response.body.getReader();
@@ -142,6 +141,8 @@ function activate(context) {
 	let history;
 	const getHistory = () => {
 		if (!history) {
+			getStats();
+			const { createHistory, createHistoryFiles } = require('./stats');
 			const files = context.globalStorageUri ? createHistoryFiles(vscode.workspace.fs,
 				vscode.Uri.joinPath(context.globalStorageUri, 'usage-history'), vscode.Uri.joinPath,
 				() => trace('An unreadable history record was preserved and skipped; other totals remain available.')) : undefined;
@@ -158,15 +159,19 @@ function activate(context) {
 	const pendingActions = new Map();
 	let dashboard;
 	let sharedState, syncInFlight, syncDisposed = false;
-	let syncController = new AbortController();
+	const syncController = new AbortController();
 	let syncTimer;
 	let keepaliveInfo = { state: 'idle', lastCheckAt: null };
 	let sessionPersistence, sessionPersistenceInfo = 'idle';
 	const configuredPort = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
-	const stats = createStats(Number.isInteger(configuredPort) && configuredPort >= 1024 && configuredPort <= 65535 ? configuredPort : 58379);
+	const stats = { port: Number.isInteger(configuredPort) && configuredPort >= 1024 && configuredPort <= 65535 ? configuredPort : 58379, connectedAt: null };
+	const getStats = () => { if (!stats.models) Object.assign(stats, require('./stats').createStats(stats.port)); return stats; };
+	const sharedControl = require('./shared-control').createSharedControl(context.globalStorageUri?.fsPath, stats.port);
+	let controlState, listenerInstance, resumeSavedSession = false;
 	let admission;
 	const getAdmission = () => {
 		if (!admission) {
+			const { createBridgeAdmission } = require('./bridge-stream');
 			const configuration = vscode.workspace.getConfiguration('genai-login');
 			const bounded = (name, fallback, minimum, maximum) => {
 				const value = configuration.get(name, fallback);
@@ -199,83 +204,98 @@ function activate(context) {
 		if (connection !== 'authenticating') loginPhase = undefined;
 		dashboard?.refresh();
 	};
-	const localSnapshot = () => ({
-		status: state,
-		connection, loginPhase, active: Boolean(active), listening: listenerReady, shared: false,
-		pendingActions: [...pendingActions.keys()],
-		bridge: admission?.snapshot(),
-		history: context.globalStorageUri && (!history || history.state() !== 'ready') ? undefined : getHistory().snapshot(),
-		historyState: history?.state() || (context.globalStorageUri ? 'loading' : 'ready'),
-		port: stats.port,
-		connectedAt: stats.connectedAt,
-		requests: stats.requests,
-		tokensIn: stats.tokensIn,
-		tokensOut: stats.tokensOut,
-		usageReports: stats.usageReports,
-		usageMissing: stats.usageMissing,
-		inputUsageReports: stats.inputUsageReports,
-		outputUsageReports: stats.outputUsageReports,
-		modelUsage: modelUsageRows(stats.modelUsage),
-		pricing: DEEPSEEK_PRICING,
-		models: [...stats.models].map(([name, requests]) => ({ name, requests })).concat(stats.otherModels ? [{ name: '其他模型', requests: stats.otherModels }] : []),
-		keepalive: { ...keepaliveInfo },
-		sessionPersistence: sessionPersistenceInfo
-	});
+	const localSnapshot = (includeUsage = true) => {
+		const snapshot = {
+			status: state,
+			connection, loginPhase, active: Boolean(active), listening: listenerReady, shared: false,
+			sharedControl: 1, instance: listenerInstance,
+			pendingActions: [...pendingActions.keys()],
+			port: stats.port, connectedAt: stats.connectedAt,
+			keepalive: { ...keepaliveInfo }, sessionPersistence: sessionPersistenceInfo,
+			models: []
+		};
+		if (!includeUsage) return snapshot;
+		getStats();
+		const { modelUsageRows, DEEPSEEK_PRICING } = require('./stats');
+		return { ...snapshot,
+			bridge: admission?.snapshot(),
+			history: context.globalStorageUri && (!history || history.state() !== 'ready') ? undefined : getHistory().snapshot(),
+			historyState: history?.state() || (context.globalStorageUri ? 'loading' : 'ready'),
+			requests: stats.requests,
+			tokensIn: stats.tokensIn,
+			tokensOut: stats.tokensOut,
+			usageReports: stats.usageReports,
+			usageMissing: stats.usageMissing,
+			inputUsageReports: stats.inputUsageReports,
+			outputUsageReports: stats.outputUsageReports,
+			modelUsage: modelUsageRows(stats.modelUsage),
+			pricing: DEEPSEEK_PRICING,
+			models: [...stats.models].map(([name, requests]) => ({ name, requests })).concat(stats.otherModels ? [{ name: '其他模型', requests: stats.otherModels }] : [])
+		};
+	};
 	const stateSnapshot = () => {
 		const local = localSnapshot();
-		if (active || !sharedState) return local;
+		if (active || listenerReady || !sharedState) return local;
 		const remoteHistory = sharedState.history;
 		const useRemoteHistory = remoteHistory && sharedState.historyState !== 'loading' && sharedState.historyState !== 'error' &&
 			(!local.history || ['requests', 'tokensIn', 'tokensOut'].every(field => Number(remoteHistory[field] || 0) >= Number(local.history[field] || 0)) &&
 				['requests', 'tokensIn', 'tokensOut'].some(field => Number(remoteHistory[field] || 0) > Number(local.history[field] || 0)));
-		return { ...sharedState, shared: true, pendingActions: [...pendingActions.keys()], status: `${sharedState.status} (shared window)`,
+		return { ...sharedState, shared: true, pendingActions: [...new Set([...(sharedState.pendingActions || []), ...pendingActions.keys()])],
 			history: useRemoteHistory ? remoteHistory : local.history,
 			historyState: useRemoteHistory ? 'ready' : local.historyState };
 	};
-	const syncSharedState = () => {
-		if (syncDisposed || active || listenerReady) return Promise.resolve();
+	const syncSharedState = (allowTakeover = true) => {
+		if (syncDisposed) return Promise.resolve();
 		if (syncInFlight) return syncInFlight;
 		const currentController = syncController;
+		const version = connectionVersion;
 		syncInFlight = (async () => {
 			let next;
 			try {
-				const response = await fetch(`http://127.0.0.1:${stats.port}/internal/status`, {
-					headers: { Authorization: 'Bearer local-browser-session' },
-					redirect: 'error',
+				const previous = controlState;
+				controlState = await sharedControl.read();
+				if (version !== connectionVersion || syncDisposed || currentController.signal.aborted) return;
+				if (controlState.mode === 'disconnected' && previous?.revision !== controlState.revision && (active || listenerReady)) {
+					returnToStandby();
+					await startListener();
+					return;
+				}
+				if (active || listenerReady) {
+					return;
+				}
+				const payload = await require('./shared-control').requestSharedState(stats.port, 'status', {
+					headers: !dashboard?.view?.visible ? { 'x-genai-status': 'brief' } : undefined,
 					signal: AbortSignal.any([currentController.signal, AbortSignal.timeout(1500)])
 				});
-				if (!response.ok) { await response.body?.cancel(); return; }
-				const payload = await response.json();
 				if (payload.service === 'genai-login' && payload.version === 1 &&
 					payload.state?.port === stats.port && typeof payload.state.status === 'string' &&
 					Array.isArray(payload.state.models) && payload.state.keepalive) next = payload.state;
-			} catch {}
+			} catch (error) {
+				if (allowTakeover && version === connectionVersion && !syncDisposed && !currentController.signal.aborted && controlState &&
+					['standby', 'connected', 'disconnected'].includes(controlState.mode) &&
+					(error.cause?.code === 'ECONNREFUSED' || error.code === 'ECONNREFUSED')) {
+					resumeSavedSession = controlState.mode === 'connected' && sharedState?.active === true;
+					try {
+						if (await startListener() && resumeSavedSession && !syncDisposed) await connect(false, true);
+					} catch (failure) { trace(`Shared connection handover failed: code=${transportCode(failure)}`); }
+				}
+			}
 			finally {
-				if (!syncDisposed && !active && !listenerReady && !currentController.signal.aborted) { sharedState = next; dashboard?.refresh(); }
+				if (version === connectionVersion && !syncDisposed && !active && !listenerReady && !currentController.signal.aborted) { sharedState = next; dashboard?.refresh(); }
 			}
 		})().finally(() => { if (currentController === syncController) syncInFlight = undefined; });
 		return syncInFlight;
 	};
 	const setSyncVisible = visible => {
-		clearInterval(syncTimer);
-		syncTimer = undefined;
-		if (!visible || syncDisposed) {
-			syncController.abort();
-			syncController = new AbortController();
-			syncInFlight = undefined;
-			return;
-		}
+		if (!visible || syncDisposed) return;
 		const refreshHistory = () => { if (!syncDisposed) dashboard?.refresh(); };
 		void getHistory().reload(refreshHistory).then(refreshHistory);
-		if (active || listenerReady) return;
 		void syncSharedState();
-		syncTimer = setInterval(() => { void syncSharedState(); }, 2000);
-		syncTimer.unref?.();
 	};
 	const requireOwner = async () => {
 		if (!active && !listenerReady) await syncSharedState();
 		if (!active && sharedState) {
-			await vscode.window.showInformationMessage('GENAI is connected in another VS Code window. Manage the connection in that window.');
+			await vscode.window.showInformationMessage('请先断开共享连接，再修改凭据、清除会话或启动可见诊断。');
 			return false;
 		}
 		return true;
@@ -296,33 +316,65 @@ function activate(context) {
 	const startListener = async () => {
 		if (listenerReady) return true;
 		if (listenerStartPromise) return listenerStartPromise;
+		const http = require('node:http');
 		const operation = (async () => {
 			const owner = new AbortController();
 			listenerController = owner;
+			const instance = require('node:crypto').randomUUID();
 			const candidate = http.createServer((request, response) => {
+				const requestOwner = listenerController;
+				const requestInstance = listenerInstance;
 				void (async () => {
 					const rejected = rejectLocalRequest(request);
 					if (rejected) { trace(`Local request rejected: ${rejected}`); return sendError(response, 403, `Local authenticated clients only: ${rejected}`); }
 					if (request.method === 'GET' && request.url === '/internal/status') {
 						response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-						return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot() }));
+						return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot(request.headers['x-genai-status'] !== 'brief') }));
+					}
+					if (request.method === 'POST' && ['/internal/connect', '/internal/disconnect'].includes(request.url)) {
+						if (request.headers['x-genai-instance'] !== requestInstance) return sendError(response, 409, 'Shared connection changed; refresh and retry.');
+						if (request.url === '/internal/disconnect') {
+							const revision = request.headers['x-genai-control-revision'];
+							if (typeof revision !== 'string' || !revision) return sendError(response, 409, 'Shared control revision required.');
+							const next = await sharedControl.update('disconnected', revision);
+							if (!next || syncDisposed || server !== candidate || listenerInstance !== requestInstance) return sendError(response, 409, 'Shared connection changed; refresh and retry.');
+							controlState = next;
+							response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', connection: 'close' });
+							response.end(JSON.stringify({ service: 'genai-login', version: 1, disconnected: true }), () => {
+								if (server !== candidate || listenerInstance !== requestInstance) return;
+								returnToStandby();
+								void startListener().catch(reportError);
+							});
+							return;
+						}
+						void actions.connect().catch(reportError);
+						response.writeHead(202, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+						return response.end(JSON.stringify({ service: 'genai-login', version: 1, accepted: true }));
 					}
 					if (request.url === '/mcp') {
 						if (!imageMcpEnabled()) return sendError(response, 404, 'Drawing MCP is disabled');
 						return require('./image-mcp').handleImageMcp(request, response, {
-							port: stats.port, directory: context.globalStorageUri?.fsPath, signal: owner.signal, detectImageMimeType
+							port: stats.port, directory: context.globalStorageUri?.fsPath, signal: requestOwner.signal, detectImageMimeType
 						});
 					}
 					const supported = request.method === 'POST' && ['/v1/chat/completions', '/v1/images/generations'].includes(request.url) || request.method === 'GET' && request.url === '/v1/models';
 					if (!supported) return sendError(response, 404, 'Not found');
 					if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
+					if (!requestHandler && request.method === 'GET' && request.url === '/v1/models') {
+						response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+						return response.end(JSON.stringify({ object: 'list', data: require('./genai-models.json').models.map(model => ({
+							id: model.id, object: 'model', created: 0, owned_by: 'genai'
+						})) }));
+					}
 					if (!requestHandler && automaticRetryAt > Date.now()) return sendError(response, 503,
 						'GENAI automatic connection is cooling down after a temporary network or service failure; retry later or reconnect explicitly.', automaticRetryHeaders());
+					const { MAX_JSON_REQUEST_BODY } = require('./stats');
+					const { createRequestLifetime, waitForSignal } = require('./bridge-stream');
 					const contentLength = request.headers['content-length'];
 					const declaredBytes = typeof contentLength === 'string' && /^\d+$/.test(contentLength) ? Number(contentLength) : undefined;
 					if (declaredBytes > MAX_JSON_REQUEST_BODY) return sendError(response, 413, 'Request too large');
 					const bodyBudget = Number.isSafeInteger(declaredBytes) ? declaredBytes : request.method === 'GET' && !request.headers['transfer-encoding'] ? 0 : MAX_JSON_REQUEST_BODY;
-					const queuedLifetime = createRequestLifetime(response, owner.signal);
+					const queuedLifetime = createRequestLifetime(response, requestOwner.signal);
 					const cancelQueued = () => request.destroy();
 					queuedLifetime.signal.addEventListener('abort', cancelQueued, { once: true });
 					let permit;
@@ -377,8 +429,8 @@ function activate(context) {
 				await new Promise((resolve, reject) => { candidate.once('error', reject); candidate.listen(stats.port, '127.0.0.1', resolve); });
 				if (owner.signal.aborted || server !== candidate || syncDisposed) { candidate.close(); return false; }
 				listenerReady = true;
+				listenerInstance = instance;
 				sharedState = undefined;
-				clearInterval(syncTimer); syncTimer = undefined;
 				trace(`Local bridge listener ready on 127.0.0.1:${stats.port}`);
 				dashboard?.refresh();
 				return true;
@@ -386,7 +438,10 @@ function activate(context) {
 				if (server === candidate) server = undefined;
 				candidate.closeAllConnections?.(); candidate.close?.();
 				if (owner.signal.aborted || syncDisposed) return false;
-				if (error.code === 'EADDRINUSE') { await syncSharedState(); if (sharedState) return false; }
+				if (error.code === 'EADDRINUSE') {
+					if (!syncInFlight) await syncSharedState(false);
+					if (sharedState || syncInFlight) return false;
+				}
 				throw error;
 			}
 		})();
@@ -408,13 +463,27 @@ function activate(context) {
 			automaticRetryAt = 0; automaticFailures = 0;
 			listenerController?.abort(); listenerController = undefined; listenerStartPromise = undefined;
 			server?.closeAllConnections(); server?.close(); server = undefined; listenerReady = false;
+			listenerInstance = undefined;
 		}
-		stats.connectedAt = null; stats.requests = 0; stats.tokensIn = 0; stats.tokensOut = 0; stats.usageReports = 0; stats.usageMissing = 0; stats.models.clear(); stats.otherModels = 0;
-		stats.inputUsageReports = 0; stats.outputUsageReports = 0;
-		stats.modelUsage.clear();
+		stats.connectedAt = null;
+		if (stats.models) {
+			stats.requests = 0; stats.tokensIn = 0; stats.tokensOut = 0; stats.usageReports = 0; stats.usageMissing = 0; stats.models.clear(); stats.otherModels = 0;
+			stats.inputUsageReports = 0; stats.outputUsageReports = 0;
+			stats.modelUsage.clear();
+		}
 		status('Disconnected');
 	};
-	stopActive = stop;
+	const returnToStandby = () => {
+		resumeSavedSession = false;
+		if (!listenerReady) { stop(); return; }
+		const previous = listenerController;
+		listenerController = new AbortController();
+		listenerInstance = require('node:crypto').randomUUID();
+		automaticRetryAt = 0; automaticFailures = 0;
+		stop(false);
+		previous?.abort();
+	};
+	stopActive = () => { syncDisposed = true; clearInterval(syncTimer); syncController.abort(); stop(); };
 	const credentials = async () => {
 		if (!await requireOwner()) return false;
 		if (active) throw new Error('Disconnect before changing credentials.');
@@ -435,18 +504,40 @@ function activate(context) {
 		if (active) return;
 		if (!automatic) { automaticLoginBlocked = false; automaticRetryAt = 0; automaticFailures = 0; }
 		const version = connectionVersion;
+		let intent = await sharedControl.read();
+		if (version !== connectionVersion || syncDisposed) return;
+		if (!automatic) {
+			if (intent.mode !== 'connecting') intent = await sharedControl.update('connecting', intent.revision);
+			if (!intent || version !== connectionVersion || syncDisposed) return;
+			controlState = intent;
+		}
 		if (!await startListener() || version !== connectionVersion || syncDisposed) return;
 		await getHistory().reload();
 		if (active || sharedState || version !== connectionVersion || syncDisposed) return;
+		const resuming = resumeSavedSession;
+		resumeSavedSession = false;
 		if (diagnostic) output.show(true);
 		trace(diagnostic ? 'Visible diagnostic connection requested' : automatic ? 'Automatic connection requested' : 'Manual connection requested');
 		let stored = await context.secrets.get('credentials');
 		if (version !== connectionVersion || syncDisposed) return;
+		if (!stored && resuming) {
+			automaticLoginBlocked = true;
+			keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
+			status('Authentication required; reconnect');
+			return;
+		}
 		if (!stored) { if (!await credentials()) return; stored = await context.secrets.get('credentials'); }
 		if (active || version !== connectionVersion || syncDisposed) return;
 		const controller = new AbortController(); active = controller;
 		try {
+		controlState = await sharedControl.read();
+		if (controlState.revision !== intent.revision && (!resuming || controlState.mode !== 'connected')) { stop(); return; }
+		if (automatic && !resuming) controlState = await sharedControl.update('connecting', controlState.revision);
+		if (!controlState || controller.signal.aborted || syncDisposed) { if (active === controller) stop(); return; }
+		let intentRevision = controlState.revision;
 		status('Connecting');
+		const { createRequestLifetime, waitForSignal, forwardBody, proxyResponseHeaders } = require('./bridge-stream');
+		const { MAX_JSON_REQUEST_BODY, parseRequestBody, recordRequest, commitRequest, createUsageParser } = require('./stats');
 		const { Agent, fetch: upstreamFetch } = require('./upstream');
 		const { Session, createKeepaliveSchedule, createSessionPersistence, ORIGIN } = require('./auth');
 		const { browserLogin: login } = require('./browser-auth');
@@ -488,15 +579,32 @@ function activate(context) {
 				status('Authenticating');
 				authentication = (async () => {
 					await retainedBrowser?.(); retainedBrowser = undefined;
-					retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic,
+					if (force) {
+						const current = await sharedControl.read();
+						const next = current.mode !== 'disconnected' && await sharedControl.update('connecting', current.revision);
+						if (!next || !isCurrentConnection()) { if (active === controller) stop(); controller.signal.throwIfAborted(); return; }
+						controlState = next;
+						intentRevision = next.revision;
+					}
+					if (resuming && !force) {
+						if (!savedSession || !await session.valid(AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]))) {
+							throw Object.assign(new Error('Shared session needs explicit verification'), { code: 'SESSION_RESUME_REQUIRED', retryAuthentication: false });
+						}
+					} else retainedBrowser = await login(session, account, controller.signal, loginTrace, undefined, diagnostic, !diagnostic,
 						{ force: true });
 					controller.signal.throwIfAborted();
 					if (active !== controller) return;
+					automaticLoginBlocked = false;
 					sessionVersion++;
 					authenticationRetryAt = 0;
 					authenticationFailures = 0;
 					healthFailures = 0;
-					void persist();
+					void persist().then(async saved => {
+						if (!saved || !isCurrentConnection()) return;
+						const revision = intentRevision;
+						const next = await sharedControl.update('connected', revision);
+						if (next && isCurrentConnection() && intentRevision === revision) { controlState = next; intentRevision = next.revision; }
+					}).catch(error => trace(`Shared session readiness unavailable: code=${transportCode(error)}`));
 					if (!isCurrentConnection()) return;
 					keepaliveSchedule.checked();
 					keepaliveInfo = { state: 'healthy', lastCheckAt: Date.now() };
@@ -803,6 +911,7 @@ function activate(context) {
 			if (controller.signal.aborted) return;
 			trace(`Connection failed: code=${transportCode(error)}; inspect preceding stage (no credentials logged)`); output.show(true);
 			if (active === controller) stop(false);
+			if (resuming && temporaryAuthenticationFailure(error)) resumeSavedSession = true;
 			if (automatic && (error.retryAuthentication === false ||
 				error.name === 'TimeoutError' && error.retryAuthentication !== true || error.code === 'CREDENTIALS_REJECTED')) {
 				automaticLoginBlocked = true;
@@ -827,6 +936,11 @@ function activate(context) {
 	};
 	const connect = async (diagnostic = false, automatic = false) => {
 		if (connectPromise) return connectPromise;
+		if (!automatic && !diagnostic && !active && !listenerReady) {
+			await syncSharedState();
+			if (sharedState) { await controlSharedConnection('connect'); return; }
+		}
+		if (!automatic) resumeSavedSession = false;
 		if (active) return !automatic && !diagnostic && ['error', 'retrying', 'needs-login'].includes(keepaliveInfo.state) ? reconnectActive?.() : undefined;
 		if (automatic && ['credentials', 'clear', 'diagnose'].some(name => pendingActions.has(name))) throw new Error('GENAI configuration is changing; retry after it completes.');
 		const pending = automatic ? {} : undefined;
@@ -874,16 +988,48 @@ function activate(context) {
 		if (active) { await vscode.window.showInformationMessage('Disconnect GENAI before starting a visible diagnostic login.'); return; }
 		await connect(true);
 	};
-	const actions = { connect, diagnose, credentials, models, mcp, port, disconnect: async () => { if (await requireOwner()) stop(); }, clear: async () => {
+	const controlSharedConnection = async command => {
+		const peer = sharedState;
+		if (peer?.sharedControl !== 1 || typeof peer.instance !== 'string') throw Object.assign(new Error('Update all GENAI windows before shared control'), { code: 'SHARED_CONTROL_UNAVAILABLE' });
+		const result = await require('./shared-control').requestSharedState(stats.port, command, {
+			headers: { 'x-genai-instance': peer.instance,
+				...(command === 'disconnect' ? { 'x-genai-control-revision': controlState.revision } : {}) },
+			signal: AbortSignal.any([syncController.signal, AbortSignal.timeout(3000)])
+		});
+		if (result.service !== 'genai-login' || result.version !== 1 || !(result.disconnected || result.accepted)) throw new Error('Invalid shared connection acknowledgement');
+		if (command === 'disconnect') sharedState = undefined;
+		else await syncSharedState();
+	};
+	const disconnect = async () => {
+		if (!active && !listenerReady && !sharedState && !syncInFlight) await syncSharedState(false);
+		const remote = !active && !listenerReady && sharedState;
+		if (remote && remote.sharedControl !== 1) await controlSharedConnection('disconnect');
+		controlState = await sharedControl.update('disconnected');
+		returnToStandby();
+		if (remote) {
+			try { await controlSharedConnection('disconnect'); }
+			catch (error) {
+				if (error.cause?.code !== 'ECONNREFUSED' && error.code !== 'ECONNREFUSED') {
+					trace(`Shared disconnect acknowledgement unavailable: code=${transportCode(error)}`);
+				}
+			}
+		}
+		sharedState = undefined;
+		await startListener();
+	};
+	const actions = { connect, diagnose, credentials, models, mcp, port, disconnect, clear: async () => {
 		if (!await requireOwner()) return;
 		const owner = active;
 		const answer = await vscode.window.showWarningMessage('清除保存的账号和 Cookie？', { modal: true, detail: '当前连接将断开，账号和 Cookie 将删除。历史用量保留；此操作不会撤销服务器端会话。' }, '清除凭据');
 		if (answer !== '清除凭据' || !await requireOwner() || active !== owner) return;
-		stop(); await sessionPersistence?.flush(); await context.secrets.delete('credentials'); await context.secrets.delete('session');
+		await disconnect(); await sessionPersistence?.flush(); await context.secrets.delete('credentials'); await context.secrets.delete('session');
 	} };
 	const reportError = async error => {
 		if (error?.name === 'AbortError') return;
-		const message = error?.code === 'EADDRINUSE' ? `端口 ${stats.port} 已占用。请关闭其他桥接，或设置另一个端口后重载。` :
+		const message = error?.code === 'SHARED_CONTROL_UNAVAILABLE' ? '请先重载所有 GENAI 窗口，使它们使用同一个支持共享控制的版本。' :
+			error?.code === 'SHARED_CONTROL_FAILED' ? '共享连接已变化或暂时无法响应，请等待状态同步后重试。' :
+			error?.code === 'SESSION_RESUME_REQUIRED' ? '共享会话已失效，请点击连接完成验证；不会自动重复 MFA。' :
+			error?.code === 'EADDRINUSE' ? `端口 ${stats.port} 已占用。请关闭其他桥接，或设置另一个端口后重载。` :
 			error?.code === 'SESSION_CHECK_TIMEOUT' ? (error.retryAuthentication === false ?
 				'GENAI 登录后的会话验证网络超时。为避免重复 MFA，请稍后重新连接；无需清除账号。' :
 				'GENAI 会话检查网络超时，自动连接未禁用。请稍后重试请求或重新连接；无需清除账号。') :
@@ -912,7 +1058,18 @@ function activate(context) {
 	dashboard = new DashboardProvider(stateSnapshot, actions, reportError, setSyncVisible, trace);
 	context.subscriptions.push({ dispose: () => { syncDisposed = true; clearInterval(syncTimer); syncController.abort(); } });
 	context.subscriptions.push(vscode.window.registerWebviewViewProvider('genai-login.session', dashboard, { webviewOptions: { retainContextWhenHidden: false } }), { dispose: () => dashboard.dispose() }, { dispose: stop });
-	return startListener().catch(error => {
+	syncTimer = setInterval(() => syncSharedState().catch(error => trace(`Shared connection sync failed: code=${transportCode(error)}`)), 2000);
+	syncTimer.unref?.();
+	return sharedControl.read().then(async value => {
+		controlState = value;
+		if (syncDisposed) return;
+		if (value.mode === 'connecting') {
+			automaticLoginBlocked = true;
+			keepaliveInfo = { state: 'needs-login', lastCheckAt: Date.now() };
+			status('Authentication required; reconnect');
+		}
+		await startListener();
+	}).catch(error => {
 		trace(`Local bridge listener unavailable: code=${transportCode(error)}`);
 		void reportError(error);
 	});

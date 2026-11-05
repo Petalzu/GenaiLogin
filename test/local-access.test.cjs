@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const { setImmediate: nextTurn } = require('node:timers/promises');
 const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
+const sharedControlModule = process.env.GENAI_SHARED_CONTROL_MODULE || '../shared-control';
 
 const pngImage = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+nmf0AAAAASUVORK5CYII=', 'base64');
 
@@ -13,6 +14,7 @@ function connectionHarness(options = {}) {
     const messages = [];
     const subscriptions = [];
     const timers = [];
+    const intervals = new Set();
     const loginCalls = [];
     const servers = [];
     let provider;
@@ -20,7 +22,7 @@ function connectionHarness(options = {}) {
     let mcpEnabled = options.mcpEnabled || false;
     const updates = [], notices = [];
     const loaded = [], traces = [];
-    const saved = new Map(options.credentials === false ? [] : [['credentials', '{"username":"test","password":"dummy"}']]);
+    const saved = options.saved || new Map(options.credentials === false ? [] : [['credentials', '{"username":"test","password":"dummy"}']]);
     const disposable = { dispose() {} };
     const fakeVscode = {
         workspace: {
@@ -89,27 +91,36 @@ function connectionHarness(options = {}) {
         module: { exports: {} }, AbortController, AbortSignal, Buffer, URL,
         Date: options.now ? class extends Date { static now() { return options.now(); } } : Date,
         setTimeout: (callback, milliseconds) => { const timer = { callback, milliseconds, unref() {} }; timers.push(timer); return timer; },
-        clearTimeout(timer) { if (timer) timer.cancelled = true; }, setInterval: () => ({ unref() {} }), clearInterval() {},
-        fetch: async () => { throw new Error('no other owner'); },
+        clearTimeout(timer) { if (timer) timer.cancelled = true; },
+        setInterval: callback => { const timer = { callback, unref() {} }; intervals.add(timer); return timer; },
+        clearInterval: timer => intervals.delete(timer),
         require: name => {
             loaded.push(name);
             if (name === 'vscode') return fakeVscode;
             if (name === 'node:http') return options.realHttp ? require('node:http') : fakeHttp;
             if (name === './upstream') return { Agent: class { destroy() { return Promise.resolve(); } }, fetch() { assert.fail('unexpected network'); } };
+            if (name === './shared-control') return options.realHttp ? require(sharedControlModule) : {
+                ...require(sharedControlModule), requestSharedState: async () => { throw new Error('no other owner'); }
+            };
             if (name === './auth') return { ...require('../auth'), Session };
             if (name === './browser-auth') return { browserLogin: async (...args) => { loginCalls.push(args); return options.login?.(...args); } };
+            if (name === './bridge-stream') return require(process.env.GENAI_BRIDGE_MODULE || '../bridge-stream');
             return require(name.startsWith('./') ? '../' + name.slice(2) : name);
         }
     };
     vm.runInNewContext(fs.readFileSync(process.env.GENAI_EXTENSION_MODULE || require.resolve('../extension.js'), 'utf8'), sandbox);
-    const ready = sandbox.module.exports.activate({ subscriptions, secrets, globalState: options.globalState || { get() {}, keys: () => [], update: async () => {} },
+    const globalState = options.globalState || { get() {}, keys: () => [], update: async () => {} };
+    const ready = sandbox.module.exports.activate({ subscriptions, secrets, globalState,
         globalStorageUri: options.directory ? { path: options.directory, fsPath: options.directory } : undefined });
     if (!options.deferDashboard) provider.resolveWebviewView({ visible: false, webview: { postMessage: message => messages.push(message.data), onDidReceiveMessage: () => disposable },
         onDidChangeVisibility: () => disposable, onDidDispose: () => disposable });
     return { loginCalls, timers, servers, messages, secrets, loaded, ready, commands, mcpProvider, updates, notices, traces,
         showDashboard: view => provider.resolveWebviewView(view),
         action: name => commands.get(`genai-login.${name}`)(),
+        poll: async () => { await Promise.all([...intervals].map(timer => timer.callback())); },
         snapshot: () => provider.getState(),
+        deactivate: () => sandbox.module.exports.deactivate(),
+        flushHistory: () => loaded.includes('./stats') ? require('../stats').createHistory(globalState).flush() : Promise.resolve(),
         dispose: () => { for (const item of subscriptions) item.dispose(); }
     };
 }
@@ -122,6 +133,95 @@ function chatExchange(url = '/v1/chat/completions', body = '{"model":"test","str
         destroy() { this.destroyed = true; }, async *[Symbol.asyncIterator]() { yield Buffer.from(body); } };
     return { request, response, chunks };
 }
+
+async function sharedWindows(context, mode) {
+    const probe = require('node:http').createServer();
+    await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise(resolve => probe.close(resolve));
+    const directory = await fs.promises.mkdtemp(require('node:path').join(require('node:os').tmpdir(), 'genai-windows-'));
+    const saved = new Map([['credentials', '{"username":"test","password":"dummy"}']]);
+    const control = require(sharedControlModule).createSharedControl(directory, port);
+    if (mode) {
+        await control.update(mode);
+        saved.set('session', '{"cookies":[]}');
+    }
+    const windows = [];
+    context.after(async () => {
+        for (const window of windows) window.dispose();
+        await Promise.all(windows.map(window => window.ready));
+        await nextTurn();
+        await Promise.all(windows.map(window => window.flushHistory()));
+        await fs.promises.rm(directory, { recursive: true, force: true });
+    });
+    return {
+        control,
+        create(overrides = {}) {
+            const window = connectionHarness({ realHttp: true, port, directory, saved, deferDashboard: true, ...overrides });
+            windows.push(window);
+            return window;
+        },
+        async waitReady() {
+            const deadline = Date.now() + 2000;
+            while ((await control.read()).mode !== 'connected' && Date.now() < deadline) {
+                context.signal.throwIfAborted();
+                await nextTurn();
+            }
+            assert.equal((await control.read()).mode, 'connected');
+        },
+        async modelsStatus() {
+            const response = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+                headers: { Authorization: 'Bearer local-browser-session' }, signal: AbortSignal.timeout(2000)
+            });
+            await response.arrayBuffer();
+            return response.status;
+        },
+        async chatStatus() {
+            const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+                method: 'POST', headers: { Authorization: 'Bearer local-browser-session', 'Content-Type': 'application/json' },
+                body: '{"model":"test","stream":true,"messages":[]}', signal: AbortSignal.timeout(2000)
+            });
+            await response.arrayBuffer();
+            return response.status;
+        }
+    };
+}
+
+test('shared connection intent is atomic and a stale login cannot undo a global disconnect', async () => {
+    const directory = await fs.promises.mkdtemp(require('node:path').join(require('node:os').tmpdir(), 'genai-control-'));
+    const calls = {};
+    const countedFs = new Proxy(fs.promises, { get(target, name) {
+        const value = target[name];
+        return typeof value !== 'function' ? value : (...args) => { calls[name] = (calls[name] || 0) + 1; return value(...args); };
+    } });
+    const sandbox = { module: { exports: {} }, require: name => name === 'node:fs/promises' ? countedFs : require(name) };
+    vm.runInNewContext(fs.readFileSync(require.resolve(sharedControlModule), 'utf8'), sandbox);
+    const { createSharedControl } = sandbox.module.exports;
+    const first = createSharedControl(directory, 58480);
+    const second = createSharedControl(directory, 58480);
+    try {
+        assert.equal((await first.read()).mode, 'standby');
+        const connected = await first.update('connected');
+        assert.deepEqual(await second.read(), connected);
+        const disconnected = await second.update('disconnected');
+        assert.equal(await first.update('connected', connected.revision), undefined);
+        assert.deepEqual(await first.read(), disconnected);
+        const contenders = await Promise.all([first.update('connecting', disconnected.revision), second.update('connecting', disconnected.revision)]);
+        assert.equal(contenders.filter(Boolean).length, 1);
+        assert.equal((await first.read()).mode, 'connecting');
+        await Promise.all([
+            (async () => { for (let index = 0; index < 20; index++) await first.update(index % 2 ? 'connected' : 'connecting'); })(),
+            (async () => { for (let index = 0; index < 40; index++) assert.ok((await second.read()).revision); })()
+        ]);
+        assert.equal((await second.read()).mode, 'connected');
+        const before = { ...calls };
+        for (let index = 0; index < 20; index++) assert.equal((await second.read()).mode, 'connected');
+        for (const name of ['mkdir', 'open', 'readFile', 'unlink', 'rename']) assert.equal(calls[name], before[name], name);
+        assert.equal(calls.stat - before.stat, 20);
+        assert.deepEqual(await require('../shared-control').createSharedControl(directory, 58481).read(), { mode: 'standby', revision: '' });
+        assert.deepEqual((await fs.promises.readdir(directory)).filter(name => /\.lock$|\.tmp$/.test(name)), []);
+    } finally { await fs.promises.rm(directory, { recursive: true, force: true }); }
+});
 
 test('bridge preserves upstream retry hints without forwarding private or hop-by-hop headers', async () => {
     for (const route of ['/v1/chat/completions', '/v1/images/generations']) {
@@ -151,6 +251,56 @@ test('bridge preserves upstream retry hints without forwarding private or hop-by
             assert.equal(harness.snapshot().requests, 1);
         } finally { harness.dispose(); }
     }
+});
+
+test('bridge keeps continuous reasoning together without changing the request, answer, tools or usage', async () => {
+    const deltas = [{ reasoning: 'Default ', signature: 'fixture-signature' }, { content: '', reasoning: '' }, { reasoning: '44/44 tests pass.' },
+        { reasoning: ' Finished.', content: '**Result**\n' },
+        { content: 'Unchanged.', signature: 'fixture-signature' },
+        { signature: 'fixture-signature', tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'test', arguments: '{}' } }] }];
+    const events = deltas.map(delta => ({ choices: [{ index: 0, delta, logprobs: null, finish_reason: null, stop_reason: null, token_ids: null }] }));
+    events.splice(1, 0, { choices: [{ index: 0, finish_reason: null }], usage: { completion_tokens: 1 } });
+    events.splice(3, 0, { choices: [{ index: 0, delta: null }] });
+    events.push({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 19, completion_tokens: 7 } });
+    const input = Buffer.from(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n');
+    const requests = [];
+    const harness = connectionHarness({ request: async (url, options) => {
+        requests.push(options.body);
+        let offset = 0;
+        return new Response(new ReadableStream({ pull(controller) {
+            if (offset === input.length) controller.close();
+            else controller.enqueue(input.subarray(offset, ++offset));
+        } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+        await harness.ready;
+        await harness.action('connect');
+        const original = '{ "model": "DeepSeek-V4.1-Flash-1017", "stream": true, "messages": [], "tools": [] }';
+        const exchange = chatExchange('/v1/chat/completions', original);
+        const completed = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await completed; await nextTurn();
+        assert.deepEqual(requests, [Buffer.from(original)]);
+        assert.equal(exchange.response.status, 200);
+        const parsed = Buffer.concat(exchange.chunks).toString().split('\n\n').filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+        const choices = parsed.flatMap(event => event.choices);
+        const reasoning = choices.filter(choice => choice.delta.reasoning);
+        assert.equal(reasoning.map(choice => choice.delta.reasoning).join(''), 'Default 44/44 tests pass. Finished.');
+        assert.ok(choices.slice(0, reasoning.length).every(choice => choice.delta.reasoning));
+        assert.ok(reasoning.every(choice => (choice.delta.cot_id || choice.delta.signature) === 'fixture-signature'));
+        assert.ok(choices.filter(choice => !choice.delta.reasoning).every(choice => choice.delta.cot_id === undefined));
+        assert.equal(choices.filter(choice => choice.delta.signature).length, 1);
+        assert.equal(choices.filter(choice => choice.delta.content).map(choice => choice.delta.content).join(''), '**Result**\nUnchanged.');
+        assert.deepEqual(choices.find(choice => choice.delta.tool_calls).delta.tool_calls, deltas.at(-1).tool_calls);
+        assert.deepEqual(choices.at(-1), events.at(-1).choices[0]);
+        assert.equal(parsed.filter(event => event.usage).length, 2);
+        const state = harness.snapshot();
+        assert.equal(state.requests, 1);
+        assert.equal(state.tokensIn, 19);
+        assert.equal(state.tokensOut, 7);
+        assert.equal(state.bridge.active, 0);
+        assert.equal(state.bridge.reservedBytes, 0);
+    } finally { harness.dispose(); }
 });
 
 test('bridge admission queues before reading bodies, rejects overflow and skips cancelled requests', async () => {
@@ -298,32 +448,37 @@ test('bridge queue timeout returns retryable overload without reading the queued
     } finally { release?.(); harness.dispose(); }
 });
 
-test('activation listens only on loopback without reading credentials or loading authentication', async () => {
-    const harness = connectionHarness({ get: () => assert.fail('startup must not read secrets') });
-    try {
-        await harness.ready;
-        assert.equal(harness.servers.length, 1);
-        assert.equal(harness.servers[0].host, '127.0.0.1');
-        assert.equal(harness.servers[0].port, 58379);
-        assert.equal(harness.snapshot().listening, true);
-        assert.equal(harness.snapshot().active, false);
-        assert.equal(harness.snapshot().connectedAt, null);
-        assert.equal(harness.loginCalls.length, 0);
-        assert.equal(harness.timers.length, 0);
-        for (const name of ['undici', './upstream', './auth', './browser-auth', './image-mcp']) assert.ok(!harness.loaded.includes(name));
-    } finally { harness.dispose(); }
-});
-
-test('activation without a dashboard does not initialize or read usage history', async () => {
-    const harness = connectionHarness({ deferDashboard: true, globalState: {
+test('idle activation and brief status keep dependencies, history and credentials unloaded', async () => {
+    const harness = connectionHarness({ deferDashboard: true, get: () => assert.fail('startup must not read secrets'), globalState: {
         get: () => assert.fail('idle activation must not read history'),
         keys: () => assert.fail('idle activation must not enumerate history'),
         update: () => assert.fail('idle activation must not write history')
     } });
     try {
         await harness.ready;
+        assert.equal(harness.servers.length, 1);
+        assert.equal(harness.servers[0].host, '127.0.0.1');
+        assert.equal(harness.servers[0].port, 58379);
         assert.equal(harness.servers[0].listening, true);
-        assert.equal(harness.loaded.includes('node:crypto'), false);
+        const exchange = chatExchange('/internal/status');
+        exchange.request.method = 'GET';
+        exchange.request.headers['x-genai-status'] = 'brief';
+        const completed = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers[0].handle(exchange.request, exchange.response);
+        await completed;
+        const state = JSON.parse(Buffer.concat(exchange.chunks)).state;
+        assert.equal(state.sharedControl, 1);
+        assert.equal(state.listening, true);
+        assert.equal(state.active, false);
+        assert.equal(state.connectedAt, null);
+        assert.equal(state.history, undefined);
+        assert.equal(state.modelUsage, undefined);
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.timers.length, 0);
+        harness.dispose();
+        for (const name of ['./stats', './bridge-stream', './upstream', './auth', './browser-auth', './image-mcp']) {
+            assert.equal(harness.loaded.includes(name), false, name);
+        }
     } finally { harness.dispose(); }
 });
 
@@ -477,22 +632,39 @@ test('first Copilot chat request connects automatically without the connect comm
     } finally { harness.dispose(); }
 });
 
-test('first MCP image request connects automatically and returns inline image bytes', async () => {
-    const harness = connectionHarness({ request: async url => url.endsWith('/api/v1/images/generations')
-        ? Response.json([{ url: '/api/v1/files/file-1/content' }]) : new Response(pngImage) });
-    try {
-        await harness.ready;
-        const exchange = chatExchange('/v1/images/generations', '{"model":"qwen-image-2.1","prompt":"a red apple"}');
-        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
-        harness.servers[0].handle(exchange.request, exchange.response);
-        await finished;
-        assert.equal(exchange.response.status, 200);
-        assert.deepEqual(Buffer.from(JSON.parse(Buffer.concat(exchange.chunks).toString()).data[0].b64_json, 'base64'), pngImage);
-        assert.equal(harness.loginCalls.length, 1);
-    } finally { harness.dispose(); }
+test('first chat after a persisted disconnect connects once without a manual command', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context, 'disconnected');
+    const forwarded = [];
+    const options = { request: async (url, settings) => {
+        forwarded.push({ url, body: settings.body });
+        return Response.json({ choices: [{ message: { content: 'connected on demand' } }] });
+    } };
+    const first = group.create(options);
+    const second = group.create(options);
+    await Promise.all([first.ready, second.ready]);
+    await Promise.all([first.poll(), second.poll()]);
+    assert.equal([first, second].filter(window => window.snapshot().listening && !window.snapshot().shared).length, 1);
+    assert.equal(first.loginCalls.length + second.loginCalls.length, 0);
+    assert.equal(first.snapshot().active, false);
+    assert.equal(second.snapshot().active, false);
+    assert.equal((await group.control.read()).mode, 'disconnected');
+    const payload = JSON.stringify({ model: 'test', messages: [{ role: 'user', content: 'first prompt after disconnect' }] });
+    const port = first.snapshot().port;
+    await Promise.all(Array.from({ length: 2 }, async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+            method: 'POST', headers: { Authorization: 'Bearer local-browser-session', 'content-type': 'application/json' },
+            body: payload, signal: AbortSignal.timeout(3000)
+        });
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).choices[0].message.content, 'connected on demand');
+    }));
+    await group.waitReady();
+    assert.equal(first.loginCalls.length + second.loginCalls.length, 1);
+    assert.equal(forwarded.length, 2);
+    assert.ok(forwarded.every(request => request.url.endsWith('/api/v1/chat/completions') && request.body.equals(Buffer.from(payload))));
 });
 
-test('model discovery can initialize a connection without a chat request', async () => {
+test('model discovery stays local until a generation request or explicit connection', async () => {
     const harness = connectionHarness({ request: async url => {
         assert.equal(url, 'https://chat.genai.um.edu.mo/api/v1/models');
         return Response.json({ data: [{ id: 'test-model' }] });
@@ -505,9 +677,22 @@ test('model discovery can initialize a connection without a chat request', async
         harness.servers[0].handle(exchange.request, exchange.response);
         await finished;
         assert.equal(exchange.response.status, 200);
-        assert.equal(JSON.parse(Buffer.concat(exchange.chunks).toString()).data[0].id, 'test-model');
-        assert.equal(harness.loginCalls.length, 1);
+        const listed = JSON.parse(Buffer.concat(exchange.chunks).toString());
+        assert.equal(listed.object, 'list');
+        assert.deepEqual(listed.data.map(model => model.id), require('../genai-models.json').models.map(model => model.id));
+        assert.ok(listed.data.every(model => model.object === 'model'));
+        assert.equal(harness.loginCalls.length, 0);
+        assert.ok(!harness.loaded.includes('./auth'));
+        assert.equal(harness.snapshot().active, false);
         assert.equal(harness.snapshot().requests, 0);
+        await harness.action('connect');
+        const connected = chatExchange('/v1/models');
+        connected.request.method = 'GET';
+        const forwarded = new Promise(resolve => connected.response.once('finish', resolve));
+        harness.servers[0].handle(connected.request, connected.response);
+        await forwarded;
+        assert.equal(JSON.parse(Buffer.concat(connected.chunks).toString()).data[0].id, 'test-model');
+        assert.equal(harness.loginCalls.length, 1);
     } finally { harness.dispose(); }
 });
 
@@ -802,7 +987,7 @@ test('disconnect cancels the pending initial headless verification without recon
         assert.equal(closed, 1);
         assert.equal(harness.loginCalls[0][2].aborted, true);
         assert.equal(harness.snapshot().active, false);
-        assert.equal(harness.snapshot().listening, false);
+        assert.equal(harness.snapshot().listening, true);
         assert.equal(harness.snapshot().connection, 'disconnected');
     } finally { harness.dispose(); }
 });
@@ -812,7 +997,7 @@ test('disposal during listener startup cannot leave a listening server behind', 
     harness.dispose();
     await harness.ready;
     assert.equal(harness.snapshot().listening, false);
-    assert.equal(harness.servers[0].listening, false);
+    assert.ok(harness.servers.every(server => !server.listening));
     assert.equal(harness.loginCalls.length, 0);
 });
 
@@ -829,7 +1014,7 @@ test('disconnect while credentials are loading prevents a late automatic login',
         await nextTurn();
         assert.equal(harness.loginCalls.length, 0);
         assert.equal(harness.snapshot().active, false);
-        assert.equal(harness.snapshot().listening, false);
+        assert.equal(harness.snapshot().listening, true);
         assert.equal(exchange.request.destroyed, true);
         assert.equal(exchange.response.listenerCount('close'), 0);
     } finally { harness.dispose(); }
@@ -863,6 +1048,342 @@ test('real loopback HTTP requests initialize once and forward both chat and imag
         assert.deepEqual(Buffer.from((await image.json()).data[0].b64_json, 'base64'), pngImage);
         assert.equal(harness.loginCalls.length, 1);
     } finally { harness.dispose(); }
+});
+
+test('closing all windows releases the port and reopening waits for the first chat', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context, 'connected');
+    const first = group.create();
+    await first.ready;
+    assert.equal(first.snapshot().connection, 'disconnected');
+    assert.equal(first.snapshot().active, false);
+    assert.ok(!first.loaded.includes('./auth'));
+    await first.action('connect');
+    const second = group.create();
+    await second.ready;
+    assert.equal(second.snapshot().connection, 'connected');
+    await first.deactivate();
+    await nextTurn();
+    await second.poll();
+    assert.equal(second.snapshot().connection, 'connected');
+    const port = second.snapshot().port;
+    await second.deactivate();
+    await nextTurn();
+    assert.equal(second.snapshot().listening, false);
+    assert.equal(second.snapshot().active, false);
+    assert.ok(second.timers.every(timer => timer.cancelled));
+    await assert.rejects(require(sharedControlModule).requestSharedState(port, 'status'), { code: 'ECONNREFUSED' });
+    const reopened = group.create();
+    await reopened.ready;
+    await reopened.poll();
+    assert.equal(reopened.snapshot().connection, 'disconnected');
+    assert.equal(reopened.snapshot().active, false);
+    assert.equal(reopened.loginCalls.length, 0);
+    assert.ok(!reopened.loaded.includes('./auth'));
+    assert.equal(await group.modelsStatus(), 200);
+    assert.equal(reopened.snapshot().active, false);
+    assert.equal(reopened.loginCalls.length, 0);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { Authorization: 'Bearer local-browser-session', 'Content-Type': 'application/json' },
+        body: '{"model":"test","stream":true,"messages":[]}'
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.equal(reopened.loginCalls.length, 1);
+    assert.equal(reopened.snapshot().connection, 'connected');
+});
+
+test('any window can disconnect a shared connection and the next request reconnects once', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    const first = group.create();
+    await first.ready;
+    await first.action('connect');
+    const second = group.create();
+    await second.ready;
+    assert.equal(second.snapshot().shared, true);
+    assert.equal(second.snapshot().connection, 'connected');
+    assert.equal(second.loginCalls.length, 0);
+    await second.action('disconnect');
+    await nextTurn();
+    assert.equal(first.snapshot().connection, 'disconnected');
+    assert.equal(second.snapshot().connection, 'disconnected');
+    assert.equal(first.snapshot().active, false);
+    assert.equal(second.snapshot().active, false);
+    assert.equal([first, second].filter(window => window.snapshot().listening && !window.snapshot().shared).length, 1);
+    assert.equal(first.loginCalls.length, 1);
+    assert.equal(second.loginCalls.length, 0);
+    assert.deepEqual(second.notices, []);
+    assert.equal(await group.modelsStatus(), 200);
+    assert.equal(first.snapshot().active, false);
+    assert.equal(await group.chatStatus(), 200);
+    await group.waitReady();
+    await Promise.all([first.poll(), second.poll()]);
+    assert.equal(second.snapshot().connection, 'connected');
+    assert.equal(first.loginCalls.length + second.loginCalls.length, 2);
+    assert.equal(first.snapshot().connection, 'connected');
+    await first.action('disconnect');
+    await nextTurn();
+    await Promise.all([first.poll(), second.poll()]);
+    assert.equal(first.snapshot().connection, 'disconnected');
+    assert.equal(second.snapshot().connection, 'disconnected');
+    assert.equal([first, second].filter(window => window.snapshot().listening && !window.snapshot().shared).length, 1);
+    await Promise.all([first.action('connect'), second.action('connect')]);
+    await group.waitReady();
+    await Promise.all([first.poll(), second.poll()]);
+    assert.equal([first, second].filter(window => window.snapshot().active && !window.snapshot().shared).length, 1);
+    assert.equal(first.loginCalls.length + second.loginCalls.length, 3);
+    await first.action('disconnect');
+});
+
+test('hidden windows take over a completed login and new windows stay idle after disconnect', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    let finish, started;
+    const loginStarted = new Promise(resolve => { started = resolve; });
+    const first = group.create({ login: () => { started(); return new Promise(resolve => { finish = resolve; }); } });
+    try {
+        await first.ready;
+        const connecting = first.action('connect');
+        await loginStarted;
+        const second = group.create({ login: () => assert.fail('a ready handover must not start MFA') });
+        await second.ready;
+        assert.equal(second.snapshot().shared, true);
+        finish();
+        await connecting;
+        await group.waitReady();
+        first.dispose();
+        await nextTurn();
+        await second.poll();
+        assert.equal(await group.modelsStatus(), 200);
+        assert.equal(second.snapshot().active, true);
+        assert.equal(second.snapshot().listening, true);
+        assert.equal(second.snapshot().connection, 'connected');
+        assert.equal(second.loginCalls.length, 0);
+        assert.equal(first.loginCalls.length, 1);
+        await second.action('disconnect');
+        const third = group.create();
+        await third.ready;
+        await third.poll();
+        assert.equal(third.snapshot().listening, true);
+        assert.equal(third.snapshot().shared, true);
+        assert.equal(third.snapshot().active, false);
+        assert.equal(third.loginCalls.length, 0);
+        second.dispose();
+        await nextTurn();
+        await third.poll();
+        assert.equal(third.snapshot().listening, true);
+        assert.equal(third.loginCalls.length, 0);
+        assert.equal(await group.modelsStatus(), 200);
+        assert.equal(third.loginCalls.length, 0);
+        assert.equal(await group.chatStatus(), 200);
+        await group.waitReady();
+        assert.equal(third.loginCalls.length, 1);
+    } finally { finish?.(); }
+});
+
+test('shared control rejects browser origins, wrong tokens and stale connection instances', { timeout: 10000 }, async () => {
+    const { requestSharedState } = require(sharedControlModule);
+    const probe = require('node:http').createServer();
+    await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise(resolve => probe.close(resolve));
+    const harness = connectionHarness({ realHttp: true, port, deferDashboard: true });
+    const base = `http://127.0.0.1:${port}`;
+    const authorization = { Authorization: 'Bearer local-browser-session' };
+    try {
+        await harness.ready;
+        const initial = await (await fetch(base + '/internal/status', { headers: authorization })).json();
+        assert.equal((await requestSharedState(port, 'status')).state.instance, initial.state.instance);
+        const headers = { ...authorization, 'x-genai-instance': initial.state.instance };
+        for (const route of ['/internal/connect', '/internal/disconnect']) {
+            for (const extra of [{ Authorization: 'wrong' }, { Origin: 'https://evil.example' },
+                { 'Sec-Fetch-Site': 'cross-site' }]) {
+                const response = await fetch(base + route, { method: 'POST', headers: { ...headers, ...extra } });
+                assert.equal(response.status, 403, `${route}: ${Object.keys(extra).join(', ')}`);
+                await response.arrayBuffer();
+            }
+            await new Promise((resolve, reject) => {
+                const request = require('node:http').request(base + route, {
+                    method: 'POST', headers: { ...headers, Host: 'evil.example' }
+                }, response => {
+                    response.resume();
+                    response.once('end', () => {
+                        try { assert.equal(response.statusCode, 403); resolve(); } catch (error) { reject(error); }
+                    });
+                });
+                request.once('error', reject);
+                request.end();
+            });
+            const stale = await fetch(base + route, { method: 'POST', headers: { ...headers, 'x-genai-instance': 'stale' } });
+            assert.equal(stale.status, 409);
+            await stale.arrayBuffer();
+            const wrongMethod = await fetch(base + route, { headers });
+            assert.equal(wrongMethod.status, 404);
+            await wrongMethod.arrayBuffer();
+        }
+        assert.equal(harness.loginCalls.length, 0);
+        assert.equal(harness.snapshot().listening, true);
+        await harness.action('connect');
+        const staleIntent = await fetch(base + '/internal/disconnect', {
+            method: 'POST', headers: { ...headers, 'x-genai-control-revision': 'older-disconnect' }
+        });
+        assert.equal(staleIntent.status, 409);
+        await staleIntent.arrayBuffer();
+        assert.equal(harness.snapshot().connection, 'connected');
+        await harness.action('disconnect');
+        await harness.action('connect');
+        await new Promise((resolve, reject) => {
+            const request = require('node:http').request(base + '/internal/disconnect', {
+                method: 'POST', headers, agent: false
+            }, response => {
+                response.resume();
+                response.once('end', () => {
+                    try { assert.equal(response.statusCode, 409); resolve(); } catch (error) { reject(error); }
+                });
+            });
+            request.once('error', reject);
+            request.end();
+        });
+        assert.equal(harness.snapshot().connection, 'connected');
+    } finally { harness.dispose(); }
+    let mode = 'large';
+    const server = require('node:http').createServer((request, response) => {
+        assert.equal(request.headers.authorization, 'Bearer local-browser-session');
+        assert.equal(request.url, '/internal/status');
+        if (mode === 'large') response.end('x'.repeat(256 * 1024 + 1));
+        else if (mode === 'invalid') response.end('invalid json');
+        else if (mode === 'redirect') { response.writeHead(302, { location: 'https://example.com' }); response.end(); }
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const clientPort = server.address().port;
+    try {
+        await assert.rejects(requestSharedState(clientPort, 'status'), /too large/);
+        mode = 'invalid';
+        await assert.rejects(requestSharedState(clientPort, 'status'), { name: 'SyntaxError' });
+        mode = 'redirect';
+        await assert.rejects(requestSharedState(clientPort, 'status'), { code: 'SHARED_CONTROL_FAILED', status: 302 });
+        mode = 'silent';
+        const controller = new AbortController();
+        const waiting = requestSharedState(clientPort, 'status', { signal: controller.signal });
+        controller.abort();
+        await assert.rejects(waiting, { name: 'AbortError' });
+    } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('multiple hidden windows elect one replacement and an invalid saved session never repeats MFA', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    const initial = group.create();
+    await initial.ready;
+    await initial.action('connect');
+    const options = { login: () => assert.fail('takeover must never repeat MFA') };
+    const first = group.create(options);
+    const second = group.create(options);
+    await Promise.all([first.ready, second.ready]);
+    initial.dispose();
+    await nextTurn();
+    await Promise.all([first.poll(), second.poll()]);
+    assert.equal([first, second].filter(window => window.snapshot().listening && !window.snapshot().shared).length, 1);
+    const owner = [first, second].find(window => window.snapshot().listening && !window.snapshot().shared);
+    const peer = owner === first ? second : first;
+    assert.equal(owner.snapshot().connection, 'connected');
+    await peer.poll();
+    assert.equal(peer.snapshot().connection, 'connected');
+    owner.dispose();
+    await nextTurn();
+    await peer.poll();
+    assert.equal(peer.snapshot().connection, 'connected', JSON.stringify({ control: await group.control.read(),
+        owner: owner.traces, peer: peer.traces }));
+    assert.equal(peer.snapshot().shared, false);
+    assert.equal(peer.loginCalls.length, 0);
+    const replacement = group.create({ ...options, valid: async () => false });
+    await replacement.ready;
+    peer.dispose();
+    await nextTurn();
+    await replacement.poll();
+    assert.equal(replacement.snapshot().keepalive.state, 'needs-login');
+    assert.equal(await group.modelsStatus(), 401);
+    assert.equal(replacement.loginCalls.length, 0);
+    await replacement.action('disconnect');
+});
+
+test('handover transport failures keep retrying only the saved session without starting MFA', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    const first = group.create();
+    await first.ready;
+    await first.action('connect');
+    let now = Date.now(), checks = 0;
+    const harness = group.create({ now: () => now,
+        valid: async () => {
+            if (++checks === 1) throw Object.assign(new Error('fixture network failure'), { code: 'ECONNRESET' });
+            return true;
+        }, login: () => assert.fail('a temporary takeover outage must not start MFA') });
+    await harness.ready;
+    first.dispose();
+    await nextTurn();
+    await harness.poll();
+    assert.equal(harness.snapshot().keepalive.state, 'error');
+    now += 300001;
+    assert.equal(await group.chatStatus(), 200);
+    assert.equal(checks, 2);
+    assert.equal(harness.loginCalls.length, 0);
+    assert.equal(harness.snapshot().connection, 'connected');
+    await harness.action('disconnect');
+});
+
+test('a window closing during authentication cannot make another window repeat MFA', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    let started;
+    const loginStarted = new Promise(resolve => { started = resolve; });
+    const first = group.create({ login: async (session, account, signal) => {
+        started();
+        await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    } });
+    await first.ready;
+    const connecting = first.action('connect');
+    await loginStarted;
+    first.dispose();
+    await connecting;
+    const second = group.create({ login: () => assert.fail('incomplete MFA must remain explicit') });
+    await second.ready;
+    assert.equal(await group.modelsStatus(), 401);
+    assert.equal(second.loginCalls.length, 0);
+    await second.action('disconnect');
+});
+
+test('disconnect immediately cancels an in-progress saved-session handover', { timeout: 5000 }, async context => {
+    const group = await sharedWindows(context);
+    const first = group.create();
+    await first.ready;
+    await first.action('connect');
+    let started, checkingSignal, deadline;
+    const checking = new Promise(resolve => { started = resolve; });
+    const harness = group.create({ valid: async signal => {
+            checkingSignal = signal;
+            started();
+            await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+        }, login: () => assert.fail('handover cancellation must not start MFA') });
+    let disconnecting;
+    let takingOver;
+    try {
+        await harness.ready;
+        first.dispose();
+        await nextTurn();
+        takingOver = harness.poll();
+        await checking;
+        disconnecting = harness.action('disconnect');
+        await Promise.race([disconnecting, new Promise((resolve, reject) => {
+            deadline = setTimeout(() => reject(new Error('disconnect waited for session verification')), 1000);
+        })]);
+        await harness.ready;
+        assert.equal(checkingSignal.aborted, true);
+        assert.equal(harness.snapshot().listening, true);
+        assert.equal(harness.snapshot().active, false);
+        assert.equal((await group.control.read()).mode, 'disconnected');
+    } finally {
+        clearTimeout(deadline);
+        harness.dispose();
+        await harness.ready;
+        await takingOver;
+        await disconnecting;
+    }
 });
 
 test('real HTTP bridge handles 64 queued streams within configured admission limits', { timeout: 10000 }, async () => {
@@ -951,18 +1472,25 @@ test('native MCP discovery stays idle and the first drawing tool call logs in th
     }
 });
 
-test('explicit disconnect closes the idle listener and manual connect can restart it', async () => {
+test('explicit disconnect rearms the idle listener for the next chat without background login', async () => {
     const harness = connectionHarness();
     try {
         await harness.ready;
         await harness.action('disconnect');
-        assert.equal(harness.snapshot().listening, false);
-        assert.equal(harness.servers[0].listening, false);
+        assert.equal(harness.snapshot().listening, true);
+        assert.equal(harness.servers[0].listening, true);
         assert.equal(harness.loginCalls.length, 0);
-        await harness.action('connect');
+        await harness.poll();
+        assert.equal(harness.loginCalls.length, 0);
+        const exchange = chatExchange();
+        const finished = new Promise(resolve => exchange.response.once('finish', resolve));
+        harness.servers.at(-1).handle(exchange.request, exchange.response);
+        await finished;
+        assert.equal(exchange.response.status, 200);
+        assert.equal(harness.loginCalls.length, 1);
         assert.equal(harness.snapshot().listening, true);
         assert.equal(harness.snapshot().connection, 'connected');
-        assert.equal(harness.servers.length, 2);
+        assert.equal(harness.servers.length, 1);
     } finally { harness.dispose(); }
 });
 
@@ -1590,6 +2118,9 @@ test('diagnostic reauthentication closes the previous retained browser first', a
     try {
         await harness.action('diagnose');
         assert.equal(harness.loginCalls[0][5], true);
+        await harness.action('diagnose');
+        assert.equal(harness.loginCalls.length, 1);
+        assert.equal(harness.notices.length, 1);
         await harness.timers.at(-1).callback();
         assert.equal(harness.loginCalls.length, 2);
         assert.equal(closed, 1);
@@ -1673,6 +2204,8 @@ test('connection initialization failure clears active state and permits retry', 
     const sandbox = {
         AbortController,
         syncSharedState: async () => {},
+        sharedControl: require('../shared-control').createSharedControl(undefined, 58379),
+        controlState: undefined, resumeSavedSession: false,
         startListener: async () => true,
         syncDisposed: false, connectionVersion: 0,
         getHistory: () => ({ reload: async () => {} }),
@@ -1687,26 +2220,6 @@ test('connection initialization failure clears active state and permits retry', 
         assert.equal(sandbox.isActive(), false);
     }
     assert.equal(loads, 2);
-});
-
-test('visible diagnostic login requires ownership and an idle connection', async () => {
-    const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
-    const start = source.indexOf('const diagnose = async () =>');
-    const end = source.indexOf('const actions =', start);
-    assert.ok(start >= 0 && end > start);
-    for (const state of ['observer', 'active', 'idle']) {
-        const calls = [];
-        const notices = [];
-        const sandbox = {
-            requireOwner: async () => state !== 'observer',
-            active: state === 'active' ? {} : undefined,
-            connect: async diagnostic => calls.push(diagnostic),
-            vscode: { window: { showInformationMessage: async message => notices.push(message) } }
-        };
-        await vm.runInNewContext(source.slice(start, end) + 'diagnose()', sandbox);
-        assert.deepEqual(calls, state === 'idle' ? [true] : []);
-        assert.equal(notices.length, state === 'active' ? 1 : 0);
-    }
 });
 
 test('startup registration and initial snapshot do not require a message round trip', () => {
@@ -1755,7 +2268,40 @@ test('port action validates, cancels, resets and saves only user settings', asyn
     assert.ok(require('../dashboard').dashboardHtml().includes('data-command="port"'));
 });
 
-test('observer yields the occupied port and synchronizes without loading authentication or changing credentials', async () => {
+test('an occupied port with an unreachable status endpoint cannot deadlock listener startup', { timeout: 2000 }, async () => {
+    const subscriptions = [];
+    const source = fs.readFileSync(process.env.GENAI_EXTENSION_MODULE || require.resolve('../extension.js'), 'utf8');
+    const disposable = { dispose() {} };
+    const sandbox = {
+        module: { exports: {} }, AbortController, AbortSignal, setTimeout, clearTimeout,
+        setInterval: () => ({ unref() {} }), clearInterval() {},
+        require: name => {
+            if (name === './shared-control') return { ...require(sharedControlModule),
+                requestSharedState: async () => { throw Object.assign(new Error('fixture refusal'), { code: 'ECONNREFUSED' }); } };
+            if (name === 'vscode') return {
+                workspace: { getConfiguration: () => ({ get: (key, fallback) => fallback }) },
+                window: { createOutputChannel: () => ({ ...disposable, appendLine() {}, show() {} }),
+                    registerWebviewViewProvider: () => disposable, showErrorMessage: async () => undefined },
+                commands: { registerCommand: () => disposable }
+            };
+            if (name === 'node:http') return { createServer: () => {
+                const server = Object.assign(new EventEmitter(), {
+                    listen() { queueMicrotask(() => server.emit('error', Object.assign(new Error('occupied'), { code: 'EADDRINUSE' }))); },
+                    close() {}, closeAllConnections() {}
+                });
+                return server;
+            } };
+            return require(name.startsWith('./') ? '../' + name.slice(2) : name);
+        }
+    };
+    vm.runInNewContext(source, sandbox);
+    try {
+        await sandbox.module.exports.activate({ subscriptions, globalState: { get() {}, keys: () => [] },
+            secrets: { get: () => assert.fail('port conflict must not log in') } });
+    } finally { for (const subscription of subscriptions) subscription.dispose(); }
+});
+
+test('shared windows synchronize while hidden without loading authentication or changing credentials', async () => {
     const source = fs.readFileSync(process.env.GENAI_EXTENSION_MODULE || require.resolve('../extension.js'), 'utf8');
     const commands = new Map();
     const messages = [];
@@ -1785,19 +2331,20 @@ test('observer yields the occupied port and synchronizes without loading authent
         setTimeout, clearTimeout,
         setInterval: callback => { poll = callback; return { unref() {} }; },
         clearInterval: () => { timerCleared = true; poll = undefined; },
-        fetch: async (url, options) => {
+        peerRequest: async (port, command, options) => {
             fetches++;
             if (pending) {
                 pendingSignal = options.signal;
                 return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
             }
-            assert.equal(url, 'http://127.0.0.1:58480/internal/status');
-            assert.equal(options.headers.Authorization, 'Bearer local-browser-session');
+            assert.equal(port, 58480);
+            assert.equal(command, 'status');
             if (unavailable) throw new Error('connection refused');
-            return { ok: true, json: async () => ({ service: 'genai-login', version: 1, state: snapshot }) };
+            return { service: 'genai-login', version: 1, state: snapshot };
         },
         require: name => {
             assert.ok(!['undici', './upstream', './auth', './browser-auth'].includes(name), `Observer loaded heavy dependency: ${name}`);
+            if (name === './shared-control') return { ...require(sharedControlModule), requestSharedState: sandbox.peerRequest };
             if (name === 'vscode') return fakeVscode;
             if (name === 'node:http') return { createServer: () => {
                 const server = Object.assign(new EventEmitter(), {
@@ -1821,7 +2368,7 @@ test('observer yields the occupied port and synchronizes without loading authent
     try {
         await nextTurn();
         assert.equal(fetches, 1);
-        assert.equal(poll, undefined);
+        assert.equal(typeof poll, 'function');
         assert.ok(commands.has('genai-login.diagnose'));
         assert.ok(require('../package.json').contributes.commands.some(command => command.command === 'genai-login.diagnose'));
         const view = { visible: false, webview: { postMessage: message => messages.push(message.data),
@@ -1832,7 +2379,7 @@ test('observer yields the occupied port and synchronizes without loading authent
         assert.equal(fetches, 1);
         view.visible = true; visibilityChanged();
         await nextTurn();
-        assert.match(messages.at(-1).status, /shared window/);
+        assert.equal(messages.at(-1).status, snapshot.status);
         assert.equal(messages.at(-1).tokensOut, 56);
         assert.equal(messages.at(-1).models[0].name, 'test-model');
         assert.equal(messages.at(-1).history.requests, 30);
@@ -1846,28 +2393,25 @@ test('observer yields the occupied port and synchronizes without loading authent
         poll(); await nextTurn();
         assert.equal(messages.at(-1).history.requests, 30);
         delete snapshot.historyState;
-        for (const action of ['connect', 'diagnose', 'disconnect', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
-        assert.equal(notices, 4);
+        for (const action of ['diagnose', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
+        assert.equal(notices, 3);
         snapshot.requests = 23;
         poll(); await nextTurn();
         assert.equal(messages.at(-1).requests, 23);
         pending = true;
         poll();
+        await nextTurn();
         view.visible = false; visibilityChanged();
-        assert.equal(pendingSignal.aborted, true);
-        assert.equal(poll, undefined);
+        assert.equal(pendingSignal.aborted, false);
+        assert.equal(typeof poll, 'function');
         const hiddenFetches = fetches;
         await nextTurn();
         assert.equal(fetches, hiddenFetches);
-        pending = false;
-        snapshot.requests = 42;
-        view.visible = true; visibilityChanged();
+        for (const subscription of subscriptions) subscription.dispose();
+        assert.equal(pendingSignal.aborted, true);
         await nextTurn();
-        assert.equal(messages.at(-1).requests, 42);
-        unavailable = true;
-        poll(); await nextTurn();
-        assert.equal(messages.at(-1).status, 'Disconnected');
-        assert.equal(messages.at(-1).requests, 0);
+        assert.equal(poll, undefined);
+        pending = false;
         viewDisposed();
         assert.equal(poll, undefined);
     } finally {

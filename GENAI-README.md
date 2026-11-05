@@ -21,17 +21,17 @@ Automatic connection and ordinary manual Connect use the same temporary headless
 
 The browser session check has a 30-second deadline, separate from the three-minute login/MFA deadline. Temporary gateway or connection errors receive at most two bounded retries. The original prompt waits for the shared login and is forwarded after verification; another prompt is not needed when login succeeds. If a temporary pre-submission failure remains, the request receives HTTP 503 and Retry-After; subsequent requests do not start another login during the cooldown, which grows from 30 seconds to five minutes and respects longer server Retry-After values. Explicit Connect can retry immediately. Incomplete MFA or a failure after credential submission stops repeated automatic logins until an explicit reconnect. Network failures do not require clearing saved credentials, and persistent service outages cannot be overcome by extending the login timeout.
 
-The dashboard initially shows **待命**: the local port is listening, but no login, Edge instance or health checks have started. Selecting **连接 GENAI** or running **GENAI Login: Login and connect** remains available to log in before making a request. Status queries do not trigger authentication.
+The dashboard initially shows **待命**: the local port is listening, but no login, Edge instance or health checks have started. Selecting **连接 GENAI** or running **GENAI Login: Login and connect** remains available to log in before making a request. Status queries do not trigger authentication. Model discovery while on standby returns the bundled presets locally; it does not log in either.
 
 When Duo displays a recognized device-confirmation prompt, the extension selects **Yes, this is my device**. This does not approve MFA or guarantee that future temporary browser sessions will be remembered. Use the extension only on a trusted personal device.
 
 ## Manage the Connection
 
-- **Disconnect** stops the bridge listener and session checks without deleting saved credentials or history. Automatic connection stays off until you explicitly connect again or reload the window.
+- **Disconnect** cancels the shared session, active requests and session checks in all participating windows without deleting saved credentials or history. A lightweight local listener remains on standby without logging in. The next authorized chat or image request connects automatically, including after reloads or opening new windows.
 - **Clear saved credentials and session** requires confirmation, disconnects the bridge, and removes saved credentials and cookies. Usage history remains; the server-side session is not revoked.
 - **Manage Copilot models** adds or removes presets in the current Profile. Addition and deletion are separate operations; unchecking a model during addition does not delete it. Configuration changes require confirmation and create a backup.
 
-Only the window that owns the bridge can disconnect it or change credentials. Other windows display read-only connection status. Use the same port across participating windows.
+Any window can connect, recover or disconnect the shared connection. All windows using the same extension storage and port synchronize the same status, including while their dashboards are hidden. Disconnect before changing credentials, clearing the saved session or starting visible diagnostics.
 
 ## Image Generation with MCP
 
@@ -60,7 +60,7 @@ Health checks cannot extend a fixed token lifetime. Expired authentication trigg
 
 If three consecutive session checks fail because of gateway or connection errors, the extension may try the same browser entry used by manual reconnect once per outage. A successful health check or new authenticated request resets this allowance. Forbidden responses, rate limits and responses carrying Retry-After do not trigger this fallback; persistent platform outages still require the service to recover.
 
-Hiding the dashboard does not stop the bridge or session checks. Closing or reloading the owner window ends active requests; after a reload, the window returns to the idle-listener state. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version.
+Hiding the dashboard does not stop connection synchronization or session checks. If the window currently holding the bridge closes, another open window that observed the active connection takes over after the background check and verifies the saved session without starting MFA. If the saved session is missing or invalid, select **连接 GENAI** to verify explicitly. Requests already running in the closing window can be interrupted and are never automatically replayed. Finish active requests before upgrading or reloading, and reload every participating window to use the installed version. Closing all desktop windows stops the bridge. Reopening starts on standby even if the previous connection was active; the first chat or image request, or an explicit connection command, starts authentication.
 
 ## Troubleshooting
 
@@ -72,7 +72,7 @@ Open **View > Output** and select **GENAI Login** for sanitized authentication s
 
 ### Port Is Occupied
 
-Check whether another VS Code window already owns the connection. Manage it there, or change **genai-login.port**, reload participating windows, and update client URLs. Only one bridge can listen on a given port.
+Other up-to-date GENAI windows using the same port synchronize automatically and can control the same connection. If a different application occupies the port, change **genai-login.port**, reload participating windows, and update client URLs. Only one bridge can listen on a given port.
 
 ### Upstream or Session Errors
 

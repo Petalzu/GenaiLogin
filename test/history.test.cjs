@@ -62,6 +62,7 @@ test('stream diagnostics preserve reasoning variants, metadata and newline count
 	parser.finish(); parser.finish();
 	assert.deepEqual(parser.formatting, { contentChunks: 2, contentNewlines: 3, reasoningAfterContent: 5,
 		mixedReasoningContent: 1, reasoningChunks: 5, toolCallChunks: 1, reasoningIdChunks: 1,
+		emptyNullStopReasonChunks: 0, emptyNullTokenIdsChunks: 0, emptyMissingDeltaChunks: 0,
 		parsedEvents: 8, invalidEvents: 0, droppedEvents: 0, eventStream: true });
 	assert.equal(request.tokensIn, 100);
 	assert.equal(request.tokensOut, 10);

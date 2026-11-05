@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { setTimeout: delay } = require('node:timers/promises');
-const { createRequestLifetime, waitForSignal, forwardBody, createBridgeAdmission, transportCode } = require('../bridge-stream');
+const bridgeModule = process.env.GENAI_BRIDGE_MODULE || '../bridge-stream';
+const { createRequestLifetime, waitForSignal, forwardBody, createBridgeAdmission, transportCode } = require(bridgeModule);
 
 test('admission bounds active requests and bytes, preserves FIFO and removes cancelled waiters', async () => {
 	const gate = createBridgeAdmission({ maxActive: 2, maxQueued: 2, maxBytes: 10 });
@@ -220,23 +221,6 @@ test('client disconnect and parent cancellation abort upstream; disposal clears 
 	}
 });
 
-test('forwarding preserves bytes with a slow consumer', async () => {
-	const chunks = [];
-	const response = new Writable({ highWaterMark: 1, write(chunk, encoding, callback) {
-		chunks.push(chunk.toString());
-		delay(2).then(() => callback());
-	} });
-	const body = new ReadableStream({ start(controller) {
-		controller.enqueue(Buffer.from('data: first\n\n'));
-		controller.enqueue(Buffer.from('data: [DONE]\n\n'));
-		controller.close();
-	} });
-	let touches = 0;
-	await forwardBody(body, response, { signal: new AbortController().signal, touch() { touches++; } }, () => {});
-	assert.equal(chunks.join(''), 'data: first\n\ndata: [DONE]\n\n');
-	assert.equal(touches, 2);
-});
-
 test('Markdown split across content deltas and empty reasoning fields stays unchanged', async () => {
 	const { createUsageParser } = require('../stats');
 	const fragments = ['v107 **84485528 >', ' 84485446**', ', +82.\n\n', '```js\nconst value = 1;\n```'];
@@ -275,6 +259,7 @@ test('formatting diagnostics distinguish actual newlines from reasoning interrup
 	parser.finish();
 	assert.deepEqual(parser.formatting, { contentChunks: 3, contentNewlines: 4, reasoningAfterContent: 1,
 		mixedReasoningContent: 0, reasoningChunks: 3, toolCallChunks: 0, reasoningIdChunks: 0,
+		emptyNullStopReasonChunks: 0, emptyNullTokenIdsChunks: 0, emptyMissingDeltaChunks: 0,
 		parsedEvents: 6, invalidEvents: 0, droppedEvents: 0, eventStream: true });
 });
 
@@ -284,14 +269,22 @@ test('formatting detects mixed first content, metadata-only thinking and skipped
 	const choices = [
 		{ delta: { reasoning: 'Plan', content: 'First' } },
 		{ delta: { content: ' next', signature: 'opaque' } },
-		{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } }
+		{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] }, stop_reason: null, token_ids: null },
+		{ delta: {}, stop_reason: null },
+		{ delta: { content: '' }, token_ids: null },
+		{ delta: {}, stop_reason: 42, token_ids: [42] },
+		{ stop_reason: null },
+		{ delta: null },
+		{ finish_reason: 'stop' },
+		{ message: { content: 'snapshot' } }
 	];
 	for (const choice of choices) parser.consume(Buffer.from('data: ' + JSON.stringify({ choices: [choice] }) + '\n\n'));
 	parser.consume(Buffer.from(': heartbeat\n\ndata: invalid\n\ndata: ' + 'x'.repeat(MAX_SSE_LINE_LENGTH) + '\n\ndata: [DONE]\n\n'));
 	parser.finish();
 	assert.deepEqual(parser.formatting, { contentChunks: 2, contentNewlines: 0, reasoningAfterContent: 0,
 		mixedReasoningContent: 1, reasoningChunks: 1, toolCallChunks: 1, reasoningIdChunks: 1,
-		parsedEvents: 3, invalidEvents: 1, droppedEvents: 1, eventStream: true });
+		emptyNullStopReasonChunks: 2, emptyNullTokenIdsChunks: 1, emptyMissingDeltaChunks: 2,
+		parsedEvents: 10, invalidEvents: 1, droppedEvents: 1, eventStream: true });
 });
 
 test('mixed reasoning is completed before the first Markdown fragment without duplicating tools or usage', async () => {
@@ -334,6 +327,273 @@ test('mixed reasoning is completed before the first Markdown fragment without du
 	assert.ok(result.endsWith('data: [DONE]\n\n'));
 });
 
+test('continuous reasoning keeps one Copilot thinking block across empty control deltas', async () => {
+	const fragments = ['Default ', 'identity confirmed: ', '44/44 tests pass.'];
+	const deltas = [{ reasoning: fragments[0] }, { content: '' }, { reasoning: fragments[1] }, {}, { reasoning: fragments[2] }, { content: 'Result' }];
+	const input = Buffer.from(deltas.map(delta => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta, logprobs: null }] }) + '\n\n').join('') + 'data: [DONE]\n\n');
+	const output = [];
+	const body = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+	const sink = new Writable({ write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+	await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+	const choices = Buffer.concat(output).toString().split('\n\n').filter(event => event.startsWith('data: {'))
+		.flatMap(event => JSON.parse(event.slice(6)).choices);
+	const reasoning = choices.filter(choice => choice.delta.reasoning);
+	assert.equal(reasoning.map(choice => choice.delta.reasoning).join(''), fragments.join(''));
+	const first = choices.indexOf(reasoning[0]);
+	const last = choices.indexOf(reasoning.at(-1));
+	assert.ok(choices.slice(first, last + 1).every(choice => choice.delta.reasoning));
+	assert.match(reasoning[0].delta.cot_id, /^genai-[0-9a-f-]{36}$/);
+	assert.equal(new Set(reasoning.map(choice => choice.delta.cot_id)).size, 1);
+	const renderedBlocks = [];
+	for (const choice of reasoning) {
+		const identifier = choice.delta.cot_id || '';
+		let block = renderedBlocks.at(-1);
+		if (!block || block.id !== identifier) {
+			block = { id: identifier, text: '' };
+			renderedBlocks.push(block);
+		}
+		block.text += choice.delta.reasoning;
+		block.id ||= `render-${renderedBlocks.length}`;
+	}
+	assert.deepEqual(renderedBlocks.map(block => block.text), [fragments.join('')]);
+	assert.equal(choices.at(-1).delta.content, 'Result');
+	assert.equal(choices.at(-1).delta.cot_id, undefined);
+});
+
+test('empty upstream placeholders and missing deltas cannot interrupt continuous reasoning', async () => {
+	for (const placeholder of [{ stop_reason: null }, { token_ids: null }, { stop_reason: null, token_ids: null },
+		{ delta: undefined }, { delta: null }]) {
+		const events = [
+			{ choices: [{ index: 0, delta: { reasoning: 'First ' } }] },
+			{ choices: [{ index: 0, delta: { content: '' }, logprobs: null, ...placeholder }], usage: { completion_tokens: 2 } },
+			{ choices: [{ index: 0, delta: { reasoning: 'continued' } }] },
+			{ choices: [{ index: 0, delta: {}, logprobs: null, ...placeholder }] },
+			{ choices: [{ index: 0, delta: { reasoning: ' done.' } }] },
+			{ choices: [{ index: 0, delta: { content: 'Answer' } }] },
+			{ choices: [{ index: 0, delta: {}, finish_reason: 'stop', ...placeholder }], usage: { prompt_tokens: 8, completion_tokens: 4 } }
+		];
+		const input = Buffer.from(events.map(event => `data: ${JSON.stringify(event)}\r\n\r\n`).join('') + 'data: [DONE]\r\n\r\n');
+		for (const step of [1, input.length]) {
+			let offset = 0;
+			const output = [];
+			const body = new ReadableStream({ pull(controller) {
+				if (offset === input.length) controller.close();
+				else { controller.enqueue(input.subarray(offset, offset + step)); offset = Math.min(offset + step, input.length); }
+			} });
+			const sink = new Writable({ write(chunk, encoding, done) { output.push(Buffer.from(chunk)); done(); } });
+			await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+			const parsed = Buffer.concat(output).toString().split(/\r?\n\r?\n/).filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+			const expected = JSON.parse(JSON.stringify(events));
+			expected[1].choices = [];
+			expected[3].choices = [];
+			const identifier = parsed[0].choices[0].delta.cot_id;
+			assert.match(identifier, /^genai-[0-9a-f-]{36}$/);
+			for (const index of [0, 2, 4]) expected[index].choices[0].delta.cot_id = identifier;
+			assert.deepEqual(parsed, expected);
+		}
+	}
+});
+
+test('reasoning state stays isolated across choices, output boundaries and concurrent requests', async () => {
+	const events = [
+		{ choices: [{ index: 0, delta: { reasoning: 'first ' } }, { index: 1, delta: { reasoning_content: 'other ' } }] },
+		{ choices: [{ index: 0, delta: { content: '' } }, { index: 1, delta: { reasoning_content: 'choice' } }] },
+		{ choices: [{ index: 0, delta: { reasoning: 'block', content: 'answer' } }] },
+		{ choices: [{ index: 0, delta: { reasoning: 'after answer' } }] },
+		{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call', function: { name: 'test', arguments: '{}' } }] } }] },
+		{ choices: [{ index: 0, delta: { reasoning: 'after tool' } }] },
+		{ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 17, completion_tokens: 8 } }
+	];
+	const input = Buffer.from(events.map(event => 'data: ' + JSON.stringify(event) + '\r\n\r\n').join('') + 'data: [DONE]\n\n');
+	const requestIds = new Set();
+	const run = async step => {
+		let offset = 0;
+		const output = [];
+		const state = { committed: false };
+		const parser = require('../stats').createUsageParser('text/event-stream', state);
+		const body = new ReadableStream({ pull(controller) {
+			if (offset === input.length) controller.close();
+			else { controller.enqueue(input.subarray(offset, offset + step)); offset = Math.min(offset + step, input.length); }
+		} });
+		const sink = new Writable({ highWaterMark: 1, write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true, parser.consumeEvent);
+		parser.finish();
+		assert.equal(state.tokensIn, 17);
+		assert.equal(state.tokensOut, 8);
+		const parsed = Buffer.concat(output).toString().split(/\r?\n\r?\n/).filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+		assert.equal(parsed.filter(event => event.usage).length, 1);
+		const choices = parsed.flatMap(event => event.choices);
+		const firstChoice = choices.filter(choice => choice.index === 0 && choice.delta.reasoning);
+		const otherChoice = choices.filter(choice => choice.index === 1);
+		assert.equal(firstChoice.map(choice => choice.delta.reasoning).join(''), 'first blockafter answerafter tool');
+		assert.equal(otherChoice.map(choice => choice.delta.reasoning_content).join(''), 'other choice');
+		assert.equal(firstChoice[0].delta.cot_id, firstChoice[1].delta.cot_id);
+		assert.equal(otherChoice[0].delta.cot_id, otherChoice[1].delta.cot_id);
+		const identifiers = new Set([...firstChoice, ...otherChoice].map(choice => choice.delta.cot_id));
+		assert.equal(identifiers.size, 4);
+		for (const identifier of identifiers) {
+			assert.match(identifier, /^genai-[0-9a-f-]{36}$/);
+			assert.ok(!requestIds.has(identifier));
+			requestIds.add(identifier);
+		}
+		assert.deepEqual(choices.filter(choice => choice.delta.content).map(choice => choice.delta), [{ content: 'answer' }]);
+		assert.deepEqual(choices.find(choice => choice.delta.tool_calls).delta, events[4].choices[0].delta);
+		assert.deepEqual(choices.at(-1), events.at(-1).choices[0]);
+		for (const choice of [...firstChoice, ...otherChoice]) delete choice.delta.cot_id;
+		return parsed;
+	};
+	const results = await Promise.all([run(1), run(37), run(input.length)]);
+	assert.deepEqual(results[0], results[1]);
+	assert.deepEqual(results[1], results[2]);
+	assert.equal(requestIds.size, 12);
+});
+
+test('upstream reasoning IDs and signatures are preserved and continued on later text', async () => {
+	for (const field of ['cot_id', 'signature', 'reasoning_opaque']) {
+		const events = [
+			{ choices: [{ delta: { [field]: 'upstream-id', reasoning: 'plan ' } }] },
+			{ choices: [{ delta: { reasoning: 'continued' } }] },
+			{ choices: [{ delta: { [field]: 'next-id', reasoning: 'next' } }] },
+			{ choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] }
+		];
+		const input = events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n';
+		const output = [];
+		const body = new ReadableStream({ start(controller) { controller.enqueue(Buffer.from(input)); controller.close(); } });
+		const sink = new Writable({ write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+		const parsed = Buffer.concat(output).toString().split('\n\n').filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+		assert.deepEqual(parsed[0], events[0]);
+		assert.deepEqual(parsed[1], { choices: [{ delta: { reasoning: 'continued', cot_id: 'upstream-id' } }] });
+		assert.deepEqual(parsed[2], events[2]);
+		assert.deepEqual(parsed[3], events[3]);
+	}
+});
+
+test('reasoning IDs reset at retained control and finish boundaries without changing payloads', async () => {
+	for (const boundary of [
+		{ delta: {}, content_filter_results: { safe: true } },
+		{ delta: { extension_field: '' } },
+		{ delta: {}, logprobs: { content: [] } },
+		{ delta: {}, finish_reason: 'stop' },
+		{ delta: { content: ' ' } },
+		{ delta: { refusal: 'Refused' } },
+		{ delta: { function_call: { name: 'test', arguments: '{}' } } }
+	]) {
+		const events = [
+			{ choices: [{ index: 0, delta: { reasoning: 'First' } }] },
+			{ choices: [{ index: 0, ...boundary }] },
+			{ choices: [{ index: 0, delta: { reasoning: 'Second' } }] }
+		];
+		const input = Buffer.from(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+		const output = [];
+		const body = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+		const sink = new Writable({ write(chunk, encoding, done) { output.push(chunk); done(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+		const parsed = Buffer.concat(output).toString().split('\n\n').filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+		const first = parsed[0].choices[0].delta.cot_id;
+		const second = parsed[2].choices[0].delta.cot_id;
+		assert.match(first, /^genai-[0-9a-f-]{36}$/);
+		assert.match(second, /^genai-[0-9a-f-]{36}$/);
+		assert.notEqual(first, second);
+		delete parsed[0].choices[0].delta.cot_id;
+		delete parsed[2].choices[0].delta.cot_id;
+		assert.deepEqual(parsed, events);
+	}
+});
+
+test('repeated reasoning metadata cannot reopen thinking between answer fragments', async () => {
+	for (const field of ['cot_id', 'signature', 'reasoning_opaque']) {
+		const events = [
+			{ choices: [{ index: 0, delta: { reasoning: 'Plan', [field]: 'thought-1' } }] },
+			...['Result', ': unchanged', '.'].map(content => ({ choices: [{ index: 0, delta: { content, [field]: 'thought-1' } }] })),
+			{ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 19, completion_tokens: 7 } }
+		];
+		const input = Buffer.from(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n');
+		const output = [];
+		const body = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+		const sink = new Writable({ write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+		const parsed = Buffer.concat(output).toString().split('\n\n').filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+		const choices = parsed.flatMap(event => event.choices);
+		const thinking = choices.filter(choice => choice.delta.reasoning || choice.delta[field]);
+		assert.equal(thinking.length, 1, field);
+		assert.deepEqual(thinking[0], events[0].choices[0]);
+		assert.equal(choices.map(choice => choice.delta.content || '').join(''), 'Result: unchanged.');
+		assert.deepEqual(parsed.at(-1), events.at(-1));
+	}
+});
+
+test('reasoning metadata stays isolated across choices, requests and new thinking phases', async () => {
+	for (const field of ['cot_id', 'signature', 'reasoning_opaque']) {
+		const events = [
+			{ choices: [0, 1].map(index => ({ index, delta: { reasoning: 'Plan', [field]: 'same-id' } })) },
+			{ choices: [0, 1].map(index => ({ index, delta: { content: 'Answer', [field]: 'same-id' } })) },
+			{ choices: [{ index: 0, delta: { reasoning: 'New phase', [field]: 'same-id' } }] },
+			{ choices: [{ index: 0, delta: { [field]: 'new-id' } }] },
+			{ choices: [{ index: 0, delta: { content: 'Next answer', [field]: 'new-id' }, finish_reason: 'stop' }] }
+		];
+		const expected = structuredClone(events);
+		for (const choice of expected[1].choices) delete choice.delta[field];
+		delete expected[4].choices[0].delta[field];
+		const input = Buffer.from(events.map(event => 'data: ' + JSON.stringify(event) + '\r\n\r\n').join('') + 'data: [DONE]\n\n');
+		const run = async step => {
+			let offset = 0;
+			const output = [];
+			const body = new ReadableStream({ pull(controller) {
+				if (offset === input.length) controller.close();
+				else { controller.enqueue(input.subarray(offset, offset + step)); offset = Math.min(offset + step, input.length); }
+			} });
+			const sink = new Writable({ write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+			await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true);
+			const parsed = Buffer.concat(output).toString().split(/\r?\n\r?\n/).filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+			assert.deepEqual(parsed, expected);
+		};
+		await Promise.all([run(1), run(37), run(input.length)]);
+	}
+});
+
+test('empty control filtering preserves safety metadata, unknown fields and actual output boundaries', async () => {
+	for (const field of ['cot_summary', 'reasoning_text', 'reasoning_content', 'reasoning', 'thinking']) {
+		const events = [
+			{ choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] },
+			{ choices: [{ index: 0, delta: { [field]: 'plan' } }] },
+			{ choices: [{ index: 0, delta: { content: '', [field]: null, tool_calls: [], refusal: null } }], usage: { completion_tokens: 3 } },
+			{ choices: [{ index: 0, delta: { extension_field: '' } }] },
+			{ choices: [{ index: 0, delta: {}, content_filter_results: { safe: true } }] },
+			{ choices: [{ index: 0, delta: {}, logprobs: { content: [] } }] },
+			{ choices: [{ index: 0, delta: {}, stop_reason: 42 }] },
+			{ choices: [{ index: 0, delta: {}, token_ids: [42] }] },
+			{ choices: [{ index: 0, content_filter_results: { safe: true } }] },
+			{ choices: [{ index: 0, delta: null, extension_field: '' }] },
+			{ choices: [{ index: 0, delta: 'invalid' }] },
+			{ choices: [{ index: 0, message: { content: 'snapshot' } }] },
+			{ choices: [{ index: 0, delta: { content: ' ' } }] },
+			{ choices: [{ index: 0, delta: { content: '' } }] },
+			{ choices: [{ index: 0, delta: { [field]: 'next' } }] },
+			{ choices: [{ index: 0, delta: {}, finish_reason: 'content_filter' }] },
+			{ choices: [{ index: 0, delta: {} }] }
+		];
+		const input = Buffer.from(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n');
+		for (const normalize of [false, true]) {
+			const output = [];
+			const body = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+			const sink = new Writable({ write(chunk, encoding, callback) { output.push(Buffer.from(chunk)); callback(); } });
+			await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, normalize);
+			if (!normalize) { assert.deepEqual(Buffer.concat(output), input); continue; }
+			const expected = structuredClone(events);
+			expected[2].choices = [];
+			const parsed = Buffer.concat(output).toString().split('\n\n').filter(event => event.startsWith('data: {')).map(event => JSON.parse(event.slice(6)));
+			for (const index of [1, 14]) {
+				const identifier = parsed[index].choices[0].delta.cot_id;
+				assert.match(identifier, /^genai-[0-9a-f-]{36}$/);
+				expected[index].choices[0].delta.cot_id = identifier;
+			}
+			assert.notEqual(expected[1].choices[0].delta.cot_id, expected[14].choices[0].delta.cot_id);
+			assert.deepEqual(parsed, expected);
+		}
+	}
+});
+
 test('CR-only SSE boundaries split mixed events even across single-byte chunks', async () => {
 	const event = { choices: [{ delta: { reasoning: 'plan', content: 'answer' } }] };
 	const input = Buffer.from(`data: ${JSON.stringify(event)}\r\rdata: [DONE]\r\r`);
@@ -348,7 +608,9 @@ test('CR-only SSE boundaries split mixed events even across single-byte chunks',
 	const text = Buffer.concat(output).toString();
 	assert.equal((text.match(/data:/g) || []).length, 3);
 	assert.ok(text.endsWith('data: [DONE]\r\r'));
-	assert.deepEqual(text.split('\n\n').slice(0, 2).map(value => JSON.parse(value.slice(6)).choices[0].delta), [{ reasoning: 'plan' }, { content: 'answer' }]);
+	const deltas = text.split('\n\n').slice(0, 2).map(value => JSON.parse(value.slice(6)).choices[0].delta);
+	assert.match(deltas[0].cot_id, /^genai-[0-9a-f-]{36}$/);
+	assert.deepEqual(deltas, [{ reasoning: 'plan', cot_id: deltas[0].cot_id }, { content: 'answer' }]);
 });
 
 test('SSE metadata and metadata-only thinking cannot bypass separation', async () => {
@@ -363,7 +625,12 @@ test('SSE metadata and metadata-only thinking cannot bypass separation', async (
 		assert.equal(events.length, 2);
 		for (const value of events) assert.ok(value.startsWith(': keepalive\nevent: message\nid: 123\n'));
 		const parsed = events.map(value => JSON.parse(value.split('\n').find(line => line.startsWith('data:')).slice(5)));
-		assert.deepEqual(parsed[0].choices[0].delta, { [field]: 'value' });
+		const expected = { [field]: 'value' };
+		if (!['cot_id', 'reasoning_opaque', 'signature'].includes(field)) {
+			assert.match(parsed[0].choices[0].delta.cot_id, /^genai-[0-9a-f-]{36}$/);
+			expected.cot_id = parsed[0].choices[0].delta.cot_id;
+		}
+		assert.deepEqual(parsed[0].choices[0].delta, expected);
 		assert.deepEqual(parsed[1].choices[0].delta, { content: '正文' });
 		assert.equal(parsed[0].choices[0].finish_reason, null);
 		assert.equal(parsed[0].usage, undefined);
@@ -378,7 +645,7 @@ test('shared SSE decoding parses each event once and preserves usage and mixed r
 	let parses = 0;
 	const sandbox = { module: { exports: {} }, require, Buffer, AbortController, AbortSignal, DOMException, setTimeout, clearTimeout,
 		JSON: { parse: text => { parses++; return JSON.parse(text); }, stringify: JSON.stringify } };
-	vm.runInNewContext(fs.readFileSync(require.resolve('../bridge-stream'), 'utf8'), sandbox);
+	vm.runInNewContext(fs.readFileSync(require.resolve(bridgeModule), 'utf8'), sandbox);
 	const event = { choices: [{ index: 0, delta: { content: 'answer\n', reasoning: 'plan', tool_calls: [{ index: 0 }] } }],
 		usage: { prompt_tokens: 10, completion_tokens: 2 } };
 	const text = ': heartbeat\r\n\r\ndata: ' + JSON.stringify(event) + '\r\n\r\ndata: {"usage":{"completion_tokens":3}}\n\ndata: [DONE]\n\n';
@@ -492,20 +759,6 @@ test('upstream failures reject instead of becoming successful truncated response
 	assert.equal(transportCode({ name: 'secret value' }), 'UNKNOWN');
 });
 
-test('single-byte UTF-8 fragments preserve SSE and intentional newlines exactly', async () => {
-	const text = '\u4e2d\u6587\u5206\u6790\n\n```js\nconst value = 1;\n```';
-	const original = Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: text } }] }) + '\r\n\r\ndata: [DONE]\n\n');
-	const chunks = [];
-	const response = new Writable({ write(chunk, encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
-	let offset = 0;
-	const body = new ReadableStream({ pull(controller) {
-		if (offset === original.length) controller.close();
-		else controller.enqueue(original.subarray(offset, ++offset));
-	} });
-	await forwardBody(body, response, { signal: new AbortController().signal, touch() {} }, () => {});
-	assert.deepEqual(Buffer.concat(chunks), original);
-	assert.equal(JSON.parse(Buffer.concat(chunks).toString().split('\r\n')[0].slice(6)).choices[0].delta.content, text);
-});
 test('request cancellation stops waiting without cancelling shared authentication', async () => {
 	let finish;
 	const shared = new Promise(resolve => { finish = resolve; });

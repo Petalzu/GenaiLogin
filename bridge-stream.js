@@ -44,8 +44,9 @@ const reasoningFields = ['cot_summary', 'reasoning_text', 'reasoning_content', '
 const reasoningMetadata = ['cot_id', 'reasoning_opaque', 'signature'];
 const thinkingFields = [...reasoningFields, ...reasoningMetadata];
 const separatedFields = [...thinkingFields, 'role'];
+const controlFields = new Set([...separatedFields, 'content', 'tool_calls', 'function_call', 'refusal']);
 
-function splitMixedEvent(bytes, onEvent, normalize = true) {
+function splitMixedEvent(bytes, onEvent, normalize = true, reasoningByChoice = new Set(), metadataByChoice = new Map(), reasoningIds = new Map()) {
 	const lines = bytes.toString('utf8').split(/\r\n|\r|\n/).filter(Boolean);
 	const dataLines = lines.filter(line => line.startsWith('data:'));
 	const lineLength = lines.reduce((longest, line) => Math.max(longest, line.length), 0);
@@ -61,7 +62,62 @@ function splitMixedEvent(bytes, onEvent, normalize = true) {
 	let choices;
 	for (let index = 0; index < event.choices.length; index++) {
 		const choice = event.choices[index];
-		const delta = choice?.delta;
+		if (!choice || typeof choice !== 'object') continue;
+		let delta = choice.delta ?? {};
+		if (typeof delta !== 'object') continue;
+		const choiceIndex = choice.index ?? 0;
+		const hasReasoningText = reasoningFields.some(field => typeof delta[field] === 'string' && delta[field]);
+		if (hasReasoningText && !reasoningByChoice.has(choiceIndex)) {
+			metadataByChoice.delete(choiceIndex);
+			reasoningIds.delete(choiceIndex);
+		}
+		const metadata = metadataByChoice.get(choiceIndex) || {};
+		let normalizedDelta;
+		for (const field of reasoningMetadata) {
+			if (typeof delta[field] !== 'string' || !delta[field]) continue;
+			if (!hasReasoningText && metadata[field] === delta[field]) {
+				normalizedDelta ??= { ...delta };
+				delete normalizedDelta[field];
+			} else {
+				metadata[field] = delta[field];
+				metadataByChoice.set(choiceIndex, metadata);
+			}
+		}
+		const upstreamId = ['reasoning_opaque', 'cot_id', 'signature']
+			.map(field => delta[field]).find(value => typeof value === 'string' && value);
+		if (upstreamId) reasoningIds.set(choiceIndex, upstreamId);
+		else if (hasReasoningText && reasoningMetadata.every(field => delta[field] == null || delta[field] === '')) {
+			let identifier = reasoningIds.get(choiceIndex);
+			if (!identifier) {
+				identifier = `genai-${require('node:crypto').randomUUID()}`;
+				reasoningIds.set(choiceIndex, identifier);
+			}
+			normalizedDelta ??= { ...delta };
+			normalizedDelta.cot_id = identifier;
+		}
+		if (normalizedDelta) {
+			delta = normalizedDelta;
+			choices ??= event.choices.slice();
+			choices[index] = { ...choice, delta };
+		}
+		if (choice.finish_reason) metadataByChoice.delete(choiceIndex);
+		const hasReasoning = thinkingFields.some(field => typeof delta[field] === 'string' && delta[field]);
+		const hasOutput = Boolean(delta.content || delta.tool_calls?.length || delta.function_call || delta.refusal || choice.finish_reason);
+		if (hasReasoning) {
+			reasoningByChoice.add(choiceIndex);
+		} else if (reasoningByChoice.has(choiceIndex) && !hasOutput &&
+			Object.entries(choice).every(([field, value]) => ['index', 'delta', 'finish_reason'].includes(field) ||
+				['logprobs', 'stop_reason', 'token_ids'].includes(field) && value == null) &&
+			Object.entries(delta).every(([field, value]) => controlFields.has(field) &&
+				(field === 'role' && value === 'assistant' || value === '' || value == null || Array.isArray(value) && value.length === 0))) {
+			choices ??= event.choices.slice();
+			choices[index] = undefined;
+			continue;
+		}
+		if (hasOutput || !hasReasoning) {
+			reasoningByChoice.delete(choiceIndex);
+			reasoningIds.delete(choiceIndex);
+		}
 		if (typeof delta?.content !== 'string' || !delta.content || !thinkingFields.some(field => typeof delta[field] === 'string' && delta[field])) continue;
 		const thinking = {};
 		const content = { ...delta };
@@ -75,6 +131,8 @@ function splitMixedEvent(bytes, onEvent, normalize = true) {
 	if (!choices) return bytes;
 	const metadata = lines.filter(line => !line.startsWith('data:')).join('\n');
 	const prefix = metadata ? metadata + '\n' : '';
+	choices = choices.filter(choice => choice !== undefined);
+	if (!thinkingChoices.length) return Buffer.from(`${prefix}data: ${JSON.stringify({ ...event, choices })}\n\n`);
 	const first = { ...event, choices: thinkingChoices };
 	delete first.usage;
 	return Buffer.from(`${prefix}data: ${JSON.stringify(first)}\n\n${prefix}data: ${JSON.stringify({ ...event, choices })}\n\n`);
@@ -82,6 +140,9 @@ function splitMixedEvent(bytes, onEvent, normalize = true) {
 
 function createMixedReasoningTransform(onEvent) {
 	const { Transform } = require('node:stream');
+	const reasoningByChoice = new Set();
+	const metadataByChoice = new Map();
+	const reasoningIds = new Map();
 	let parts = [];
 	let size = 0;
 	let passthrough = false;
@@ -102,7 +163,7 @@ function createMixedReasoningTransform(onEvent) {
 			};
 			let start = 0;
 			const finish = () => {
-				if (!passthrough) this.push(splitMixedEvent(parts.length === 1 ? parts[0] : Buffer.concat(parts, size), onEvent));
+				if (!passthrough) this.push(splitMixedEvent(parts.length === 1 ? parts[0] : Buffer.concat(parts, size), onEvent, true, reasoningByChoice, metadataByChoice, reasoningIds));
 				else onEvent?.(undefined, { dropped: true });
 				parts = []; size = 0; passthrough = false;
 			};
@@ -131,7 +192,7 @@ function createMixedReasoningTransform(onEvent) {
 			callback();
 		},
 		flush(callback) {
-			if (parts.length && !passthrough) this.push(splitMixedEvent(parts.length === 1 ? parts[0] : Buffer.concat(parts, size), onEvent, pendingBoundary));
+			if (parts.length && !passthrough) this.push(splitMixedEvent(parts.length === 1 ? parts[0] : Buffer.concat(parts, size), onEvent, pendingBoundary, reasoningByChoice, metadataByChoice, reasoningIds));
 			else { if (passthrough) onEvent?.(undefined, { dropped: true }); for (const part of parts) this.push(part); }
 			parts = []; size = 0; passthrough = false;
 			callback();

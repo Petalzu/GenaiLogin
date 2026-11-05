@@ -1,5 +1,38 @@
 # Change Log
 
+## [Unreleased]
+
+- Keep cold startup on standby even when the last stored connection intent is `connected`. Only windows that observed an active owner may resume its saved session during handover; tolerate a late `connected` revision from that owner without ignoring disconnects. Serve model discovery from bundled presets while idle so opening a client cannot trigger authentication. Chat/image requests and explicit connect remain the triggers. Add real-port close/reopen and VS Code host deactivation regressions while retaining the reasoning-ID fix.
+- Keep a stable reasoning identifier on every text fragment in a thinking phase. Reuse upstream IDs when later fragments omit them; otherwise generate a request-local `cot_id` per choice and phase. Retain upstream IDs, signatures and opaque values, and start a new phase after answer, tool, finish or retained non-thinking control events. Copilot 0.73.0 maps missing IDs to empty strings; VS Code's `renderThinkingPart` assigns a timestamp directly to such response objects, making later empty-ID fragments look like different thinking blocks. Replay including that renderer entry reduces a synthetic ten-fragment phase from ten blocks to one with identical text, while genuine phases remain separate. This is source-level compatibility verification, not confirmation that an installed extension or the user's original conversation has been repaired.
+- Handle missing or null `delta` on otherwise empty stream choices during active reasoning instead of bypassing empty-control filtering. Preserve usage, real finish events, snapshots and safety/unknown fields. Actual Copilot parser, VS Code response-model and default-header replay changes each synthetic three-part `Finished thinking` case to one timed `Thought for` part without changing text; genuine reasoning/content boundaries remain separate. Add content-free missing-delta counts for real-request verification.
+- Treat null `stop_reason` and `token_ids` placeholders on otherwise empty stream choices like null `logprobs`, so they cannot close continuous Copilot thinking. Preserve nonnull values, real output and finish events. Add fragmented-stream and request-level regressions plus content-free counters for these empty placeholders. Offline replay through the installed Copilot parser reduces each synthetic three-block case to one without changing text; existing logs do not prove these fields caused the reported conversation.
+- Restore request-triggered automatic connection after a shared disconnect, including when the disconnected intent was saved by an earlier installation. Keep one lightweight loopback listener on standby across reloads and new windows without starting login or health checks. Cancel old requests and authentication on disconnect; only a new authorized API request starts a fresh shared login, with revision checks preventing stale login results from reviving the previous session.
+
+## [0.0.25] - 2026-11-05
+
+- Packaged for local installation at the user's request; not uploaded to Marketplace or GitHub Releases. Include the shared-window connection and performance improvements from 0.0.25-beta.1 and the reasoning-stream fixes below.
+- Prevent empty control choices with the standard `logprobs: null` placeholder from prematurely closing continuous Copilot thinking. Preserve nonempty log probabilities, safety metadata, tool calls and real finish events.
+- Deduplicate identical reasoning IDs, signatures and opaque metadata already forwarded within the same request and choice when no new reasoning text is present. Preserve first-seen and changed values, and reset tracking when a new reasoning phase starts. Repeated metadata on answer fragments no longer creates empty thinking blocks.
+- Add request-level and fragmented-stream regressions. Offline replay through the installed Copilot 0.73.0 parser, provider and VS Code response model confirms fewer synthetic thinking blocks with unchanged text; real upstream interruptions and genuine reasoning/content boundaries are not hidden or replayed.
+
+## [0.0.25-beta.1] - 2026-11-04
+
+- Local test build only; not published to Marketplace or GitHub Releases. Retain the 0.0.25-beta reasoning-stream fix.
+- Synchronize connection state in all participating windows even when dashboards are hidden. Allow connecting, recovering and disconnecting the shared bridge from any up-to-date window, using the existing loopback, Host, Origin, Fetch Metadata and Bearer protections plus a per-listener instance check.
+- Transfer the bridge to a remaining window when its current window exits. Verify only the saved session during handover; never automatically repeat MFA for missing, invalid or unfinished authentication. Preserve saved-session-only retries after temporary transport failures. Active requests in a closing window can still be interrupted and are never replayed.
+- Persist a per-port connection intent with atomic replacement, revision checks and a bounded cross-window lock. Global disconnect survives window closure and reload, and late login results cannot undo it. Store no credentials or cookies in this record; retain independent usage-history files.
+- Cache unchanged control records using file identity and nanosecond timestamps; stable polling performs only a metadata check without locking or reading JSON. Hidden windows request a compact status without history or model-usage aggregation. Preserve two-second handover detection and locked reads after changes.
+- Defer HTTP, statistics and stream modules until their first use. Idle activation, brief status and disposal leave statistics, history and authentication unloaded. Use a bounded native loopback HTTP client for shared status and commands instead of initializing fetch in every observing window; retain cancellation, response limits and no redirects.
+- Reject delayed disconnect commands using control revisions, ignore stale synchronization results after local stop, and keep disconnect independent of automatic takeover. Reuse one connecting intent across simultaneous window requests. Consolidate duplicate window fixtures and handover tests while retaining access, cancellation, MFA and stale-result coverage.
+- Add real-loopback multi-window disconnect, hidden-window handover, competing replacement, authentication safety, access-control and responsive dashboard regressions, plus production-module and isolated VS Code host checks.
+
+## [0.0.25-beta] - 2026-11-04
+
+- Local test build only; not published to Marketplace or GitHub Releases.
+- Preserve upstream reasoning IDs, signatures and opaque metadata without generating new protocol fields. Keep reasoning state separate across choices and requests, and retain answer text and tool-call boundaries.
+- Prevent empty control deltas during reasoning from prematurely closing Copilot's thinking block. Preserve actual text, tool calls, finish events, usage accounting, cancellation, backpressure and bounded SSE decoding.
+- Add reasoning continuity, concurrent-request isolation, upstream metadata and byte-fragmentation regressions, including direct production-bundle coverage.
+
 ## [0.0.24] - 2026-10-29
 
 - Match request-model statistics parsing to the bridge's 20 MiB request limit so large valid conversations retain their model name. Missing or invalid model names still record as unknown without rejecting requests.

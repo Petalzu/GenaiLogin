@@ -314,6 +314,7 @@ function createUsageParser(contentType, requestStats) {
 	const isEventStream = contentType.toLowerCase().includes('text/event-stream');
 	const formatting = { contentChunks: 0, contentNewlines: 0, reasoningAfterContent: 0,
 		mixedReasoningContent: 0, reasoningChunks: 0, toolCallChunks: 0, reasoningIdChunks: 0,
+		emptyNullStopReasonChunks: 0, emptyNullTokenIdsChunks: 0, emptyMissingDeltaChunks: 0,
 		parsedEvents: 0, invalidEvents: 0, droppedEvents: 0, eventStream: isEventStream };
 	const contentChoices = new Set();
 	let lineBuffer = '';
@@ -331,8 +332,9 @@ function createUsageParser(contentType, requestStats) {
 			formatting.parsedEvents++;
 			applyUsage(requestStats, event.usage);
 			for (const choice of Array.isArray(event.choices) ? event.choices : []) {
-				const delta = choice?.delta;
-				if (!delta) continue;
+				if (!choice || typeof choice !== 'object') continue;
+				const delta = choice.delta ?? {};
+				if (typeof delta !== 'object') continue;
 				const index = choice.index ?? 0;
 				const hasReasoning = typeof delta.cot_summary === 'string' && delta.cot_summary.length > 0 ||
 					typeof delta.reasoning_text === 'string' && delta.reasoning_text.length > 0 ||
@@ -343,6 +345,11 @@ function createUsageParser(contentType, requestStats) {
 				if (contentChoices.has(index) && hasReasoning) formatting.reasoningAfterContent++;
 				if (delta.cot_id || delta.reasoning_opaque || delta.signature) formatting.reasoningIdChunks++;
 				if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) formatting.toolCallChunks++;
+				if (!hasReasoning && !delta.content && !delta.tool_calls?.length && !delta.function_call && !delta.refusal && !choice.finish_reason) {
+					if (choice.stop_reason === null) formatting.emptyNullStopReasonChunks++;
+					if (choice.token_ids === null) formatting.emptyNullTokenIdsChunks++;
+					if (choice.delta == null && !choice.message) formatting.emptyMissingDeltaChunks++;
+				}
 				if (typeof delta.content === 'string' && delta.content.length > 0) {
 					if (hasReasoning) formatting.mixedReasoningContent++;
 					formatting.contentChunks++;

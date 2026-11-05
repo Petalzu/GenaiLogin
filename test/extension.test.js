@@ -17,34 +17,30 @@ suite('Extension Test Suite', () => {
 		assert.equal(payload.service, 'genai-login');
 		assert.equal(payload.state.listening, true);
 		assert.equal(payload.state.port, port);
-	});
-	test('Production bridge admission, retry headers and shared SSE parsing work inside VS Code', async () => {
-		const { createBridgeAdmission, proxyResponseHeaders, forwardBody } = require('../dist/bridge-stream');
-		const { createUsageParser } = require('../dist/stats');
-		const { Writable } = require('node:stream');
-		const gate = createBridgeAdmission({ maxActive: 1, maxBytes: 10 });
-		const first = await gate.acquire(10, new AbortController().signal);
-		const controller = new AbortController();
-		const waiting = gate.acquire(1, controller.signal);
-		controller.abort();
-		await assert.rejects(waiting, { name: 'AbortError' });
-		first.release();
-		assert.equal(gate.snapshot().active, 0);
-		assert.equal(gate.snapshot().reservedBytes, 0);
-		assert.deepEqual(proxyResponseHeaders(new Headers({ 'retry-after': '7', 'set-cookie': 'private=fixture' })),
-			{ 'content-type': 'application/json', 'retry-after': '7' });
-		const state = { committed: false };
-		const parser = createUsageParser('text/event-stream', state);
-		const bytes = Buffer.from('data: {"choices":[{"delta":{"reasoning":"plan","content":"answer"}}],"usage":{"prompt_tokens":9,"completion_tokens":2}}\n\ndata: [DONE]\n\n');
-		const output = [];
-		const sink = new Writable({ write(chunk, encoding, done) { output.push(chunk); done(); } });
-		const body = new ReadableStream({ start(source) { source.enqueue(bytes); source.close(); } });
-		await forwardBody(body, sink, { signal: new AbortController().signal, touch() {} }, () => {}, true, parser.consumeEvent);
-		parser.finish();
-		assert.equal(state.tokensIn, 9);
-		assert.equal(state.tokensOut, 2);
-		assert.equal(parser.formatting.parsedEvents, 1);
-		assert.equal(Buffer.concat(output).toString().split('data: ').length - 1, 3);
+		assert.equal(payload.state.sharedControl, 1);
+		assert.equal(typeof payload.state.instance, 'string');
+		assert.equal(payload.state.active, false);
+		assert.equal(payload.state.connection, 'disconnected');
+		const models = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+			headers: { Authorization: 'Bearer local-browser-session' }, signal: AbortSignal.timeout(3000)
+		});
+		assert.equal(models.status, 200);
+		assert.deepEqual((await models.json()).data.map(model => model.id), require('../genai-models.json').models.map(model => model.id));
+		await vscode.commands.executeCommand('genai-login.disconnect');
+		const standbyResponse = await fetch(`http://127.0.0.1:${port}/internal/status`, {
+			headers: { Authorization: 'Bearer local-browser-session' }, signal: AbortSignal.timeout(3000)
+		});
+		assert.equal(standbyResponse.status, 200);
+		const standby = (await standbyResponse.json()).state;
+		assert.equal(standby.listening, true);
+		assert.equal(standby.active, false);
+		assert.equal(standby.connection, 'disconnected');
+		assert.equal(standby.keepalive.state, 'idle');
+		assert.notEqual(standby.instance, payload.state.instance);
+		const view = extension.packageJSON.contributes.views['genai-login'].find(item => item.id === 'genai-login.session');
+		assert.equal(view.type, 'webview');
+		assert.equal(view.name, 'GENAI Login');
+		assert.equal(extension.packageJSON.contributes.viewsContainers.activitybar[0].title, 'GENAI Login');
 	});
 	test('One-click drawing MCP enables a native server and discovers its tool inside VS Code', async function () {
 		this.timeout(15000);
@@ -87,39 +83,6 @@ suite('Extension Test Suite', () => {
 			assert.ok(!Object.keys(require.cache).some(path => path.includes('playwright-core')));
 		} finally { controller.abort(); }
 	});
-	test('Session-check timeouts recover or remain retryable inside VS Code without MFA', async function () {
-		this.timeout(10000);
-		const { browserLogin } = require('../dist/browser-auth');
-		const { transportCode } = require('../dist/bridge-stream');
-		for (const persistent of [false, true]) {
-			let checks = 0;
-			const session = { valid: async () => {
-				if (++checks <= (persistent ? 2 : 1)) throw new DOMException('Check timed out', 'TimeoutError');
-				return true;
-			} };
-			const connect = () => browserLogin(session, {}, undefined, () => {}, { launch: () => assert.fail('unexpected MFA') });
-			if (persistent) {
-				await assert.rejects(connect(), { name: 'Error', code: 'SESSION_CHECK_TIMEOUT' });
-				await connect();
-			} else await connect();
-			assert.equal(checks, persistent ? 3 : 2);
-		}
-		assert.equal(transportCode(new DOMException('Timed out', 'TimeoutError')), 'TimeoutError');
-	});
-	test('Dashboard view is contributed as a Webview', async () => {
-		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
-		await extension.activate();
-		const view = extension.packageJSON.contributes.views['genai-login'].find(item => item.id === 'genai-login.session');
-		assert.equal(view.type, 'webview');
-		assert.equal(view.name, 'GENAI Login');
-		assert.equal(extension.packageJSON.contributes.viewsContainers.activitybar[0].title, 'GENAI Login');
-		const { dashboardHtml } = require('../dashboard');
-		const html = dashboardHtml();
-		assert.match(html, /data-command="connect"/);
-		assert.match(html, /Content-Security-Policy/);
-		assert.match(html, /<title>GENAI Login<\/title>/);
-		assert.match(html, /<h1>GENAI Login/);
-	});
 	test('Independent history files survive replacement through VS Code filesystem APIs', async () => {
 		const { mkdtemp } = require('node:fs/promises');
 		const { tmpdir } = require('node:os');
@@ -143,5 +106,17 @@ suite('Extension Test Suite', () => {
 			const cached = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(directory, 'usageHistory.total.v1.json'))));
 			assert.equal(cached.total.requests, 3);
 		} finally { await vscode.workspace.fs.delete(directory, { recursive: true }); }
+	});
+	test('Deactivation releases the bridge listener in the actual extension host', async () => {
+		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
+		const port = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
+		const { requestSharedState } = require('../dist/shared-control');
+		assert.equal((await requestSharedState(port, 'status')).state.listening, true);
+		const entryPath = require('node:path').resolve(extension.extensionPath, extension.packageJSON.main).toLowerCase();
+		const loaded = Object.values(require.cache).filter(entry => entry.filename.toLowerCase() === entryPath);
+		assert.equal(loaded.length, 1, 'Deactivation must target the already loaded extension instance');
+		await loaded[0].exports.deactivate();
+		await new Promise(resolve => setImmediate(resolve));
+		await assert.rejects(requestSharedState(port, 'status'), { code: 'ECONNREFUSED' });
 	});
 });

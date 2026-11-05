@@ -388,6 +388,7 @@ function dashboardHtml(initialState = null) {
             const isConnected = connected(data);
             const mode = connectionState(data);
             const shared = Boolean(data.shared || String(data.status).includes('(shared window)'));
+            const legacyShared = shared && data.sharedControl !== 1;
             const busy = mode === 'authenticating' || mode === 'connecting';
             const active = data.active ?? (isConnected || busy || Boolean(data.connectedAt));
             const recoverable = !busy && ['error', 'retrying', 'needs-login'].includes(data.keepalive?.state);
@@ -396,10 +397,10 @@ function dashboardHtml(initialState = null) {
             for (const button of buttons) {
                 const command = button.dataset.command;
                 const disabled = pending.includes(command) ||
-                    (command === 'connect' && (active && !recoverable || busy || shared || exclusivePending)) ||
+                    (command === 'connect' && (active && !recoverable || busy || legacyShared || exclusivePending)) ||
                     (['diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
                     (command === 'clear' && (shared || exclusivePending)) ||
-                    (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || shared));
+                    (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || legacyShared));
                 setProperty(button, 'disabled', Boolean(disabled));
             }
             setText('connect-label', active && recoverable ? '重新连接' : '连接 GENAI');
@@ -408,7 +409,7 @@ function dashboardHtml(initialState = null) {
             const dot = byId('status-dot');
             setProperty(dot, 'className', 'status-dot ' + (busy ? 'busy' : mode === 'error' ? 'error' : warning ? 'warning' : isConnected ? 'connected' : ''));
             const label = mode === 'disconnected' && data.listening ? '待命' : { connected: '已连接', disconnected: '未连接', connecting: '正在连接', authenticating: '正在登录', error: '请求暂时失败' }[mode] || '未连接';
-            setText('status-text', label + (shared ? ' · 其他窗口' : ''));
+            setText('status-text', label);
             setText('port-badge', (data.listening ?? isConnected) ? ':' + data.port : '未监听');
             setProperty(byId('session-warning'), 'hidden', data.sessionPersistence !== 'error');
             setText('session-warning', data.sessionPersistence === 'error' ? 'Cookie 保存失败，当前连接可继续；重载后可能需要重新登录。' : '');
@@ -452,7 +453,7 @@ function dashboardHtml(initialState = null) {
                 keepalive.state === 'checking' ? '正在检查会话' : keepalive.state === 'reauthenticating' ? '认证已失效，正在重认证' :
                 expiring ? '会话即将或已经到期，服务端可能要求重新登录' :
                 keepalive.state === 'healthy' ? '会话有效' : isConnected ? '等待首次检查' : '等待连接';
-            setText('keepalive-text', (shared ? '只读 · ' : '') + health);
+            setText('keepalive-text', health);
             setText('last-check', keepalive.nextCheckAt ? '下次检查 ' + formatClock(keepalive.nextCheckAt) : '保活：尚未安排');
             setProperty(byId('last-check'), 'title', '上次检查 ' + formatClock(keepalive.lastCheckAt) +
                 (keepalive.expiresAt ? ' · 会话到期 ' + formatClock(keepalive.expiresAt) : ' · 会话到期时间未知'));
