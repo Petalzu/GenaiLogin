@@ -21,7 +21,7 @@ This is an independent community project, not an official University of Macau ex
 - Microsoft Edge installed on the VS Code client machine.
 - A UMPASS account authorized to access GENAI.
 
-The extension runs in the local UI extension host, including when the workspace is connected through Remote-SSH. Its bridge listens on the client machine, not the remote host.
+The extension runs in the local UI extension host, including when the workspace is connected through Remote-SSH. Its bridge listens on the client machine, not the remote host. On desktop VS Code versions with an Agents window, that window can run the bridge without an editor window or an open folder. Agents-window activation and editor-to-Agents handover are verified with VS Code 1.145.0.
 
 ## Installation
 
@@ -109,11 +109,15 @@ Health checks do not extend a fixed server-side token lifetime. Genuine expiry o
 
 ### Multiple Windows
 
+The extension declares Agents-window support and activates after startup without requiring its dashboard or a workspace. Keep it enabled in the same Profile in the editor and Agents windows. An Agents-only startup opens the standby listener; the first authorized chat or image request connects as usual. Use the Command Palette for **GENAI Login** setup and connection commands when the editor activity bar is unavailable. No experimental extension-management setting or separate background service is required.
+
 Windows using the same extension storage and bridge port share connection status and can connect, recover or disconnect from any window. Background synchronization continues while dashboards are hidden. One window holds the port at a time; if it closes, a remaining window that observed the active connection takes over and checks the saved session without starting another MFA flow. Allow a short handover interval for the two-second background check and session verification. A missing or invalid saved session requires an explicit connection attempt. After all windows close, reopening starts on standby: a stored `connected` intent alone never resumes authentication.
 
 Unchanged control records require only a file-metadata check; locked JSON reads happen after a change. Hidden windows request only connection status, without loading history or aggregating model usage. Opening the dashboard requests the full statistics again.
 
-An explicit disconnect applies to every participating window and is not treated as a window closing. A small atomic control record stores only the connection intent and a revision, never credentials or cookies. Reload every participating window after upgrading; older versions do not support shared control. Credential changes, clearing saved credentials and visible diagnostics still require a disconnected connection. Requests already running in a window that exits can be interrupted and are not replayed automatically. Closing every desktop window still stops the bridge.
+An explicit disconnect applies to every participating window and is not treated as a window closing. Visible diagnostics can be started from any participating window, including while connected; the current bridge window switches to one visible Edge login and shares sanitized diagnostic logs with the other windows. Account input and clear confirmation stay in the invoking window. Saving credentials or confirming a clear pauses the shared connection, waits for outstanding Cookie writes, and blocks new authentication until the update completes. Cancelling input leaves the connection unchanged; a connection change during input requires retrying instead of overwriting a newer session. Model configuration remains local to the current Profile, while application settings can be changed from any window.
+
+A small atomic control record stores connection intent, a revision and a bounded configuration deadline, never credentials or cookies. Reload every participating window after upgrading; older versions do not support the new shared actions. A configuration interrupted by a window exit expires after five minutes rather than blocking authentication indefinitely. Requests already running in a window that exits or during a credential update can be interrupted and are not replayed automatically. A remaining Agents window participates in the same handover as an editor window; close the editor after the Agents window has finished starting. Closing every desktop window, including Agents windows, still stops the bridge. After upgrading, reload both editor and Agents windows to load the new manifest and production modules.
 
 ## Usage Statistics
 
@@ -143,6 +147,8 @@ npm test
 ```
 
 `npm test` runs lint checks, builds the production modules in `dist`, and runs Node.js regression tests and VS Code extension-host tests. `npm run build` rebuilds the modules; packaging runs the same build automatically. Keep the Playwright runtime assets external rather than bundling or pruning its internal files.
+
+For Agents-window regressions, build first and set `GENAI_TEST_VSCODE_PATH` to a desktop VS Code executable that supports `--agents` (verified with 1.145.0). Run `node --test test/agents-window.test.cjs` to stage the production manifest and bundles as an installed extension in temporary isolated data and extension directories, verify Agents-only startup and real editor/Agents window handover, then close only the test instance and delete its data. Without the executable variable this opt-in test is skipped. Set `GENAI_TEST_AGENTS=1` when running `npx --no-install vscode-test` to run the existing host suite in an empty Agents window; omit it for the editor-host suite. The host configurations allocate an unused bridge port and separate editor/Agents user-data directories. These checks do not use saved university credentials or make real authentication requests.
 
 Browser authentication tests use intercepted responses and cover both in-process form logic and the isolated browser helper. Successful university login must be verified separately with an authorized account. Development benchmarks must distinguish JS heap, process RSS, dependency loading and overall VS Code startup; lower extension loading time is not a guarantee for total window startup time.
 

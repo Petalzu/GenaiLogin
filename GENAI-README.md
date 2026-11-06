@@ -31,11 +31,17 @@ When Duo displays a recognized device-confirmation prompt, the extension selects
 - **Clear saved credentials and session** requires confirmation, disconnects the bridge, and removes saved credentials and cookies. Usage history remains; the server-side session is not revoked.
 - **Manage Copilot models** adds or removes presets in the current Profile. Addition and deletion are separate operations; unchecking a model during addition does not delete it. Configuration changes require confirmation and create a backup.
 
-Any window can connect, recover or disconnect the shared connection. All windows using the same extension storage and port synchronize the same status, including while their dashboards are hidden. Disconnect before changing credentials, clearing the saved session or starting visible diagnostics.
+Any up-to-date window can connect, recover, disconnect, start visible diagnostics, update credentials or clear the shared session. All windows using the same extension storage and port synchronize the same status and sanitized diagnostic logs, including while their dashboards are hidden. Account input and clear confirmation appear in the invoking window. Saving credentials or confirming a clear pauses the shared connection and blocks new authentication during the update; cancelling input leaves the connection unchanged. If the connection changes while a prompt is open, retry the operation instead of overwriting the newer session. Model configuration uses the current Profile; port and other application settings remain available from every window.
+
+## Agents Window Without an Editor
+
+On desktop VS Code versions that provide an Agents window (verified with 1.145.0), GENAI Login can start there without an editor window or an open folder. Keep the extension enabled in the same Profile and use the same bridge port. Setup and connection commands remain available through the Command Palette; the editor's GENAI Login dashboard does not need to be open. No experimental extension settings are required.
+
+After installing an update, reload all participating editor and Agents windows. Allow the Agents window to finish starting before closing the editor. If the editor owned the bridge, the Agents window takes over after the next background check (normally within about two seconds), with additional time to verify a saved connected session. Requests already running in the closing window may be interrupted and are not replayed. A cold Agents-only startup stays on standby until the first chat/image request; it does not start MFA just because the window opened. Closing all editor and Agents windows still stops the bridge.
 
 ## Image Generation with MCP
 
-1. Keep a desktop VS Code window with GENAI Login enabled open. Saving credentials once is recommended; there is no need to connect manually before using the tool.
+1. Keep a desktop VS Code editor or Agents window with GENAI Login enabled open. Saving credentials once is recommended; there is no need to connect manually before using the tool.
 2. Select **添加绘画 MCP** in the dashboard, or run **GENAI Login: Add Qwen Image 2.1 drawing MCP server**. Repeating the command does not create duplicate servers.
 3. In Copilot **Agent** mode, select a tool-capable chat model and enable `generate_image` from **GENAI / Qwen Image 2.1** in the tools picker. Accept any VS Code server trust or tool-call approval prompts.
 4. Ask Copilot to draw an image. The tool accepts a text `prompt`, optional `size` such as `1024x1024`, and `n` from 1 to 6. It returns image previews and the paths of the original files saved on the local VS Code machine.
@@ -66,7 +72,7 @@ Hiding the dashboard does not stop connection synchronization or session checks.
 
 ### Login Stalls
 
-Disconnect, then run **GENAI Login: Diagnose login in visible Edge** or select **可见诊断**. Inspect the visible browser for verification, consent, or error pages. Diagnostic Edge remains open until disconnect; the login deadline is three minutes.
+Run **GENAI Login: Diagnose login in visible Edge** or select **可见诊断** in any participating window. An existing ordinary connection switches to one visible diagnostic login; no manual disconnect is required. Inspect the visible browser for verification, consent, or error pages. Diagnostic Edge remains open until disconnect; the login deadline is three minutes. Reload all participating windows after an upgrade so shared diagnostic and account actions use the same protocol.
 
 Open **View > Output** and select **GENAI Login** for sanitized authentication stages and transport error codes. Do not share authentication callback URLs, passwords, cookies, or tokens.
 
@@ -79,6 +85,8 @@ Other up-to-date GENAI windows using the same port synchronize automatically and
 Temporary service errors do not necessarily indicate expired credentials. Allow the scheduled health retry, or retry the client request after service recovers. If a response was partially delivered, review its content before retrying.
 
 Browser login starts at the GENAI home page and selects its UMPASS sign-in button. Temporary gateway failures are retried at most twice before credentials are submitted. An explicit **连接 GENAI** can also reopen the home page if the saved-session check repeatedly fails. An existing connection permits one bounded browser recovery after three consecutive unavailable checks, subject to the session-health limits above. A persistent `no healthy upstream` page is a platform gateway failure, not a password error or evidence of a new login URL.
+
+Session verification interrupted by an identity-page navigation waits for the callback instead of aborting the login. A browser-network probe failure is logged as `BROWSER_SESSION_TRANSPORT` and retried at most twice within the session-check deadline, without restarting the browser or resubmitting credentials. These safeguards do not eliminate upstream connection resets or guarantee that a different device's network and MFA will succeed.
 
 A cookie-storage warning means the current session may continue, but reconnecting after a reload can require a new login. Failed initial verification blocks automatic login retries; use **连接 GENAI** after checking credentials or MFA. For a failed existing connection, select **重新连接** directly; disconnecting first is no longer required. The dashboard distinguishes a temporary health failure, a scheduled login retry and a verification failure requiring your attention.
 

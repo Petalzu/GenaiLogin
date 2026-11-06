@@ -218,6 +218,19 @@ test('shared connection intent is atomic and a stale login cannot undo a global 
         for (let index = 0; index < 20; index++) assert.equal((await second.read()).mode, 'connected');
         for (const name of ['mkdir', 'open', 'readFile', 'unlink', 'rename']) assert.equal(calls[name], before[name], name);
         assert.equal(calls.stat - before.stat, 20);
+        const configuring = await first.update('configuring', (await first.read()).revision);
+        assert.equal(configuring.expiresAt > Date.now(), true);
+        assert.equal(await second.update('connecting', configuring.revision), undefined);
+        assert.equal(await second.update('disconnected'), undefined);
+        assert.ok(await second.update('disconnected', configuring.revision));
+        let now = Date.now();
+        const expiredSandbox = { module: { exports: {} }, require,
+            Date: class extends Date { static now() { return now; } } };
+        vm.runInNewContext(fs.readFileSync(require.resolve(sharedControlModule), 'utf8'), expiredSandbox);
+        const expiring = expiredSandbox.module.exports.createSharedControl();
+        const lease = await expiring.update('configuring');
+        now = lease.expiresAt + 1;
+        assert.ok(await expiring.update('disconnected', lease.revision));
         assert.deepEqual(await require('../shared-control').createSharedControl(directory, 58481).read(), { mode: 'standby', revision: '' });
         assert.deepEqual((await fs.promises.readdir(directory)).filter(name => /\.lock$|\.tmp$/.test(name)), []);
     } finally { await fs.promises.rm(directory, { recursive: true, force: true }); }
@@ -446,6 +459,14 @@ test('bridge queue timeout returns retryable overload without reading the queued
         release(); release = undefined; await nextTurn(); await nextTurn();
         assert.equal(harness.snapshot().bridge.active, 0);
     } finally { release?.(); harness.dispose(); }
+});
+
+test('manifest opts the local bridge into Agents windows without requiring an editor or view', () => {
+    const manifest = require('../package.json');
+    assert.equal(manifest.capabilities?.agentsWindow?.supported, true);
+    assert.deepEqual(manifest.extensionKind, ['ui']);
+    assert.ok(manifest.activationEvents.includes('onStartupFinished'));
+    assert.equal(manifest.extensionDependencies, undefined);
 });
 
 test('idle activation and brief status keep dependencies, history and credentials unloaded', async () => {
@@ -1134,6 +1155,55 @@ test('any window can disconnect a shared connection and the next request reconne
     await first.action('disconnect');
 });
 
+test('a later window connects through the existing owner after its first login fails', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    let attempts = 0;
+    const first = group.create({ login: async () => {
+        attempts++;
+        if (attempts === 1) throw new TypeError('session verification response is incompatible');
+    } });
+    await first.ready;
+    await first.action('connect');
+    assert.equal(first.loginCalls.length, 1);
+    const second = group.create({ login: () => assert.fail('the later window must use the existing owner') });
+    await second.ready;
+    await second.action('connect');
+    await group.waitReady();
+    await second.poll();
+    assert.equal(first.loginCalls.length, 2);
+    assert.equal(second.loginCalls.length, 0);
+    assert.equal(first.snapshot().connection, 'connected');
+    assert.equal(second.snapshot().connection, 'connected');
+    await second.action('disconnect');
+});
+
+test('any window can start visible diagnostic through the shared owner', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    let started;
+    const diagnosticStarted = new Promise(resolve => { started = resolve; });
+    const first = group.create({ login: async (...args) => { if (args[5]) started(); } });
+    await first.ready;
+    await first.action('connect');
+    await group.waitReady();
+    const second = group.create();
+    await second.ready;
+    await second.action('diagnose');
+    await diagnosticStarted;
+    await group.waitReady();
+    await second.poll();
+    assert.equal(first.loginCalls.length, 2);
+    assert.equal(second.loginCalls.length, 0);
+    assert.equal(first.loginCalls[1][5], true);
+    assert.equal(first.loginCalls[1][6], false);
+    assert.equal(first.snapshot().connection, 'connected');
+    assert.equal(second.snapshot().connection, 'connected');
+    assert.ok(second.traces.some(message => message.includes('Visible diagnostic connection requested')));
+    const records = second.traces.length;
+    await second.poll();
+    assert.equal(second.traces.length, records);
+    await first.action('disconnect');
+});
+
 test('hidden windows take over a completed login and new windows stay idle after disconnect', { timeout: 10000 }, async context => {
     const group = await sharedWindows(context);
     let finish, started;
@@ -1179,6 +1249,50 @@ test('hidden windows take over a completed login and new windows stay idle after
     } finally { finish?.(); }
 });
 
+test('any window can update credentials and clear the shared session without a competing login', { timeout: 10000 }, async context => {
+    const group = await sharedWindows(context);
+    const first = group.create();
+    await first.ready;
+    await first.action('connect');
+    await group.waitReady();
+    let writing, finishWrite;
+    const writeStarted = new Promise(resolve => { writing = resolve; });
+    const writeAllowed = new Promise(resolve => { finishWrite = resolve; });
+    const second = group.create({ input: async settings => settings.password ? 'new-fixture-password' : 'new-fixture-user',
+        store: async (key, value) => { writing(); await writeAllowed; await first.secrets.store(key, value); },
+        confirm: async () => '清除凭据' });
+    await second.ready;
+    let changing;
+    try {
+        changing = second.action('credentials');
+        await writeStarted;
+        assert.equal((await group.control.read()).mode, 'configuring');
+        assert.equal(first.snapshot().active, false);
+        assert.equal(await group.chatStatus(), 503);
+        assert.equal(await group.control.update('disconnected'), undefined);
+        const configuring = await group.control.read();
+        assert.equal(await group.control.update('connecting', configuring.revision), undefined);
+        assert.equal(await group.control.update('connected', configuring.revision), undefined);
+        await first.action('connect');
+        assert.equal(first.loginCalls.length, 1);
+        finishWrite();
+        await changing;
+        assert.deepEqual(JSON.parse(await first.secrets.get('credentials')), { username: 'new-fixture-user', password: 'new-fixture-password' });
+        assert.equal(await first.secrets.get('session'), undefined);
+        assert.equal((await group.control.read()).mode, 'disconnected');
+        assert.equal(await group.chatStatus(), 200);
+        await group.waitReady();
+        assert.equal(first.loginCalls[1][1].username, 'new-fixture-user');
+        await second.poll();
+        await second.action('clear');
+        assert.equal(await first.secrets.get('credentials'), undefined);
+        assert.equal(await first.secrets.get('session'), undefined);
+        assert.equal(first.snapshot().active, false);
+        assert.equal((await group.control.read()).mode, 'disconnected');
+        assert.equal(second.loginCalls.length, 0);
+    } finally { finishWrite(); await changing; }
+});
+
 test('shared control rejects browser origins, wrong tokens and stale connection instances', { timeout: 10000 }, async () => {
     const { requestSharedState } = require(sharedControlModule);
     const probe = require('node:http').createServer();
@@ -1193,7 +1307,7 @@ test('shared control rejects browser origins, wrong tokens and stale connection 
         const initial = await (await fetch(base + '/internal/status', { headers: authorization })).json();
         assert.equal((await requestSharedState(port, 'status')).state.instance, initial.state.instance);
         const headers = { ...authorization, 'x-genai-instance': initial.state.instance };
-        for (const route of ['/internal/connect', '/internal/disconnect']) {
+        for (const route of ['/internal/connect', '/internal/disconnect', '/internal/diagnose', '/internal/configure', '/internal/configured']) {
             for (const extra of [{ Authorization: 'wrong' }, { Origin: 'https://evil.example' },
                 { 'Sec-Fetch-Site': 'cross-site' }]) {
                 const response = await fetch(base + route, { method: 'POST', headers: { ...headers, ...extra } });
@@ -2120,7 +2234,7 @@ test('diagnostic reauthentication closes the previous retained browser first', a
         assert.equal(harness.loginCalls[0][5], true);
         await harness.action('diagnose');
         assert.equal(harness.loginCalls.length, 1);
-        assert.equal(harness.notices.length, 1);
+        assert.equal(harness.notices.length, 0);
         await harness.timers.at(-1).callback();
         assert.equal(harness.loginCalls.length, 2);
         assert.equal(closed, 1);
@@ -2171,28 +2285,23 @@ test('clear confirmation cannot delete a newly connected session', async () => {
     } finally { harness.dispose(); }
 });
 
-test('credentials are not written when ownership changes during input', async () => {
-    const source = fs.readFileSync(require.resolve('../extension.js'), 'utf8');
-    const start = source.indexOf('const credentials = async () =>');
-    const end = source.indexOf('const connectNow =', start);
-    for (const owner of ['local', 'other']) {
-        let checks = 0;
-        const sandbox = {
-            active: undefined,
-            connectionVersion: 0, syncDisposed: false,
-            requireOwner: async () => {
-                checks++;
-                if (checks === 2 && owner === 'local') sandbox.active = {};
-                return checks !== 2 || owner !== 'other';
-            },
-            vscode: { window: { showInputBox: async () => 'test' } },
-            context: { secrets: { store: () => assert.fail('must not overwrite credentials'), delete: () => assert.fail('must not clear session') } }
-        };
-        const result = vm.runInNewContext(source.slice(start, end) + 'credentials()', sandbox);
-        if (owner === 'local') await assert.rejects(result, /Disconnect/);
-        else assert.equal(await result, false);
-        assert.equal(checks, 2);
-    }
+test('credentials are not written when the connection changes during input', async () => {
+    let finishInput, started;
+    const inputStarted = new Promise(resolve => { started = resolve; });
+    const writes = [];
+    const harness = connectionHarness({ input: async settings => {
+        if (!settings.password) { started(); return new Promise(resolve => { finishInput = resolve; }); }
+        return 'fixture-password';
+    }, store: async key => writes.push(key) });
+    try {
+        await harness.ready;
+        const changing = harness.action('credentials');
+        await inputStarted;
+        await harness.action('disconnect');
+        finishInput('fixture-user');
+        await changing;
+        assert.deepEqual(writes, []);
+    } finally { finishInput?.(); harness.dispose(); }
 });
 
 test('connection initialization failure clears active state and permits retry', async () => {
@@ -2203,6 +2312,7 @@ test('connection initialization failure clears active state and permits retry', 
     let loads = 0;
     const sandbox = {
         AbortController,
+        configurationInProgress: () => false,
         syncSharedState: async () => {},
         sharedControl: require('../shared-control').createSharedControl(undefined, 58379),
         controlState: undefined, resumeSavedSession: false,
@@ -2393,8 +2503,7 @@ test('shared windows synchronize while hidden without loading authentication or 
         poll(); await nextTurn();
         assert.equal(messages.at(-1).history.requests, 30);
         delete snapshot.historyState;
-        for (const action of ['diagnose', 'credentials', 'clear']) await commands.get(`genai-login.${action}`)();
-        assert.equal(notices, 3);
+        assert.equal(notices, 0);
         snapshot.requests = 23;
         poll(); await nextTurn();
         assert.equal(messages.at(-1).requests, 23);

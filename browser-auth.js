@@ -6,7 +6,7 @@ const { waitForSignal } = require('./bridge-stream');
 function retryableSessionFailure(error) {
     if (error.retryAfterMs > 10000) return false;
     return error.code === 'SESSION_UNAVAILABLE' ? [502, 503, 504].includes(error.status) :
-        ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(error.cause?.code || error.code);
+        ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'BROWSER_SESSION_TRANSPORT'].includes(error.cause?.code || error.code);
 }
 
 async function checkBrowserSession(session, signal, trace, fetch) {
@@ -148,23 +148,41 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
             return cookies.some(cookie => cookie.name === 'token' && cookie.value);
         };
         const page = await context.newPage();
+        let navigationVersion = 0;
         const fetchSession = async (url, options) => {
-            const result = await waitForSignal(page.evaluate(async address => {
-                try {
-                    const response = await globalThis.fetch(address, { credentials: 'same-origin', redirect: 'manual', signal: AbortSignal.timeout(30000) });
-                    await response.body?.cancel();
-                    return { status: response.status, ok: response.ok, url: response.url, headers: Array.from(response.headers) };
-                } catch (error) {
-                    return { error: { name: error.name } };
+            const version = navigationVersion;
+            let result;
+            try {
+                result = await waitForSignal(page.evaluate(async address => {
+                    if (globalThis.location.origin !== new URL(address).origin) return { navigated: true };
+                    try {
+                        const response = await globalThis.fetch(address, { credentials: 'same-origin', redirect: 'manual', signal: AbortSignal.timeout(30000) });
+                        await response.body?.cancel();
+                        return { status: response.status, ok: response.ok, url: response.url, type: response.type, headers: Array.from(response.headers) };
+                    } catch (error) {
+                        return { error: { name: error.name } };
+                    }
+                }, url.href), options.signal);
+            } catch (error) {
+                options.signal.throwIfAborted();
+                if (version !== navigationVersion || /Execution context was destroyed|Cannot find context with specified id/i.test(error.message)) {
+                    throw Object.assign(new Error('Session check interrupted by navigation'), { code: 'SESSION_NAVIGATION_INTERRUPTED' });
                 }
-            }, url.href), options.signal);
-            if (result.error) throw Object.assign(new Error('Browser session check failed'), result.error);
+                throw error;
+            }
+            if (result.navigated || version !== navigationVersion) {
+                throw Object.assign(new Error('Session check interrupted by navigation'), { code: 'SESSION_NAVIGATION_INTERRUPTED' });
+            }
+            if (result.error) throw Object.assign(new Error('Browser session check failed'), result.error,
+                result.error.name === 'TypeError' ? { code: 'BROWSER_SESSION_TRANSPORT' } : {});
+            if (result.type === 'opaqueredirect') return { status: 401, ok: false, headers: new Headers(), body: null };
             return { ...result, headers: new Headers(result.headers), body: null };
         };
         let inspectAt = Date.now() + 10000;
         let navigationFailure;
         page.on('framenavigated', frame => {
             if (frame !== page.mainFrame()) return;
+            navigationVersion++;
             inspectAt = Date.now() + 10000;
             trace(`Authentication navigation: ${authenticationLocation(frame.url())}`);
         });
@@ -260,7 +278,17 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
             if (origin === ORIGIN) {
                 const hasToken = await importCookies();
                 if (hasToken) phase = 'verify-session';
-                if (hasToken && await checkBrowserSession(session, bounded, trace, fetchSession)) {
+                let verified = false;
+                try {
+                    if (hasToken) verified = await checkBrowserSession(session, bounded, trace, fetchSession);
+                } catch (error) {
+                    bounded.throwIfAborted();
+                    if (error.code !== 'SESSION_NAVIGATION_INTERRUPTED') throw error;
+                    trace('Session check interrupted by navigation; waiting for identity callback');
+                    await delay(1000, undefined, { signal: bounded });
+                    continue;
+                }
+                if (verified) {
                     await importCookies();
                     bounded.throwIfAborted();
                     trace('Browser session verified');
@@ -310,7 +338,7 @@ async function browserLogin(session, credentials, signal, trace = () => {}, laun
         if (navigationCode) error.code = navigationCode;
         else if (/^[A-Z0-9_]+$/.test(error.cause?.code || '')) error.code = error.cause.code;
         error.retryAuthentication = !submitted && !bounded.aborted;
-        const code = bounded.aborted ? bounded.reason?.name : error?.name;
+        const code = bounded.aborted ? bounded.reason?.name : error.code || error.name;
         trace(`Browser login failed: phase=${phase} code=${typeof code === 'string' && /^[A-Za-z0-9_]+$/.test(code) ? code : 'UNKNOWN'}`);
         throw error;
     } finally {

@@ -1,4 +1,4 @@
-const modes = new Set(['standby', 'connecting', 'connected', 'disconnected']);
+const modes = new Set(['standby', 'connecting', 'connected', 'disconnected', 'configuring']);
 
 function createSharedControl(directory, port) {
 	let memory = { mode: 'standby', revision: '' };
@@ -22,9 +22,10 @@ function createSharedControl(directory, port) {
 			return memory = { mode: 'standby', revision: '' };
 		}
 		if (value.service !== 'genai-login' || value.version !== 1 || value.port !== port ||
-			!modes.has(value.mode) || typeof value.revision !== 'string' || !value.revision) throw new Error('Invalid shared connection control');
+			!modes.has(value.mode) || typeof value.revision !== 'string' || !value.revision ||
+			(value.mode === 'configuring' && !Number.isSafeInteger(value.expiresAt))) throw new Error('Invalid shared connection control');
 		stamp = await fileStamp();
-		return memory = { mode: value.mode, revision: value.revision };
+		return memory = { mode: value.mode, revision: value.revision, ...(value.mode === 'configuring' ? { expiresAt: value.expiresAt } : {}) };
 	};
 	const locked = operation => {
 		const next = pending.catch(() => {}).then(async () => {
@@ -67,7 +68,9 @@ function createSharedControl(directory, port) {
 				try {
 					const current = await readUnlocked();
 					if (expectedRevision !== undefined && current.revision !== expectedRevision) return undefined;
-					const next = { mode, revision: require('node:crypto').randomUUID() };
+					if (current.mode === 'configuring' && current.expiresAt > Date.now() &&
+						(mode !== 'disconnected' || expectedRevision !== current.revision)) return undefined;
+					const next = { mode, revision: require('node:crypto').randomUUID(), ...(mode === 'configuring' ? { expiresAt: Date.now() + 300000 } : {}) };
 					if (filename) {
 						temporary = filename + '.' + next.revision + '.tmp';
 						await fs.writeFile(temporary, JSON.stringify({ service: 'genai-login', version: 1, port, ...next }), { flag: 'wx' });
@@ -91,7 +94,7 @@ function createSharedControl(directory, port) {
 }
 
 function requestSharedState(port, command, { headers, signal } = {}) {
-	if (!['status', 'connect', 'disconnect'].includes(command)) return Promise.reject(new Error('Invalid shared command'));
+	if (!['status', 'connect', 'disconnect', 'diagnose', 'configure', 'configured'].includes(command)) return Promise.reject(new Error('Invalid shared command'));
 	return new Promise((resolve, reject) => {
 		const request = require('node:http').request({ hostname: '127.0.0.1', port,
 			path: `/internal/${command}`, method: command === 'status' ? 'GET' : 'POST', agent: false, signal,

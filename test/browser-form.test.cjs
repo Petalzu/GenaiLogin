@@ -1,10 +1,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { chromium } = require('playwright-core');
-const { CookieJar } = require('tough-cookie');
-const { browserLogin } = require('../browser-auth');
-const { Session, ORIGIN } = require('../auth');
-const { dashboardHtml } = require('../dashboard');
+const { browserLogin } = require(process.env.GENAI_BROWSER_MODULE || '../browser-auth');
+const { Session, ORIGIN } = require(process.env.GENAI_AUTH_MODULE || '../auth');
+const { dashboardHtml } = require(process.env.GENAI_DASHBOARD_MODULE || '../dashboard');
 test('headless connection reuses saved cookies and verifies the session through Edge instead of Node fetch', { timeout: 20000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     const session = new Session();
@@ -35,6 +34,49 @@ test('headless connection reuses saved cookies and verifies the session through 
         assert.equal(browser.isConnected(), false);
     } finally { await browser.close(); }
 });
+for (const mode of ['identity navigation', 'temporary fetch failure', 'opaque redirect']) test(`${mode} during browser session verification does not abort login`, { timeout: 15000 }, async () => {
+    const browser = await chromium.launch({ channel: 'msedge', headless: true });
+    const session = new Session();
+    await session.jar.setCookie('token=stale; Secure; HttpOnly; Path=/', ORIGIN);
+    const traces = [];
+    let checks = 0;
+    try {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        await context.route('**/*', async route => {
+            const url = new URL(route.request().url());
+            if (url.origin === ORIGIN && url.pathname === '/') return route.fulfill({ contentType: 'text/html',
+                body: '<button onclick="location.href=\'/oauth/oidc/login\'">Continue with UMPASS</button>' });
+            if (url.origin === ORIGIN && url.pathname === '/oauth/oidc/login') return route.fulfill({ contentType: 'text/html',
+                body: '<script>location.href="https://login.um.edu.mo/identity"</script>' });
+            if (url.origin === ORIGIN && url.pathname === '/api/v1/auths/') {
+                checks++;
+                if (checks === 1) {
+                    if (mode === 'temporary fetch failure') return route.abort('connectionreset');
+                    if (mode === 'opaque redirect') return route.fulfill({ status: 302, headers: { location: '/auth' } });
+                    await page.goto('https://login.um.edu.mo/identity', { waitUntil: 'domcontentloaded' }).catch(error => {
+                        if (!page.isClosed()) throw error;
+                    });
+                    return route.abort().catch(() => {});
+                }
+                return route.fulfill({ contentType: 'application/json',
+                    headers: { 'set-cookie': 'token=fresh; Secure; HttpOnly; Path=/' }, body: '{}' });
+            }
+            if (url.origin === 'https://login.um.edu.mo') return route.fulfill({ contentType: 'text/html',
+                body: `<script>location.href='${ORIGIN}/oauth/oidc/callback'</script>` });
+            if (url.origin === ORIGIN && url.pathname === '/oauth/oidc/callback') return route.fulfill({ contentType: 'text/html',
+                headers: { 'set-cookie': 'token=fresh; Secure; HttpOnly; Path=/' }, body: '<p>Signed in</p>' });
+            return route.fulfill({ status: 404 });
+        });
+        await browserLogin(session, {}, AbortSignal.timeout(10000), message => traces.push(message),
+            { launch: async () => ({ newContext: async () => ({ addCookies: cookies => context.addCookies(cookies),
+                newPage: async () => page, cookies: address => context.cookies(address) }), close: () => browser.close() }) }, false, true, { force: true });
+        assert.equal(checks, 2);
+        assert.ok(traces.includes('Browser session verified'));
+        assert.ok(!traces.some(message => message.startsWith('Filling verified')));
+        assert.equal(await session.jar.getCookieString(ORIGIN), 'token=fresh');
+    } finally { await browser.close(); }
+});
 test('ADFS duplicate username fields only fill visible password form', async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
     try {
@@ -50,7 +92,7 @@ test('ADFS duplicate username fields only fill visible password form', async () 
 });
 test('browser login starts at the WebUI home and recovers a temporarily unavailable entry', { timeout: 20000 }, async () => {
     const browser = await chromium.launch({ channel: 'msedge', headless: true });
-    const jar = new CookieJar();
+    const jar = new Session().jar;
     const visits = [];
     const traces = [];
     let homeRequests = 0;
@@ -105,7 +147,7 @@ test('unavailable home pages stop after bounded retries without validating a ses
                 return route.fulfill({ status: scenario.status, contentType: 'text/plain', body: 'no healthy upstream',
                     headers: scenario.retryAfter ? { 'retry-after': scenario.retryAfter } : {} });
             });
-            await assert.rejects(browserLogin({ jar: new CookieJar(), valid: () => assert.fail('error pages are not authenticated callbacks') }, {},
+            await assert.rejects(browserLogin({ jar: new Session().jar, valid: () => assert.fail('error pages are not authenticated callbacks') }, {},
                 AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]), message => { if (scenario.cancel && message.includes('retry')) controller.abort(); },
                 { launch: async () => ({ newContext: async () => context, close: () => context.close() }) }, false, true, { force: true }),
             scenario.cancel ? { name: 'AbortError' } : { code: 'SESSION_UNAVAILABLE', status: scenario.status });
@@ -125,7 +167,7 @@ for (const mode of ['button', 'Enter', 'callback unavailable', 'callback timeout
     let submissions = 0;
     let remembered = 0;
     const traces = [];
-    const jar = new CookieJar();
+    const jar = new Session().jar;
     try {
         const context = await browser.newContext();
         await context.route('**/*', async route => {
@@ -330,10 +372,13 @@ test('Dashboard states and controls remain usable on narrow and wide views', { t
             assert.match(await page.locator('#last-check').getAttribute('title'), /会话到期/);
             assert.equal(await page.evaluate(() => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth), true);
             await render({ ...base, connection: 'connected', status: 'Connected :58379 (shared window)', shared: true,
-                sharedControl: 1, active: true, listening: true, connectedAt: Date.now() });
+                sharedControl: 1, sharedActions: 1, active: true, listening: true, connectedAt: Date.now() });
             assert.equal(await page.locator('#status-text').textContent(), '已连接');
             assert.ok(!(await page.locator('#keepalive-text').textContent()).includes('只读'));
-            for (const command of ['connect', 'diagnose', 'credentials', 'clear']) assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), false);
+            assert.equal(await page.locator('[data-command="connect"]').isEnabled(), false);
+            for (const command of ['diagnose', 'credentials', 'clear', 'models', 'port', 'mcp']) {
+                assert.equal(await page.locator(`[data-command="${command}"]`).isEnabled(), true);
+            }
             assert.equal(await page.locator('[data-command="disconnect"]').isEnabled(), true);
             await page.locator('[data-command="disconnect"]').click();
             assert.equal(await page.evaluate(() => globalThis.dashboardCommands.at(-1)), 'disconnect');

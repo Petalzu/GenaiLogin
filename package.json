@@ -3,7 +3,7 @@
   "displayName": "GENAI Login",
   "description": "UMPASS authentication and a local OpenAI-compatible bridge for University of Macau GENAI, with Copilot model configuration.",
   "readme": "GENAI-README.md",
-  "version": "0.0.25",
+  "version": "0.0.26-beta.1",
   "publisher": "Petalzu",
   "author": "Petalzu",
   "license": "MIT",
@@ -27,6 +27,11 @@
   "extensionKind": [
     "ui"
   ],
+  "capabilities": {
+    "agentsWindow": {
+      "supported": true
+    }
+  },
   "engines": {
     "vscode": "^1.110.0"
   },
@@ -159,7 +164,7 @@
   "scripts": {
     "build": "node esbuild.cjs",
     "vscode:prepublish": "npm run build",
-    "lint": "eslint extension.js auth.js auth-forms.js browser-auth.js dashboard.js stats.js bridge-stream.js shared-control.js copilot-config.js copilot-models.js upstream.js image-mcp.js esbuild.cjs test/extension.test.js test/stats.test.js test/bridge-stream.test.cjs test/local-access.test.cjs test/copilot-models.test.cjs test/image-mcp.test.cjs test/browser-auth.test.cjs test/history.test.cjs",
+    "lint": "eslint extension.js auth.js auth-forms.js browser-auth.js dashboard.js stats.js bridge-stream.js shared-control.js copilot-config.js copilot-models.js upstream.js image-mcp.js esbuild.cjs test/extension.test.js test/stats.test.js test/agents-window.test.cjs test/bridge-stream.test.cjs test/local-access.test.cjs test/copilot-models.test.cjs test/image-mcp.test.cjs test/browser-auth.test.cjs test/history.test.cjs",
     "pretest": "npm run lint && npm run build",
     "test": "node --test test/*.test.cjs && vscode-test"
   },

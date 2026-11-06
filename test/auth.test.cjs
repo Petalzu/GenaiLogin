@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { Session, createKeepaliveSchedule, createSessionPersistence, forms, login } = require('../auth');
+const { Session, createKeepaliveSchedule, createSessionPersistence, forms, login } = require(process.env.GENAI_AUTH_MODULE || '../auth');
 test('forms preserve hidden values and decode entities', () => {
     const [form] = forms('<form method="post" action="/login?a=1&amp;b=2"><input name="csrf" type="hidden" value="a&amp;b"><input name="Password" type="password"></form>', 'https://websso.um.edu.mo/');
     assert.equal(form.action, 'https://websso.um.edu.mo/login?a=1&b=2');
@@ -21,6 +21,12 @@ test('rejected credentials are submitted only once', async () => {
 });
 test('valid saved session needs no login request', async () => {
     await login({ valid: async () => true, request: () => assert.fail('unexpected login') }, {});
+});
+test('browser session responses without getSetCookie remain verifiable', async () => {
+    const headers = new Headers({ 'content-type': 'application/json' });
+    headers.getSetCookie = undefined;
+    const session = new Session();
+    assert.equal(await session.valid(undefined, async () => ({ status: 200, ok: true, headers, body: null })), true);
 });
 test('redirect cookies are retained and restored', async () => {
     const original = global.fetch;

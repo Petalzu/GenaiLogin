@@ -106,7 +106,8 @@ class Session {
                 throw error;
             }
             this.trace(`HTTP status ${response.status}`);
-            for (const cookie of response.headers.getSetCookie()) await this.jar.setCookie(cookie, current.href);
+            const setCookies = typeof response.headers.getSetCookie === 'function' ? response.headers.getSetCookie() : [];
+            for (const cookie of setCookies) await this.jar.setCookie(cookie, current.href);
             const location = response.headers.get('location');
             if (![301, 302, 303, 307, 308].includes(response.status) || !location) return response;
             const next = new URL(location, current);

@@ -398,9 +398,8 @@ function dashboardHtml(initialState = null) {
                 const command = button.dataset.command;
                 const disabled = pending.includes(command) ||
                     (command === 'connect' && (active && !recoverable || busy || legacyShared || exclusivePending)) ||
-                    (['diagnose', 'credentials'].includes(command) && (active || shared || exclusivePending)) ||
-                    (command === 'clear' && (shared || exclusivePending)) ||
-                    (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || legacyShared));
+                    (['diagnose', 'credentials', 'clear'].includes(command) && (busy || exclusivePending || shared && data.sharedActions !== 1)) ||
+                    (command === 'disconnect' && (!(active || data.listening || pending.includes('connect')) || legacyShared || pending.includes('credentials') || pending.includes('clear')));
                 setProperty(button, 'disabled', Boolean(disabled));
             }
             setText('connect-label', active && recoverable ? '重新连接' : '连接 GENAI');

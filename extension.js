@@ -137,7 +137,14 @@ function detectImageMimeType(bytes) {
 function activate(context) {
 	const output = vscode.window.createOutputChannel('GENAI Login');
 	context.subscriptions.push(output);
-	const trace = message => output.appendLine(`${new Date().toISOString()} ${message}`);
+	const traceEvents = [];
+	let traceSequence = 0, sharedTraceInstance, sharedTraceSequence = 0;
+	const trace = message => {
+		const text = `${new Date().toISOString()} ${message}`;
+		output.appendLine(text);
+		traceEvents.push({ id: ++traceSequence, message: text.slice(0, 1024) });
+		if (traceEvents.length > 64) traceEvents.shift();
+	};
 	let history;
 	const getHistory = () => {
 		if (!history) {
@@ -153,7 +160,7 @@ function activate(context) {
 	let server, listenerController, listenerReady = false, listenerStartPromise, requestHandler, connectPromise;
 	let connectionVersion = 0, automaticLoginBlocked = false;
 	let automaticRetryAt = 0, automaticFailures = 0;
-	let active, authentication, keepaliveTimer, keepaliveOwner, reconnectActive;
+	let active, authentication, keepaliveTimer, keepaliveOwner, reconnectActive, diagnosticActive = false;
 	let state = 'Disconnected';
 	let connection = 'disconnected', loginPhase;
 	const pendingActions = new Map();
@@ -208,8 +215,8 @@ function activate(context) {
 		const snapshot = {
 			status: state,
 			connection, loginPhase, active: Boolean(active), listening: listenerReady, shared: false,
-			sharedControl: 1, instance: listenerInstance,
-			pendingActions: [...pendingActions.keys()],
+			sharedControl: 1, sharedActions: 1, instance: listenerInstance,
+			pendingActions: [...new Set([...pendingActions.keys(), ...(controlState?.mode === 'configuring' ? ['credentials'] : [])])],
 			port: stats.port, connectedAt: stats.connectedAt,
 			keepalive: { ...keepaliveInfo }, sessionPersistence: sessionPersistenceInfo,
 			models: []
@@ -255,6 +262,11 @@ function activate(context) {
 				const previous = controlState;
 				controlState = await sharedControl.read();
 				if (version !== connectionVersion || syncDisposed || currentController.signal.aborted) return;
+				if (controlState.mode === 'configuring') {
+					if (controlState.expiresAt <= Date.now()) {
+						controlState = await sharedControl.update('disconnected', controlState.revision) || await sharedControl.read();
+					} else if (previous?.revision !== controlState.revision && active) returnToStandby();
+				}
 				if (controlState.mode === 'disconnected' && previous?.revision !== controlState.revision && (active || listenerReady)) {
 					returnToStandby();
 					await startListener();
@@ -264,15 +276,26 @@ function activate(context) {
 					return;
 				}
 				const payload = await require('./shared-control').requestSharedState(stats.port, 'status', {
-					headers: !dashboard?.view?.visible ? { 'x-genai-status': 'brief' } : undefined,
+					headers: { ...(!dashboard?.view?.visible ? { 'x-genai-status': 'brief' } : {}),
+						'x-genai-trace-instance': sharedTraceInstance || '', 'x-genai-trace-after': String(sharedTraceSequence) },
 					signal: AbortSignal.any([currentController.signal, AbortSignal.timeout(1500)])
 				});
 				if (payload.service === 'genai-login' && payload.version === 1 &&
 					payload.state?.port === stats.port && typeof payload.state.status === 'string' &&
-					Array.isArray(payload.state.models) && payload.state.keepalive) next = payload.state;
+					Array.isArray(payload.state.models) && payload.state.keepalive) {
+					next = payload.state;
+					if (payload.trace?.instance === next.instance && Array.isArray(payload.trace.events)) {
+						if (sharedTraceInstance !== next.instance) { sharedTraceInstance = next.instance; sharedTraceSequence = 0; }
+						for (const event of payload.trace.events.slice(-64)) {
+							if (!Number.isSafeInteger(event?.id) || event.id <= sharedTraceSequence || typeof event.message !== 'string' || event.message.length > 1024) continue;
+							output.appendLine(event.message);
+							sharedTraceSequence = event.id;
+						}
+					}
+				}
 			} catch (error) {
 				if (allowTakeover && version === connectionVersion && !syncDisposed && !currentController.signal.aborted && controlState &&
-					['standby', 'connected', 'disconnected'].includes(controlState.mode) &&
+					['standby', 'connected', 'disconnected', 'configuring'].includes(controlState.mode) &&
 					(error.cause?.code === 'ECONNREFUSED' || error.code === 'ECONNREFUSED')) {
 					resumeSavedSession = controlState.mode === 'connected' && sharedState?.active === true;
 					try {
@@ -292,13 +315,18 @@ function activate(context) {
 		void getHistory().reload(refreshHistory).then(refreshHistory);
 		void syncSharedState();
 	};
-	const requireOwner = async () => {
-		if (!active && !listenerReady) await syncSharedState();
-		if (!active && sharedState) {
-			await vscode.window.showInformationMessage('请先断开共享连接，再修改凭据、清除会话或启动可见诊断。');
-			return false;
-		}
-		return true;
+	const configurationInProgress = () => controlState?.mode === 'configuring' && controlState.expiresAt > Date.now();
+	const beginConfiguration = async (revision, instance) => {
+		if (instance !== listenerInstance || syncDisposed) throw Object.assign(new Error('Shared connection changed'), { code: 'SHARED_CONTROL_FAILED' });
+		const current = await sharedControl.read();
+		if (current.mode === 'configuring' && current.expiresAt > Date.now()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
+		const next = await sharedControl.update('configuring', revision);
+		if (!next) throw Object.assign(new Error('Shared connection changed'), { code: 'SHARED_CONTROL_FAILED' });
+		controlState = next;
+		if (active) returnToStandby();
+		await sessionPersistence?.flush();
+		dashboard?.refresh();
+		return next.revision;
 	};
 	const sendError = (response, code, message, headers = {}) => { response.writeHead(code, { 'content-type': 'application/json', ...headers }); response.end(JSON.stringify({ error: { message } })); };
 	const temporaryAuthenticationFailure = error => error.retryAuthentication !== false &&
@@ -306,7 +334,7 @@ function activate(context) {
 			error.code === 'SESSION_CHECK_TIMEOUT' ||
 			error.retryAuthentication === true && error.name === 'TimeoutError' ||
 		['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
-			'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_TIMED_OUT'].includes(transportCode(error)));
+			'ERR_CONNECTION_RESET', 'ERR_CONNECTION_CLOSED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_TIMED_OUT', 'BROWSER_SESSION_TRANSPORT'].includes(transportCode(error)));
 	const automaticRetryHeaders = () => automaticRetryAt > Date.now() ?
 		{ 'retry-after': String(Math.max(1, Math.ceil((automaticRetryAt - Date.now()) / 1000))) } : {};
 	const rejectLocalRequest = request => {
@@ -328,11 +356,34 @@ function activate(context) {
 					const rejected = rejectLocalRequest(request);
 					if (rejected) { trace(`Local request rejected: ${rejected}`); return sendError(response, 403, `Local authenticated clients only: ${rejected}`); }
 					if (request.method === 'GET' && request.url === '/internal/status') {
+						const after = request.headers['x-genai-trace-instance'] === requestInstance ? Number(request.headers['x-genai-trace-after']) || 0 : 0;
 						response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-						return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot(request.headers['x-genai-status'] !== 'brief') }));
+						return response.end(JSON.stringify({ service: 'genai-login', version: 1, state: localSnapshot(request.headers['x-genai-status'] !== 'brief'),
+							trace: { instance: requestInstance, events: traceEvents.filter(event => event.id > after) } }));
 					}
-					if (request.method === 'POST' && ['/internal/connect', '/internal/disconnect'].includes(request.url)) {
+					if (request.method === 'POST' && ['/internal/connect', '/internal/disconnect', '/internal/diagnose', '/internal/configure', '/internal/configured'].includes(request.url)) {
 						if (request.headers['x-genai-instance'] !== requestInstance) return sendError(response, 409, 'Shared connection changed; refresh and retry.');
+						if (request.url === '/internal/configure' || request.url === '/internal/configured') {
+							const revision = request.headers['x-genai-control-revision'];
+							if (typeof revision !== 'string') return sendError(response, 409, 'Shared control revision required.');
+							let configuredRevision;
+							try {
+								if (request.url === '/internal/configure') configuredRevision = await beginConfiguration(revision, requestInstance);
+								else {
+									const current = await sharedControl.read();
+									if (current.mode !== 'configuring') return sendError(response, 409, 'No shared configuration is pending.');
+									const next = await sharedControl.update('disconnected', revision);
+									if (!next) return sendError(response, 409, 'Shared configuration changed; refresh and retry.');
+									controlState = next;
+									configuredRevision = next.revision;
+									dashboard?.refresh();
+								}
+							} catch { return sendError(response, 409, 'Shared connection changed; refresh and retry.'); }
+							response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+							return response.end(JSON.stringify({ service: 'genai-login', version: 1, accepted: true,
+								revision: configuredRevision, instance: listenerInstance }));
+						}
+						if (configurationInProgress()) return sendError(response, 409, 'GENAI configuration is changing; retry after it completes.');
 						if (request.url === '/internal/disconnect') {
 							const revision = request.headers['x-genai-control-revision'];
 							if (typeof revision !== 'string' || !revision) return sendError(response, 409, 'Shared control revision required.');
@@ -347,7 +398,7 @@ function activate(context) {
 							});
 							return;
 						}
-						void actions.connect().catch(reportError);
+						void (request.url === '/internal/diagnose' ? actions.diagnose() : actions.connect()).catch(reportError);
 						response.writeHead(202, { 'content-type': 'application/json', 'cache-control': 'no-store' });
 						return response.end(JSON.stringify({ service: 'genai-login', version: 1, accepted: true }));
 					}
@@ -359,6 +410,7 @@ function activate(context) {
 					}
 					const supported = request.method === 'POST' && ['/v1/chat/completions', '/v1/images/generations'].includes(request.url) || request.method === 'GET' && request.url === '/v1/models';
 					if (!supported) return sendError(response, 404, 'Not found');
+					if (configurationInProgress()) return sendError(response, 503, 'GENAI configuration is changing; retry after it completes.', { 'retry-after': '1' });
 					if (automaticLoginBlocked) return sendError(response, 401, 'GENAI verification did not complete; reconnect explicitly before retrying.');
 					if (!requestHandler && request.method === 'GET' && request.url === '/v1/models') {
 						response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -451,11 +503,12 @@ function activate(context) {
 	const stop = (closeListener = true) => {
 		connectionVersion++;
 		active?.abort(); active = undefined; authentication = undefined;
+		diagnosticActive = false;
 		reconnectActive = undefined;
 		connectPromise = undefined;
 		requestHandler = undefined;
 		automaticLoginBlocked = false;
-		pendingActions.delete('connect'); pendingActions.delete('diagnose');
+		pendingActions.delete('connect');
 		clearTimeout(keepaliveTimer); keepaliveTimer = undefined; keepaliveOwner = undefined;
 		keepaliveInfo = { state: 'idle', lastCheckAt: null };
 		sessionPersistenceInfo = 'idle';
@@ -485,20 +538,17 @@ function activate(context) {
 	};
 	stopActive = () => { syncDisposed = true; clearInterval(syncTimer); syncController.abort(); stop(); };
 	const credentials = async () => {
-		if (!await requireOwner()) return false;
-		if (active) throw new Error('Disconnect before changing credentials.');
+		const target = await configurationTarget();
 		const version = connectionVersion;
 		const username = await vscode.window.showInputBox({ title: 'UMPASS account', prompt: 'Full UMPASS login name', ignoreFocusOut: true });
 		if (!username) return false;
 		const password = await vscode.window.showInputBox({ title: 'UMPASS password', password: true, ignoreFocusOut: true });
 		if (!password) return false;
-		if (!await requireOwner()) return false;
-		if (active) throw new Error('Disconnect before changing credentials.');
 		if (version !== connectionVersion || syncDisposed) return false;
-		await context.secrets.store('credentials', JSON.stringify({ username, password }));
-		await sessionPersistence?.flush();
-		await context.secrets.delete('session');
-		return true;
+		return changeConfiguration(target, async () => {
+			await context.secrets.store('credentials', JSON.stringify({ username, password }));
+			await context.secrets.delete('session');
+		});
 	};
 	const connectNow = async (diagnostic = false, automatic = false) => {
 		if (active) return;
@@ -506,6 +556,7 @@ function activate(context) {
 		const version = connectionVersion;
 		let intent = await sharedControl.read();
 		if (version !== connectionVersion || syncDisposed) return;
+		if (intent.mode === 'configuring' && intent.expiresAt > Date.now()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
 		if (!automatic) {
 			if (intent.mode !== 'connecting') intent = await sharedControl.update('connecting', intent.revision);
 			if (!intent || version !== connectionVersion || syncDisposed) return;
@@ -526,9 +577,17 @@ function activate(context) {
 			status('Authentication required; reconnect');
 			return;
 		}
-		if (!stored) { if (!await credentials()) return; stored = await context.secrets.get('credentials'); }
+		if (!stored) {
+			const configured = await credentials();
+			if (!configured || version !== connectionVersion || syncDisposed) return;
+			intent = configured;
+			if (!automatic) intent = await sharedControl.update('connecting', intent.revision);
+			if (!intent) return;
+			stored = await context.secrets.get('credentials');
+		}
 		if (active || version !== connectionVersion || syncDisposed) return;
 		const controller = new AbortController(); active = controller;
+		diagnosticActive = diagnostic;
 		try {
 		controlState = await sharedControl.read();
 		if (controlState.revision !== intent.revision && (!resuming || controlState.mode !== 'connected')) { stop(); return; }
@@ -935,6 +994,7 @@ function activate(context) {
 		}
 	};
 	const connect = async (diagnostic = false, automatic = false) => {
+		if (configurationInProgress()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
 		if (connectPromise) return connectPromise;
 		if (!automatic && !diagnostic && !active && !listenerReady) {
 			await syncSharedState();
@@ -984,27 +1044,73 @@ function activate(context) {
 		} catch (error) { await vscode.window.showErrorMessage(`端口设置失败：${error.message}`); }
 	};
 	const diagnose = async () => {
-		if (!await requireOwner()) return;
-		if (active) { await vscode.window.showInformationMessage('Disconnect GENAI before starting a visible diagnostic login.'); return; }
+		if (configurationInProgress()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
+		if (!active && !listenerReady) await syncSharedState();
+		if (!active && !listenerReady && sharedState) {
+			await controlSharedConnection('diagnose');
+			return;
+		}
+		output.show(true);
+		if (active && diagnosticActive) return;
+		if (active) returnToStandby();
 		await connect(true);
 	};
-	const controlSharedConnection = async command => {
+	const controlSharedConnection = async (command, revision = controlState?.revision) => {
 		const peer = sharedState;
 		if (peer?.sharedControl !== 1 || typeof peer.instance !== 'string') throw Object.assign(new Error('Update all GENAI windows before shared control'), { code: 'SHARED_CONTROL_UNAVAILABLE' });
+		if (['diagnose', 'configure', 'configured'].includes(command) && peer.sharedActions !== 1) throw Object.assign(new Error('Update all GENAI windows before shared actions'), { code: 'SHARED_CONTROL_UNAVAILABLE' });
+		if (command === 'diagnose') output.show(true);
 		const result = await require('./shared-control').requestSharedState(stats.port, command, {
 			headers: { 'x-genai-instance': peer.instance,
-				...(command === 'disconnect' ? { 'x-genai-control-revision': controlState.revision } : {}) },
+				...(['disconnect', 'configure', 'configured'].includes(command) ? { 'x-genai-control-revision': revision } : {}) },
 			signal: AbortSignal.any([syncController.signal, AbortSignal.timeout(3000)])
 		});
 		if (result.service !== 'genai-login' || result.version !== 1 || !(result.disconnected || result.accepted)) throw new Error('Invalid shared connection acknowledgement');
 		if (command === 'disconnect') sharedState = undefined;
-		else await syncSharedState();
+		else if (command !== 'configure') await syncSharedState();
+		return result;
+	};
+	const configurationTarget = async () => {
+		if (!active && !listenerReady) await syncSharedState();
+		const current = await sharedControl.read();
+		if (current.mode === 'configuring' && current.expiresAt > Date.now()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
+		return { revision: current.revision, instance: listenerReady ? listenerInstance : sharedState?.instance,
+			shared: !listenerReady && Boolean(sharedState) };
+	};
+	const changeConfiguration = async (target, change) => {
+		if (syncDisposed) return;
+		let revision, completed;
+		if (target.shared) {
+			if (sharedState?.instance !== target.instance) throw Object.assign(new Error('Shared connection changed'), { code: 'SHARED_CONTROL_FAILED' });
+			const result = await controlSharedConnection('configure', target.revision);
+			revision = result.revision;
+			if (typeof revision !== 'string' || !revision || typeof result.instance !== 'string') throw new Error('Invalid shared configuration acknowledgement');
+			sharedState = { ...sharedState, instance: result.instance };
+		} else revision = await beginConfiguration(target.revision, target.instance);
+		try {
+			const current = await sharedControl.read();
+			if (syncDisposed || current.mode !== 'configuring' || current.revision !== revision) throw Object.assign(new Error('Shared configuration changed'), { code: 'SHARED_CONTROL_FAILED' });
+			await change();
+		} finally {
+			if (target.shared) {
+				const result = await controlSharedConnection('configured', revision);
+				completed = { mode: 'disconnected', revision: result.revision };
+			} else {
+				controlState = await sharedControl.update('disconnected', revision) || await sharedControl.read();
+				completed = controlState;
+				dashboard?.refresh();
+			}
+		}
+		return completed;
 	};
 	const disconnect = async () => {
+		if (configurationInProgress()) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
 		if (!active && !listenerReady && !sharedState && !syncInFlight) await syncSharedState(false);
 		const remote = !active && !listenerReady && sharedState;
 		if (remote && remote.sharedControl !== 1) await controlSharedConnection('disconnect');
-		controlState = await sharedControl.update('disconnected');
+		const next = await sharedControl.update('disconnected');
+		if (!next) throw Object.assign(new Error('GENAI configuration is changing'), { code: 'SHARED_CONTROL_FAILED' });
+		controlState = next;
 		returnToStandby();
 		if (remote) {
 			try { await controlSharedConnection('disconnect'); }
@@ -1018,11 +1124,11 @@ function activate(context) {
 		await startListener();
 	};
 	const actions = { connect, diagnose, credentials, models, mcp, port, disconnect, clear: async () => {
-		if (!await requireOwner()) return;
-		const owner = active;
+		const target = await configurationTarget();
+		const version = connectionVersion;
 		const answer = await vscode.window.showWarningMessage('清除保存的账号和 Cookie？', { modal: true, detail: '当前连接将断开，账号和 Cookie 将删除。历史用量保留；此操作不会撤销服务器端会话。' }, '清除凭据');
-		if (answer !== '清除凭据' || !await requireOwner() || active !== owner) return;
-		await disconnect(); await sessionPersistence?.flush(); await context.secrets.delete('credentials'); await context.secrets.delete('session');
+		if (answer !== '清除凭据' || version !== connectionVersion || syncDisposed) return;
+		await changeConfiguration(target, async () => { await context.secrets.delete('credentials'); await context.secrets.delete('session'); });
 	} };
 	const reportError = async error => {
 		if (error?.name === 'AbortError') return;
@@ -1037,7 +1143,7 @@ function activate(context) {
 			/msedge|executable.*exist|browser.*not found/i.test(error?.message || '') ? '无法启动 Microsoft Edge。请确认 Edge 已安装，再重试连接。' :
 			error?.code === 'CREDENTIALS_REJECTED' ? 'UMPASS 未接受登录。请检查账号和密码，再重试。' :
 			error?.name === 'TimeoutError' ? '登录等待超时。请确认手机上的 MFA 已完成，或使用可见诊断查看阻塞页面。' :
-			/ERR_|UND_ERR|ECONN|ENOTFOUND/.test(transportCode(error)) ? '登录网络连接失败。请检查网络后重试，保存的凭据未清除。' :
+			/ERR_|UND_ERR|ECONN|ENOTFOUND|BROWSER_SESSION_TRANSPORT/.test(transportCode(error)) ? '登录网络连接失败。请检查网络后重试，保存的凭据未清除。' :
 			'GENAI 登录未完成。请查看日志中的失败阶段，或使用可见诊断。';
 		const choice = await vscode.window.showErrorMessage(message, '查看日志', '可见诊断');
 		if (choice === '查看日志') output.show(true);

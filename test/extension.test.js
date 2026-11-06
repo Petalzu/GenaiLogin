@@ -2,6 +2,27 @@ const assert = require('assert');
 
 const vscode = require('vscode');
 suite('Extension Test Suite', () => {
+	test('Editor and Agents windows activate the bridge automatically without opening its view', async function () {
+		this.timeout(15000);
+		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
+		assert.ok(extension);
+		if (process.env.GENAI_TEST_AGENTS === '1') {
+			assert.equal(vscode.workspace.workspaceFolders?.length || 0, 0);
+			const commands = await vscode.commands.getCommands(true);
+			assert.ok(commands.includes('sessions.focusActiveSession'), 'The test must actually run in the Agents window');
+		}
+		assert.equal(extension.packageJSON.capabilities?.agentsWindow?.supported, true);
+		assert.deepEqual(extension.packageJSON.extensionKind, ['ui']);
+		const deadline = Date.now() + 10000;
+		while (!extension.isActive && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(extension.isActive, true, 'onStartupFinished must activate the bridge without an editor or dashboard');
+		const port = vscode.workspace.getConfiguration('genai-login').get('port', 58379);
+		const { requestSharedState } = require('../dist/shared-control');
+		const state = (await requestSharedState(port, 'status')).state;
+		assert.equal(state.listening, true);
+		assert.equal(state.active, false);
+		assert.equal(state.connection, 'disconnected');
+	});
 	test('Activation registers commands and makes the idle listener reachable', async () => {
 		const extension = vscode.extensions.getExtension('Petalzu.genai-login');
 		assert.ok(extension);
@@ -18,9 +39,14 @@ suite('Extension Test Suite', () => {
 		assert.equal(payload.state.listening, true);
 		assert.equal(payload.state.port, port);
 		assert.equal(payload.state.sharedControl, 1);
+		assert.equal(payload.state.sharedActions, 1);
 		assert.equal(typeof payload.state.instance, 'string');
 		assert.equal(payload.state.active, false);
 		assert.equal(payload.state.connection, 'disconnected');
+		const { Session } = require('../dist/auth');
+		const headers = new Headers({ 'content-type': 'application/json' });
+		headers.getSetCookie = undefined;
+		assert.equal(await new Session().valid(undefined, async () => ({ status: 200, ok: true, headers, body: null })), true);
 		const models = await fetch(`http://127.0.0.1:${port}/v1/models`, {
 			headers: { Authorization: 'Bearer local-browser-session' }, signal: AbortSignal.timeout(3000)
 		});
